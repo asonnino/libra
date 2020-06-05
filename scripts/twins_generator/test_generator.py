@@ -87,14 +87,18 @@ def test_print():
     assert True
 
 
-#@pytest.mark.skip(reason='Performance benchmark.')
+# @pytest.mark.skip(reason='Performance benchmark.')
 def test_performance():
-    generator = Generator(Configs(4, 2, 5), testcases_per_file=100)
-    print(f'Generating {generator.testcases_length} testcases..')
-    start_time = time.time()
-    generator.run(dryrun=True, number_of_workers=16)
-    elapsed_time = time.time() - start_time
-    print(f'Elapsed time: {str(timedelta(seconds=elapsed_time))}')
+    from tempfile import TemporaryDirectory
+    with TemporaryDirectory() as directory:
+        generator = Generator(
+            Configs(4, 2, 5), testcases_per_file=100, folder_path=directory
+        )
+        print(f'Generating {generator.testcases_length} testcases..')
+        start_time = time.perf_counter()
+        generator.run(dryrun=True, workers=8)
+        elapsed_time = time.perf_counter() - start_time
+        print(f'Elapsed time: {str(timedelta(seconds=elapsed_time))}')
 
 
 if __name__ == '__main__':

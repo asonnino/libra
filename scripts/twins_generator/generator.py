@@ -1,14 +1,36 @@
 import logging
-from itertools import product, zip_longest
-from more_itertools import ichunked
+from itertools import product
+from more_itertools import ichunked, distribute
 from os.path import join
 from copy import deepcopy
 from math import ceil, factorial as f
-from threading import Thread
+from multiprocessing import Process
 
 
 class GeneratorError(Exception):
     pass
+
+
+class Format:
+    @staticmethod
+    def make(generator, testcase):
+        twins_round_proposers_idx, round_partitions_idx = {}, {}
+        for round_number, scenario in enumerate(testcase):
+            leader, partition = scenario
+            leaders = [leader]
+            if leader in generator.target_nodes:
+                leaders.append(generator.get_twin(leader))
+            twins_round_proposers_idx[round_number] = leaders
+            round_partitions_idx[round_number] = partition
+
+        return (
+            f'{generator.configs.number_of_rounds}\n'
+            f'{generator.configs.number_of_nodes}\n'
+            f'{generator.configs.number_of_partitions}\n'
+            f'{twins_round_proposers_idx}\n'
+            f'{round_partitions_idx}\n'
+            '\n'
+        )
 
 
 class Configs:
@@ -231,37 +253,22 @@ class Generator:
         """
         return product(scenarios, repeat=self.configs.number_of_rounds)
 
-    def print(self, index, testcases, dryrun=False, filter=None):
+    def print(self, testcases, machine_id, process_id, dryrun, filter=None):
         if dryrun:
             self.logger.info('Dry-run enabled: no files will be created.')
 
+        filter = bool if filter is None else filter
         num_of_chunks = ceil(self.testcases_length / self.testcases_per_file)
         chunks = ichunked(testcases, num_of_chunks)
+        #chunks = distribute(num_of_chunks, testcases)
         for i, chunk in enumerate(chunks):
-            filename = f'tmp-{index}' if dryrun else f'testcase-{index}-{i}'
+            basename = f'testcase-{machine_id}-{process_id}'
+            filename = f'tmp-{basename}' if dryrun else f'{basename}-{i}'
             with open(join(self.folder_path, filename), 'w') as f:
-                for testcase in chunk:
-                    if filter is not None and not filter(testcase):
-                        continue
+                data = [Format.make(self, x) for x in chunk if filter(x)]
+                f.write(''.join(data))
 
-                    twins_round_proposers_idx, round_partitions_idx = {}, {}
-                    for round_number, scenario in enumerate(testcase):
-                        leader, partition = scenario
-                        leaders = [leader]
-                        if leader in self.target_nodes:
-                            leaders.append(self.get_twin(leader))
-                        twins_round_proposers_idx[round_number] = leaders
-                        round_partitions_idx[round_number] = partition
-
-                    f.write(
-                        f'''{self.configs.number_of_rounds}
-                        {self.configs.number_of_nodes}
-                        {self.configs.number_of_partitions}
-                        {twins_round_proposers_idx}
-                        {round_partitions_idx}'''
-                    )
-
-    def run(self, dryrun=False, filter=None, number_of_workers=1):
+    def run(self, dryrun=False, workers=1):
         self.logger.info(
             f'Generating {self.testcases_length} testcases...'
         )
@@ -276,23 +283,12 @@ class Generator:
         testcases = self.combine_scenarios_with_rounds(scenarios)
 
         # Print the resulting testcases to files
-        from more_itertools import distribute
-        threads = []
-        chunks = distribute(number_of_workers, testcases)
-        for i in range(number_of_workers):
-            t = Thread(
-                target=self.print, args=(i, chunks[i], dryrun, filter)
-            )
-            t.start()
-            threads.append(t)
-        [t.join() for t in threads]
+        chunks = distribute(workers, testcases)
+        jobs = []
+        for i in range(workers):
+            p = Process(target=self.print, args=(chunks[i], 0, i, dryrun))
+            jobs.append(p)
+            p.start()
 
-        #self.print(0, testcases, dryrun=dryrun, filter=filter)
+        [p.join() for p in jobs]
         self.logger.info(f'Finished.')
-
-        '''
-        TODO:  1 Finish comments
-               2 Support multiple threads on a single machine
-               3 Support multiple machines (use itertool.islice)
-               4 100% test coverage (find a way to moch 'open' and 'f.write')
-        '''
