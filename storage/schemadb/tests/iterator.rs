@@ -1,12 +1,12 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use anyhow::Result;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use failure::Result;
 use schemadb::{
     define_schema,
     schema::{KeyCodec, Schema, SeekKeyCodec, ValueCodec},
-    ColumnFamilyOptions, ColumnFamilyOptionsMap, SchemaIterator, DB, DEFAULT_CF_NAME,
+    SchemaIterator, DB, DEFAULT_CF_NAME,
 };
 
 define_schema!(TestSchema, TestKey, TestValue, "TestCF");
@@ -71,24 +71,15 @@ fn collect_values(iter: SchemaIterator<TestSchema>) -> Vec<u32> {
 }
 
 struct TestDB {
-    _tmpdir: tools::tempdir::TempPath,
+    _tmpdir: libra_temppath::TempPath,
     db: DB,
 }
 
 impl TestDB {
     fn new() -> Self {
-        let tmpdir = tools::tempdir::TempPath::new();
-        let cf_opts_map: ColumnFamilyOptionsMap = [
-            (DEFAULT_CF_NAME, ColumnFamilyOptions::default()),
-            (
-                TestSchema::COLUMN_FAMILY_NAME,
-                ColumnFamilyOptions::default(),
-            ),
-        ]
-        .iter()
-        .cloned()
-        .collect();
-        let db = DB::open(&tmpdir.path(), cf_opts_map).unwrap();
+        let tmpdir = libra_temppath::TempPath::new();
+        let column_families = vec![DEFAULT_CF_NAME, TestSchema::COLUMN_FAMILY_NAME];
+        let db = DB::open(&tmpdir.path(), "test", column_families).unwrap();
 
         db.put::<TestSchema>(&TestKey(1, 0, 0), &TestValue(100))
             .unwrap();

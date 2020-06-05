@@ -2,39 +2,83 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    account_config::AccountEvent,
+    account_config::{
+        BurnEvent, CancelBurnEvent, MintEvent, NewBlockEvent, NewEpochEvent, PreburnEvent,
+        ReceivedPaymentEvent, SentPaymentEvent, UpgradeEvent,
+    },
     event::EventKey,
     ledger_info::LedgerInfo,
-    proof::{verify_event, EventProof},
+    proof::EventProof,
     transaction::Version,
 };
-use canonical_serialization::{CanonicalSerialize, CanonicalSerializer, SimpleSerializer};
-use crypto::{
-    hash::{ContractEventHasher, CryptoHash, CryptoHasher},
-    HashValue,
-};
-use failure::prelude::*;
-#[cfg(any(test, feature = "testing"))]
+use anyhow::{ensure, Error, Result};
+use libra_crypto::hash::CryptoHash;
+use libra_crypto_derive::{CryptoHasher, LCSCryptoHash};
+use move_core_types::{language_storage::TypeTag, move_resource::MoveResource};
+
+#[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
-use proto_conv::{FromProto, IntoProto};
+use serde::{Deserialize, Serialize};
+use std::{convert::TryFrom, ops::Deref};
+
+/// Support versioning of the data structure.
+#[derive(Hash, Clone, Eq, PartialEq, Serialize, Deserialize, CryptoHasher, LCSCryptoHash)]
+pub enum ContractEvent {
+    V0(ContractEventV0),
+}
+
+impl ContractEvent {
+    pub fn new(
+        key: EventKey,
+        sequence_number: u64,
+        type_tag: TypeTag,
+        event_data: Vec<u8>,
+    ) -> Self {
+        ContractEvent::V0(ContractEventV0::new(
+            key,
+            sequence_number,
+            type_tag,
+            event_data,
+        ))
+    }
+}
+
+// Temporary hack to avoid massive changes, it won't work when new variant comes and needs proper
+// dispatch at that time.
+impl Deref for ContractEvent {
+    type Target = ContractEventV0;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            ContractEvent::V0(event) => event,
+        }
+    }
+}
 
 /// Entry produced via a call to the `emit_event` builtin.
-#[derive(Clone, Default, Eq, PartialEq, FromProto, IntoProto)]
-#[ProtoType(crate::proto::events::Event)]
-pub struct ContractEvent {
+#[derive(Hash, Clone, Eq, PartialEq, Serialize, Deserialize, CryptoHasher)]
+pub struct ContractEventV0 {
     /// The unique key that the event was emitted to
     key: EventKey,
     /// The number of messages that have been emitted to the path previously
     sequence_number: u64,
+    /// The type of the data
+    type_tag: TypeTag,
     /// The data payload of the event
     event_data: Vec<u8>,
 }
 
-impl ContractEvent {
-    pub fn new(key: EventKey, sequence_number: u64, event_data: Vec<u8>) -> Self {
-        ContractEvent {
+impl ContractEventV0 {
+    pub fn new(
+        key: EventKey,
+        sequence_number: u64,
+        type_tag: TypeTag,
+        event_data: Vec<u8>,
+    ) -> Self {
+        Self {
             key,
             sequence_number,
+            type_tag,
             event_data,
         }
     }
@@ -50,15 +94,119 @@ impl ContractEvent {
     pub fn event_data(&self) -> &[u8] {
         &self.event_data
     }
+
+    pub fn type_tag(&self) -> &TypeTag {
+        &self.type_tag
+    }
+}
+
+impl TryFrom<&ContractEvent> for SentPaymentEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        if event.type_tag != TypeTag::Struct(SentPaymentEvent::struct_tag()) {
+            anyhow::bail!("Expected Sent Payment")
+        }
+        Self::try_from_bytes(&event.event_data)
+    }
+}
+
+impl TryFrom<&ContractEvent> for ReceivedPaymentEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        if event.type_tag != TypeTag::Struct(ReceivedPaymentEvent::struct_tag()) {
+            anyhow::bail!("Expected Received Payment")
+        }
+        Self::try_from_bytes(&event.event_data)
+    }
+}
+
+impl TryFrom<&ContractEvent> for MintEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        if event.type_tag != TypeTag::Struct(MintEvent::struct_tag()) {
+            anyhow::bail!("Expected MintEvent")
+        }
+        Self::try_from_bytes(&event.event_data)
+    }
+}
+
+impl TryFrom<&ContractEvent> for BurnEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        if event.type_tag != TypeTag::Struct(BurnEvent::struct_tag()) {
+            anyhow::bail!("Expected BurnEvent")
+        }
+        Self::try_from_bytes(&event.event_data)
+    }
+}
+
+impl TryFrom<&ContractEvent> for PreburnEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        if event.type_tag != TypeTag::Struct(PreburnEvent::struct_tag()) {
+            anyhow::bail!("Expected PreburnEvent")
+        }
+        Self::try_from_bytes(&event.event_data)
+    }
+}
+
+impl TryFrom<&ContractEvent> for CancelBurnEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        if event.type_tag != TypeTag::Struct(CancelBurnEvent::struct_tag()) {
+            anyhow::bail!("Expected CancelBurnEvent")
+        }
+        Self::try_from_bytes(&event.event_data)
+    }
+}
+
+impl TryFrom<&ContractEvent> for UpgradeEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        if event.type_tag != TypeTag::Struct(Self::struct_tag()) {
+            anyhow::bail!("Expected UpgradeEvent")
+        }
+        Self::try_from_bytes(&event.event_data)
+    }
+}
+
+impl TryFrom<&ContractEvent> for NewBlockEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        if event.type_tag != TypeTag::Struct(Self::struct_tag()) {
+            anyhow::bail!("Expected NewBlockEvent")
+        }
+        Self::try_from_bytes(&event.event_data)
+    }
+}
+
+impl TryFrom<&ContractEvent> for NewEpochEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        if event.type_tag != TypeTag::Struct(Self::struct_tag()) {
+            anyhow::bail!("Expected NewEpochEvent")
+        }
+        Self::try_from_bytes(&event.event_data)
+    }
 }
 
 impl std::fmt::Debug for ContractEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ContractEvent {{ key: {:?}, index: {:?}, event_data: {:?} }}",
+            "ContractEvent {{ key: {:?}, index: {:?}, type: {:?}, event_data: {:?} }}",
             self.key,
             self.sequence_number,
+            self.type_tag,
             hex::encode(&self.event_data)
         )
     }
@@ -66,11 +214,17 @@ impl std::fmt::Debug for ContractEvent {
 
 impl std::fmt::Display for ContractEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Ok(payload) = AccountEvent::try_from(&self.event_data) {
+        if let Ok(payload) = SentPaymentEvent::try_from(self) {
             write!(
                 f,
-                "ContractEvent {{ key: {}, index: {:?}, event_data: {:?} }}",
-                self.key, self.sequence_number, payload,
+                "ContractEvent {{ key: {}, index: {:?}, type: {:?}, event_data: {:?} }}",
+                self.key, self.sequence_number, self.type_tag, payload,
+            )
+        } else if let Ok(payload) = ReceivedPaymentEvent::try_from(self) {
+            write!(
+                f,
+                "ContractEvent {{ key: {}, index: {:?}, type: {:?}, event_data: {:?} }}",
+                self.key, self.sequence_number, self.type_tag, payload,
             )
         } else {
             write!(f, "{:?}", self)
@@ -78,31 +232,10 @@ impl std::fmt::Display for ContractEvent {
     }
 }
 
-impl CanonicalSerialize for ContractEvent {
-    fn serialize(&self, serializer: &mut impl CanonicalSerializer) -> Result<()> {
-        serializer
-            .encode_struct(&self.key)?
-            .encode_u64(self.sequence_number)?
-            .encode_bytes(&self.event_data)?;
-        Ok(())
-    }
-}
-
-impl CryptoHash for ContractEvent {
-    type Hasher = ContractEventHasher;
-
-    fn hash(&self) -> HashValue {
-        let mut state = Self::Hasher::default();
-        state.write(&SimpleSerializer::<Vec<u8>>::serialize(self).expect("Failed to serialize."));
-        state.finish()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, FromProto, IntoProto)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
-#[ProtoType(crate::proto::events::EventWithProof)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct EventWithProof {
-    pub transaction_version: u64, // Should be `Version`, but FromProto derive won't work that way.
+    pub transaction_version: u64, // Should be `Version`
     pub event_index: u64,
     pub event: ContractEvent,
     pub proof: EventProof,
@@ -177,12 +310,11 @@ impl EventWithProof {
             event_index,
         );
 
-        verify_event(
+        self.proof.verify(
             ledger_info,
             self.event.hash(),
             transaction_version,
             event_index,
-            &self.proof,
         )?;
 
         Ok(())

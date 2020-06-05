@@ -2,17 +2,23 @@
 name = "netcore"
 version = "0.1.0"
 authors = ["Libra Association <opensource@libra.org>"]
+description = "Libra netcore"
+repository = "https://github.com/libra/libra"
+homepage = "https://libra.org"
 license = "Apache-2.0"
 publish = false
 edition = "2018"
 
 [dependencies]
-bytes = { version = "0.4.12", default-features = false }
-futures = { version = "=0.3.0-alpha.19", package = "futures-preview", features = ["io-compat", "compat"] }
-futures_01 = { version = "0.1.28", package = "futures" }
-parity-multiaddr = { version = "0.5.0", default-features = false }
-pin-utils = "=0.1.0-alpha.4"
-tokio = "0.1.22"
-yamux = { version = "0.2.1", default-features = false }
+async-trait = "0.1.33"
+bytes = "0.5.4"
+futures = "0.3.5"
+pin-project = "0.4.17"
+tokio = { version = "0.2.21", features = ["full"] }
 
-memsocket = { path = "../memsocket" }
+libra-workspace-hack = { path = "../../common/workspace-hack", version = "0.1.0" }
+memsocket = { path = "../memsocket", version = "0.1.0" }
+libra-network-address = { path = "../network-address", version = "0.1.0" }
+
+[dev-dependencies]
+libra-logger = { path = "../../common/logger", version = "0.1.0" }

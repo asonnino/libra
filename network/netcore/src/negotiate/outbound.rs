@@ -1,9 +1,9 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::negotiate::{
+use crate::{
     framing::{read_u16frame, write_u16frame},
-    PROTOCOL_INTERACTIVE, PROTOCOL_NOT_SUPPORTED, PROTOCOL_SELECT,
+    negotiate::{PROTOCOL_INTERACTIVE, PROTOCOL_NOT_SUPPORTED, PROTOCOL_SELECT},
 };
 use bytes::BytesMut;
 use futures::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -79,7 +79,7 @@ pub async fn negotiate_outbound_select<TSocket, TProto>(
     protocol: TProto,
 ) -> Result<TSocket>
 where
-    TSocket: AsyncRead + AsyncWrite + Unpin,
+    TSocket: AsyncWrite + Unpin,
     TProto: AsRef<[u8]> + Clone,
 {
     write_u16frame(&mut stream, PROTOCOL_SELECT).await?;
@@ -93,10 +93,12 @@ where
 
 #[cfg(test)]
 mod test {
-    use crate::negotiate::{
+    use crate::{
         framing::{read_u16frame, write_u16frame},
-        outbound::{negotiate_outbound_interactive, negotiate_outbound_select},
-        PROTOCOL_INTERACTIVE, PROTOCOL_NOT_SUPPORTED, PROTOCOL_SELECT,
+        negotiate::{
+            outbound::{negotiate_outbound_interactive, negotiate_outbound_select},
+            PROTOCOL_INTERACTIVE, PROTOCOL_NOT_SUPPORTED, PROTOCOL_SELECT,
+        },
     };
     use bytes::BytesMut;
     use futures::{executor::block_on, future::join, io::AsyncWriteExt};

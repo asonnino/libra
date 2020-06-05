@@ -4,27 +4,31 @@
 #[cfg(test)]
 mod mock_vm_test;
 
-use config::config::VMConfig;
-use crypto::ed25519::compat;
-use lazy_static::lazy_static;
-use state_view::StateView;
-use std::collections::HashMap;
-use types::{
+use libra_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
+use libra_state_view::StateView;
+use libra_types::{
     access_path::AccessPath,
-    account_address::{AccountAddress, ADDRESS_LENGTH},
+    account_address::AccountAddress,
+    account_config::{association_address, validator_set_address, LBR_NAME},
     contract_event::ContractEvent,
     event::EventKey,
+    on_chain_config::{
+        config_address, new_epoch_event_key, ConfigurationResource, OnChainConfig, ValidatorSet,
+    },
     transaction::{
-        RawTransaction, Script, SignedTransaction, TransactionArgument, TransactionOutput,
-        TransactionPayload, TransactionStatus,
+        RawTransaction, Script, SignedTransaction, Transaction, TransactionArgument,
+        TransactionOutput, TransactionPayload, TransactionStatus,
     },
     vm_error::{StatusCode, VMStatus},
     write_set::{WriteOp, WriteSet, WriteSetMut},
 };
-use vm_runtime::VMExecutor;
+use libra_vm::VMExecutor;
+use move_core_types::{language_storage::TypeTag, move_resource::MoveResource};
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
 
 #[derive(Debug)]
-enum Transaction {
+enum MockVMTransaction {
     Mint {
         sender: AccountAddress,
         amount: u64,
@@ -34,34 +38,43 @@ enum Transaction {
         recipient: AccountAddress,
         amount: u64,
     },
+    Reconfiguration,
 }
 
-lazy_static! {
-    pub static ref KEEP_STATUS: TransactionStatus =
-        TransactionStatus::Keep(VMStatus::new(StatusCode::EXECUTED));
+pub static KEEP_STATUS: Lazy<TransactionStatus> =
+    Lazy::new(|| TransactionStatus::Keep(VMStatus::new(StatusCode::EXECUTED)));
 
-    // We use 10 as the assertion error code for insufficient balance within the Libra coin contract.
-    pub static ref DISCARD_STATUS: TransactionStatus =
-        TransactionStatus::Discard(VMStatus::new(StatusCode::ABORTED).with_sub_status(10));
-}
+// We use 10 as the assertion error code for insufficient balance within the Libra coin contract.
+pub static DISCARD_STATUS: Lazy<TransactionStatus> = Lazy::new(|| {
+    TransactionStatus::Discard(VMStatus::new(StatusCode::ABORTED).with_sub_status(10))
+});
 
 pub struct MockVM;
 
 impl VMExecutor for MockVM {
     fn execute_block(
-        transactions: Vec<SignedTransaction>,
-        _config: &VMConfig,
+        transactions: Vec<Transaction>,
         state_view: &dyn StateView,
-    ) -> Vec<TransactionOutput> {
+    ) -> Result<Vec<TransactionOutput>, VMStatus> {
         if state_view.is_genesis() {
             assert_eq!(
                 transactions.len(),
                 1,
                 "Genesis block should have only one transaction."
             );
-            let output =
-                TransactionOutput::new(gen_genesis_writeset(), vec![], 0, KEEP_STATUS.clone());
-            return vec![output];
+            let output = TransactionOutput::new(
+                gen_genesis_writeset(),
+                // mock the validator set event
+                vec![ContractEvent::new(
+                    new_epoch_event_key(),
+                    0,
+                    TypeTag::Bool,
+                    lcs::to_bytes(&0).unwrap(),
+                )],
+                0,
+                KEEP_STATUS.clone(),
+            );
+            return Ok(vec![output]);
         }
 
         // output_cache is used to store the output of transactions so they are visible to later
@@ -70,8 +83,8 @@ impl VMExecutor for MockVM {
         let mut outputs = vec![];
 
         for txn in transactions {
-            match decode_transaction(&txn) {
-                Transaction::Mint { sender, amount } => {
+            match decode_transaction(&txn.as_signed_user_txn().unwrap()) {
+                MockVMTransaction::Mint { sender, amount } => {
                     let old_balance = read_balance(&output_cache, state_view, sender);
                     let new_balance = old_balance + amount;
                     let old_seqnum = read_seqnum(&output_cache, state_view, sender);
@@ -89,7 +102,7 @@ impl VMExecutor for MockVM {
                         KEEP_STATUS.clone(),
                     ));
                 }
-                Transaction::Payment {
+                MockVMTransaction::Payment {
                     sender,
                     recipient,
                     amount,
@@ -130,10 +143,27 @@ impl VMExecutor for MockVM {
                         TransactionStatus::Keep(VMStatus::new(StatusCode::EXECUTED)),
                     ));
                 }
+                MockVMTransaction::Reconfiguration => {
+                    read_balance_from_storage(state_view, &balance_ap(validator_set_address()));
+                    read_balance_from_storage(state_view, &balance_ap(association_address()));
+                    outputs.push(TransactionOutput::new(
+                        // WriteSet cannot be empty so use genesis writeset only for testing.
+                        gen_genesis_writeset(),
+                        // mock the validator set event
+                        vec![ContractEvent::new(
+                            new_epoch_event_key(),
+                            0,
+                            TypeTag::Bool,
+                            lcs::to_bytes(&0).unwrap(),
+                        )],
+                        0,
+                        KEEP_STATUS.clone(),
+                    ));
+                }
             }
         }
 
-        outputs
+        Ok(outputs)
     }
 }
 
@@ -191,12 +221,15 @@ fn seqnum_ap(account: AccountAddress) -> AccessPath {
 }
 
 fn gen_genesis_writeset() -> WriteSet {
-    let address = AccountAddress::new([0xff; ADDRESS_LENGTH]);
-    let path = b"hello".to_vec();
     let mut write_set = WriteSetMut::default();
+    let validator_set_ap = ValidatorSet::CONFIG_ID.access_path();
     write_set.push((
-        AccessPath::new(address, path),
-        WriteOp::Value(b"world".to_vec()),
+        validator_set_ap,
+        WriteOp::Value(lcs::to_bytes(&ValidatorSet::new(vec![])).unwrap()),
+    ));
+    write_set.push((
+        AccessPath::new(config_address(), ConfigurationResource::resource_path()),
+        WriteOp::Value(lcs::to_bytes(&ConfigurationResource::default()).unwrap()),
     ));
     write_set
         .freeze()
@@ -245,22 +278,23 @@ fn gen_events(sender: AccountAddress) -> Vec<ContractEvent> {
     vec![ContractEvent::new(
         EventKey::new_from_address(&sender, 0),
         0,
+        TypeTag::Vector(Box::new(TypeTag::U8)),
         b"event_data".to_vec(),
     )]
 }
 
 pub fn encode_mint_program(amount: u64) -> Script {
     let argument = TransactionArgument::U64(amount);
-    Script::new(vec![], vec![argument])
+    Script::new(vec![], vec![], vec![argument])
 }
 
 pub fn encode_transfer_program(recipient: AccountAddress, amount: u64) -> Script {
     let argument1 = TransactionArgument::Address(recipient);
     let argument2 = TransactionArgument::U64(amount);
-    Script::new(vec![], vec![argument1, argument2])
+    Script::new(vec![], vec![], vec![argument1, argument2])
 }
 
-pub fn encode_mint_transaction(sender: AccountAddress, amount: u64) -> SignedTransaction {
+pub fn encode_mint_transaction(sender: AccountAddress, amount: u64) -> Transaction {
     encode_transaction(sender, encode_mint_program(amount))
 }
 
@@ -268,36 +302,57 @@ pub fn encode_transfer_transaction(
     sender: AccountAddress,
     recipient: AccountAddress,
     amount: u64,
-) -> SignedTransaction {
+) -> Transaction {
     encode_transaction(sender, encode_transfer_program(recipient, amount))
 }
 
-fn encode_transaction(sender: AccountAddress, program: Script) -> SignedTransaction {
-    let raw_transaction =
-        RawTransaction::new_script(sender, 0, program, 0, 0, std::time::Duration::from_secs(0));
+fn encode_transaction(sender: AccountAddress, program: Script) -> Transaction {
+    let raw_transaction = RawTransaction::new_script(
+        sender,
+        0,
+        program,
+        0,
+        0,
+        LBR_NAME.to_owned(),
+        std::time::Duration::from_secs(0),
+    );
 
-    let (privkey, pubkey) = compat::generate_keypair(None);
-    raw_transaction
-        .sign(&privkey, pubkey)
-        .expect("Failed to sign raw transaction.")
-        .into_inner()
+    let privkey = Ed25519PrivateKey::generate_for_testing();
+    Transaction::UserTransaction(
+        raw_transaction
+            .sign(&privkey, privkey.public_key())
+            .expect("Failed to sign raw transaction.")
+            .into_inner(),
+    )
 }
 
-fn decode_transaction(txn: &SignedTransaction) -> Transaction {
+pub fn encode_reconfiguration_transaction(sender: AccountAddress) -> Transaction {
+    let raw_transaction = RawTransaction::new_write_set(sender, 0, WriteSet::default());
+
+    let privkey = Ed25519PrivateKey::generate_for_testing();
+    Transaction::UserTransaction(
+        raw_transaction
+            .sign(&privkey, privkey.public_key())
+            .expect("Failed to sign raw transaction.")
+            .into_inner(),
+    )
+}
+
+fn decode_transaction(txn: &SignedTransaction) -> MockVMTransaction {
     let sender = txn.sender();
     match txn.payload() {
         TransactionPayload::Script(script) => {
             assert!(script.code().is_empty(), "Code should be empty.");
             match script.args().len() {
                 1 => match script.args()[0] {
-                    TransactionArgument::U64(amount) => Transaction::Mint { sender, amount },
+                    TransactionArgument::U64(amount) => MockVMTransaction::Mint { sender, amount },
                     _ => unimplemented!(
                         "Only one integer argument is allowed for mint transactions."
                     ),
                 },
                 2 => match (&script.args()[0], &script.args()[1]) {
                     (TransactionArgument::Address(recipient), TransactionArgument::U64(amount)) => {
-                        Transaction::Payment {
+                        MockVMTransaction::Payment {
                             sender,
                             recipient: *recipient,
                             amount: *amount,
@@ -312,9 +367,10 @@ fn decode_transaction(txn: &SignedTransaction) -> Transaction {
             }
         }
         TransactionPayload::WriteSet(_) => {
-            unimplemented!("MockVM does not support WriteSet transaction payload.")
+            // Use WriteSet for reconfig only for testing.
+            MockVMTransaction::Reconfiguration
         }
-        TransactionPayload::Program(_) => {
+        TransactionPayload::Program => {
             unimplemented!("MockVM does not support Program transaction payload.")
         }
         TransactionPayload::Module(_) => {

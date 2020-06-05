@@ -2,19 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module defines physical storage schema for nodes in the state Jellyfish Merkle Tree.
-//! Node is identified by [NodeKey](jellyfish_merkle::node_type::NodeKey).
+//! Node is identified by [NodeKey](jellyfish-merkle::node_type::NodeKey).
 //! ```text
 //! |<----key--->|<-----value----->|
 //! |  node_key  | serialized_node |
 //! ```
 
 use crate::schema::JELLYFISH_MERKLE_NODE_CF_NAME;
-use failure::prelude::*;
+use anyhow::Result;
+use byteorder::{BigEndian, WriteBytesExt};
 use jellyfish_merkle::node_type::{Node, NodeKey};
+use libra_types::transaction::Version;
 use schemadb::{
     define_schema,
-    schema::{KeyCodec, ValueCodec},
+    schema::{KeyCodec, SeekKeyCodec, ValueCodec},
 };
+use std::mem::size_of;
 
 define_schema!(
     JellyfishMerkleNodeSchema,
@@ -40,6 +43,15 @@ impl ValueCodec<JellyfishMerkleNodeSchema> for Node {
 
     fn decode_value(data: &[u8]) -> Result<Self> {
         Ok(Self::decode(&data[..])?)
+    }
+}
+
+impl SeekKeyCodec<JellyfishMerkleNodeSchema> for (Version, u8) {
+    fn encode_seek_key(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(size_of::<Version>() + size_of::<u8>());
+        out.write_u64::<BigEndian>(self.0)?;
+        out.write_u8(self.1)?;
+        Ok(out)
     }
 }
 

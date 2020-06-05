@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::IndexKind;
-use types::{
+use libra_types::{
     account_address::AccountAddress,
     transaction::TransactionStatus,
     vm_error::{StatusCode, VMStatus},
@@ -27,16 +27,20 @@ pub struct Location {}
 /// Error codes that can be emitted by the prologue. These have special significance to the VM when
 /// they are raised during the prologue. However, they can also be raised by user code during
 /// execution of a transaction script. They have no significance to the VM in that case.
+pub const EACCOUNT_FROZEN: u64 = 0; // sending account is frozen
 pub const EBAD_SIGNATURE: u64 = 1; // signature on transaction is invalid
 pub const EBAD_ACCOUNT_AUTHENTICATION_KEY: u64 = 2; // auth key in transaction is invalid
 pub const ESEQUENCE_NUMBER_TOO_OLD: u64 = 3; // transaction sequence number is too old
 pub const ESEQUENCE_NUMBER_TOO_NEW: u64 = 4; // transaction sequence number is too new
 pub const EACCOUNT_DOES_NOT_EXIST: u64 = 5; // transaction sender's account does not exist
 pub const ECANT_PAY_GAS_DEPOSIT: u64 = 6; // insufficient balance to pay for gas deposit
+pub const ETRANSACTION_EXPIRED: u64 = 7; // transaction expiration time exceeds block time.
 
 /// Generic error codes. These codes don't have any special meaning for the VM, but they are useful
 /// conventions for debugging
 pub const EINSUFFICIENT_BALANCE: u64 = 10; // withdrawing more than an account contains
+pub const EINSUFFICIENT_PRIVILEGES: u64 = 11; // user lacks the credentials to do something
+
 pub const EASSERT_ERROR: u64 = 42; // catch-all error code for assert failures
 
 pub type VMResult<T> = ::std::result::Result<T, VMStatus>;
@@ -65,6 +69,7 @@ pub fn vm_status_of_result<T>(result: &VMResult<T>) -> VMStatus {
 pub fn convert_prologue_runtime_error(err: &VMStatus, txn_sender: &AccountAddress) -> VMStatus {
     if err.major_status == StatusCode::ABORTED {
         match err.sub_status {
+            Some(EACCOUNT_FROZEN) => VMStatus::new(StatusCode::SENDING_ACCOUNT_FROZEN),
             // Invalid authentication key
             Some(EBAD_ACCOUNT_AUTHENTICATION_KEY) => VMStatus::new(StatusCode::INVALID_AUTH_KEY),
             // Sequence number too old
@@ -80,6 +85,7 @@ pub fn convert_prologue_runtime_error(err: &VMStatus, txn_sender: &AccountAddres
             Some(ECANT_PAY_GAS_DEPOSIT) => {
                 VMStatus::new(StatusCode::INSUFFICIENT_BALANCE_FOR_TRANSACTION_FEE)
             }
+            Some(ETRANSACTION_EXPIRED) => VMStatus::new(StatusCode::TRANSACTION_EXPIRED),
             // This should never happen...
             _ => err.clone(),
         }

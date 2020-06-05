@@ -1,22 +1,35 @@
+// Copyright (c) The Libra Core Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::OP_COUNTER;
-use canonical_serialization::{
-    CanonicalDeserialize, CanonicalDeserializer, CanonicalSerialize, CanonicalSerializer,
-};
-use failure::prelude::*;
+use libra_metrics::{register_int_gauge_vec, IntGaugeVec};
 use num_derive::ToPrimitive;
 use num_traits::ToPrimitive;
-#[cfg(any(test, feature = "testing"))]
+use num_variants::NumVariants;
+use once_cell::sync::Lazy;
+#[cfg(test)]
 use proptest::{collection::hash_map, prelude::*};
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 use proptest_derive::Arbitrary;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use strum::IntoEnumIterator;
-use strum_macros::{AsRefStr, EnumIter};
+
+// register Prometheus counters
+pub static LIBRA_STORAGE_LEDGER: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        // metric name
+        "libra_storage_ledger",
+        // metric description
+        "Libra storage ledger counters",
+        // metric labels (dimensions)
+        &["type"]
+    )
+    .unwrap()
+});
 
 /// Types of ledger counters.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ToPrimitive, EnumIter, AsRefStr)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
-#[strum(serialize_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ToPrimitive, NumVariants)]
+#[cfg_attr(test, derive(Arbitrary))]
 pub(crate) enum LedgerCounter {
     EventsCreated = 101,
 
@@ -27,7 +40,33 @@ pub(crate) enum LedgerCounter {
     StaleStateNodes = 302,
 }
 
-#[derive(Clone, Eq, PartialEq, Debug)]
+impl LedgerCounter {
+    const VARIANTS: [LedgerCounter; LedgerCounter::NUM_VARIANTS] = [
+        LedgerCounter::EventsCreated,
+        LedgerCounter::NewStateLeaves,
+        LedgerCounter::StaleStateLeaves,
+        LedgerCounter::NewStateNodes,
+        LedgerCounter::StaleStateNodes,
+    ];
+
+    const STR_EVENTS_CREATED: &'static str = "events_created";
+    const STR_NEW_STATE_LEAVES: &'static str = "new_state_leaves";
+    const STR_STALE_STATE_LEAVES: &'static str = "stale_state_leaves";
+    const STR_NEW_STATE_NODES: &'static str = "new_state_nodes";
+    const STR_STALE_STATE_NODES: &'static str = "stale_state_nodes";
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::EventsCreated => Self::STR_EVENTS_CREATED,
+            Self::NewStateLeaves => Self::STR_NEW_STATE_LEAVES,
+            Self::StaleStateLeaves => Self::STR_STALE_STATE_LEAVES,
+            Self::NewStateNodes => Self::STR_NEW_STATE_NODES,
+            Self::StaleStateNodes => Self::STR_STALE_STATE_NODES,
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
 struct InnerLedgerCounters {
     counters: BTreeMap<u16, usize>,
 }
@@ -96,7 +135,7 @@ impl LedgerCounterBumps {
 }
 
 /// Represents ledger counter values at a certain version.
-#[derive(Clone, Eq, PartialEq, Debug)]
+#[derive(Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
 pub(crate) struct LedgerCounters {
     counters: InnerLedgerCounters,
 }
@@ -120,8 +159,11 @@ impl LedgerCounters {
 
     /// Bump Prometheus counters.
     pub fn bump_op_counters(&self) {
-        for counter in LedgerCounter::iter() {
-            OP_COUNTER.set(counter.as_ref(), self.get(counter));
+        for counter in &LedgerCounter::VARIANTS {
+            OP_COUNTER.set(counter.name(), self.get(*counter));
+            LIBRA_STORAGE_LEDGER
+                .with_label_values(&[counter.name()])
+                .set(self.get(*counter) as i64);
         }
     }
 
@@ -131,24 +173,7 @@ impl LedgerCounters {
     }
 }
 
-impl CanonicalSerialize for LedgerCounters {
-    fn serialize(&self, serializer: &mut impl CanonicalSerializer) -> Result<()> {
-        serializer.encode_btreemap(&self.counters.counters)?;
-        Ok(())
-    }
-}
-
-impl CanonicalDeserialize for LedgerCounters {
-    fn deserialize(deserializer: &mut impl CanonicalDeserializer) -> Result<Self> {
-        let counters = deserializer.decode_btreemap::<u16, usize>()?;
-
-        Ok(Self {
-            counters: InnerLedgerCounters { counters },
-        })
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 prop_compose! {
     pub(crate) fn ledger_counters_strategy()(
         counters_map in hash_map(any::<LedgerCounter>(), any::<usize>(), 0..3)
@@ -162,7 +187,7 @@ prop_compose! {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 impl Arbitrary for LedgerCounters {
     type Parameters = ();
     type Strategy = BoxedStrategy<Self>;

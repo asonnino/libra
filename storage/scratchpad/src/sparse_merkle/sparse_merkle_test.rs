@@ -3,24 +3,24 @@
 
 use super::{
     node::{LeafNode, LeafValue, SparseMerkleNode},
-    AccountState, ProofRead, SparseMerkleTree,
+    AccountStatus, ProofRead, SparseMerkleTree,
 };
-use crypto::{
+use libra_crypto::{
     hash::{CryptoHash, TestOnlyHash, SPARSE_MERKLE_PLACEHOLDER_HASH},
     HashValue,
 };
-use std::{collections::HashMap, sync::Arc};
-use types::{
+use libra_types::{
     account_state_blob::AccountStateBlob,
-    proof::{verify_sparse_merkle_element, SparseMerkleProof},
+    proof::{SparseMerkleLeafNode, SparseMerkleProof},
 };
+use std::{collections::HashMap, sync::Arc};
 
 fn hash_internal(left_child: HashValue, right_child: HashValue) -> HashValue {
-    types::proof::SparseMerkleInternalNode::new(left_child, right_child).hash()
+    libra_types::proof::SparseMerkleInternalNode::new(left_child, right_child).hash()
 }
 
 fn hash_leaf(key: HashValue, value_hash: HashValue) -> HashValue {
-    types::proof::SparseMerkleLeafNode::new(key, value_hash).hash()
+    SparseMerkleLeafNode::new(key, value_hash).hash()
 }
 
 #[derive(Default)]
@@ -203,7 +203,7 @@ fn test_construct_subtree_at_bottom_found_leaf_node() {
         iter.next();
         iter
     };
-    let leaf = Some((existing_key, existing_blob_hash));
+    let leaf = Some(SparseMerkleLeafNode::new(existing_key, existing_blob_hash));
     let siblings: Vec<_> = (0..2)
         .map(|x| HashValue::new([x; HashValue::LENGTH]))
         .collect();
@@ -292,6 +292,7 @@ fn test_construct_subtree_at_bottom_found_subtree_node() {
     };
     let leaf = None;
     let siblings: Vec<_> = (3..7)
+        .rev()
         .map(|x| HashValue::new([x; HashValue::LENGTH]))
         .collect();
     let proof = SparseMerkleProof::new(leaf, siblings);
@@ -346,17 +347,18 @@ fn test_update_256_siblings_in_proof() {
         .take(255)
         .collect();
     siblings.push(leaf2_hash);
-    let proof_of_key1 = SparseMerkleProof::new(Some((key1, value1_hash)), siblings.clone());
-
-    let old_root_hash = siblings
-        .iter()
-        .rev()
-        .fold(leaf1_hash, |previous_hash, hash| {
-            hash_internal(previous_hash, *hash)
-        });
-    assert!(
-        verify_sparse_merkle_element(old_root_hash, key1, &Some(blob1), &proof_of_key1).is_ok()
+    siblings.reverse();
+    let proof_of_key1 = SparseMerkleProof::new(
+        Some(SparseMerkleLeafNode::new(key1, value1_hash)),
+        siblings.clone(),
     );
+
+    let old_root_hash = siblings.iter().fold(leaf1_hash, |previous_hash, hash| {
+        hash_internal(previous_hash, *hash)
+    });
+    assert!(proof_of_key1
+        .verify(old_root_hash, key1, Some(&blob1))
+        .is_ok());
 
     let new_blob1 = AccountStateBlob::from(b"value1111111111111".to_vec());
     let proof_reader = ProofReader::new(vec![(key1, proof_of_key1)]);
@@ -367,19 +369,16 @@ fn test_update_256_siblings_in_proof() {
 
     let new_blob1_hash = new_blob1.hash();
     let new_leaf1_hash = hash_leaf(key1, new_blob1_hash);
-    let new_root_hash = siblings
-        .iter()
-        .rev()
-        .fold(new_leaf1_hash, |previous_hash, hash| {
-            hash_internal(previous_hash, *hash)
-        });
+    let new_root_hash = siblings.iter().fold(new_leaf1_hash, |previous_hash, hash| {
+        hash_internal(previous_hash, *hash)
+    });
     assert_eq!(new_smt.root_hash(), new_root_hash);
 
     assert_eq!(
         new_smt.get(key1),
-        AccountState::ExistsInScratchPad(new_blob1)
+        AccountStatus::ExistsInScratchPad(new_blob1)
     );
-    assert_eq!(new_smt.get(key2), AccountState::Unknown);
+    assert_eq!(new_smt.get(key2), AccountStatus::Unknown);
 }
 
 #[test]
@@ -425,14 +424,15 @@ fn test_update() {
     let value4 = AccountStateBlob::from(b"value".to_vec());
 
     // Create a proof for this new key.
-    let leaf1_hash = hash_leaf(key1, value1_hash);
+    let leaf1 = SparseMerkleLeafNode::new(key1, value1_hash);
+    let leaf1_hash = leaf1.hash();
     let leaf2_hash = hash_leaf(key2, value2_hash);
     let leaf3_hash = hash_leaf(key3, value3_hash);
     let x_hash = hash_internal(leaf1_hash, leaf2_hash);
     let y_hash = hash_internal(x_hash, *SPARSE_MERKLE_PLACEHOLDER_HASH);
     let old_root_hash = hash_internal(y_hash, leaf3_hash);
-    let proof = SparseMerkleProof::new(None, vec![leaf3_hash, x_hash]);
-    assert!(verify_sparse_merkle_element(old_root_hash, key4, &None, &proof).is_ok());
+    let proof = SparseMerkleProof::new(None, vec![x_hash, leaf3_hash]);
+    assert!(proof.verify(old_root_hash, key4, None).is_ok());
 
     // Create the old tree and update the tree with new value and proof.
     let proof_reader = ProofReader::new(vec![(key4, proof)]);
@@ -447,17 +447,17 @@ fn test_update() {
     //           y      key3 (subtree)
     //          / \
     //         x   key4
-    assert_eq!(smt1.get(key1), AccountState::Unknown);
-    assert_eq!(smt1.get(key2), AccountState::Unknown);
-    assert_eq!(smt1.get(key3), AccountState::Unknown);
+    assert_eq!(smt1.get(key1), AccountStatus::Unknown);
+    assert_eq!(smt1.get(key2), AccountStatus::Unknown);
+    assert_eq!(smt1.get(key3), AccountStatus::Unknown);
     assert_eq!(
         smt1.get(key4),
-        AccountState::ExistsInScratchPad(value4.clone())
+        AccountStatus::ExistsInScratchPad(value4.clone())
     );
 
     let non_existing_key = b"foo".test_only_hash();
     assert_eq!(non_existing_key[0], 0b0111_0110);
-    assert_eq!(smt1.get(non_existing_key), AccountState::DoesNotExist);
+    assert_eq!(smt1.get(non_existing_key), AccountStatus::DoesNotExist);
 
     // Verify root hash.
     let value4_hash = value4.hash();
@@ -468,10 +468,10 @@ fn test_update() {
 
     // Next, we are going to modify key1. Create a proof for key1.
     let proof = SparseMerkleProof::new(
-        Some((key1, value1_hash)),
-        vec![leaf3_hash, *SPARSE_MERKLE_PLACEHOLDER_HASH, leaf2_hash],
+        Some(leaf1),
+        vec![leaf2_hash, *SPARSE_MERKLE_PLACEHOLDER_HASH, leaf3_hash],
     );
-    assert!(verify_sparse_merkle_element(old_root_hash, key1, &Some(value1), &proof).is_ok());
+    assert!(proof.verify(old_root_hash, key1, Some(&value1)).is_ok());
 
     let value1 = AccountStateBlob::from(b"value11111".to_vec());
     let proof_reader = ProofReader::new(vec![(key1, proof)]);
@@ -489,14 +489,11 @@ fn test_update() {
     //     key1    key2 (subtree)
     assert_eq!(
         smt2.get(key1),
-        AccountState::ExistsInScratchPad(value1.clone())
+        AccountStatus::ExistsInScratchPad(value1.clone())
     );
-    assert_eq!(smt2.get(key2), AccountState::Unknown);
-    assert_eq!(smt2.get(key3), AccountState::Unknown);
-    assert_eq!(
-        smt2.get(key4),
-        AccountState::ExistsInScratchPad(value4.clone())
-    );
+    assert_eq!(smt2.get(key2), AccountStatus::Unknown);
+    assert_eq!(smt2.get(key3), AccountStatus::Unknown);
+    assert_eq!(smt2.get(key4), AccountStatus::ExistsInScratchPad(value4));
 
     // Verify root hash.
     let value1_hash = value1.hash();
@@ -514,12 +511,12 @@ fn test_update() {
         .update(vec![(key4, value4.clone())], &proof_reader)
         .unwrap();
 
-    assert_eq!(smt22.get(key1), AccountState::Unknown);
-    assert_eq!(smt22.get(key2), AccountState::Unknown);
-    assert_eq!(smt22.get(key3), AccountState::Unknown);
+    assert_eq!(smt22.get(key1), AccountStatus::Unknown);
+    assert_eq!(smt22.get(key2), AccountStatus::Unknown);
+    assert_eq!(smt22.get(key3), AccountStatus::Unknown);
     assert_eq!(
         smt22.get(key4),
-        AccountState::ExistsInScratchPad(value4.clone())
+        AccountStatus::ExistsInScratchPad(value4.clone())
     );
 
     // Now prune smt1.
@@ -527,21 +524,15 @@ fn test_update() {
 
     // For smt2, only key1 should be available since smt2 was constructed by updating smt1 with
     // key1.
-    assert_eq!(
-        smt2.get(key1),
-        AccountState::ExistsInScratchPad(value1.clone())
-    );
-    assert_eq!(smt2.get(key2), AccountState::Unknown);
-    assert_eq!(smt2.get(key3), AccountState::Unknown);
-    assert_eq!(smt2.get(key4), AccountState::Unknown);
+    assert_eq!(smt2.get(key1), AccountStatus::ExistsInScratchPad(value1));
+    assert_eq!(smt2.get(key2), AccountStatus::Unknown);
+    assert_eq!(smt2.get(key3), AccountStatus::Unknown);
+    assert_eq!(smt2.get(key4), AccountStatus::Unknown);
 
     // For smt22, only key4 should be available since smt22 was constructed by updating smt1 with
     // key4.
-    assert_eq!(smt22.get(key1), AccountState::Unknown);
-    assert_eq!(smt22.get(key2), AccountState::Unknown);
-    assert_eq!(smt22.get(key3), AccountState::Unknown);
-    assert_eq!(
-        smt22.get(key4),
-        AccountState::ExistsInScratchPad(value4.clone())
-    );
+    assert_eq!(smt22.get(key1), AccountStatus::Unknown);
+    assert_eq!(smt22.get(key2), AccountStatus::Unknown);
+    assert_eq!(smt22.get(key3), AccountStatus::Unknown);
+    assert_eq!(smt22.get(key4), AccountStatus::ExistsInScratchPad(value4));
 }

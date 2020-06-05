@@ -3,7 +3,7 @@
 
 //! This module defines physical storage schema for a transaction index via which the version of a
 //! transaction sent by `account_address` with `sequence_number` can be found. With the version one
-//! can resort to `SignedTransactionSchema` for the transaction content.
+//! can resort to `TransactionSchema` for the transaction content.
 //!
 //! ```text
 //! |<-------key------->|<-value->|
@@ -11,17 +11,14 @@
 //! ```
 
 use crate::schema::{ensure_slice_len_eq, TRANSACTION_BY_ACCOUNT_CF_NAME};
+use anyhow::Result;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use failure::prelude::*;
+use libra_types::{account_address::AccountAddress, transaction::Version};
 use schemadb::{
     define_schema,
     schema::{KeyCodec, ValueCodec},
 };
 use std::{convert::TryFrom, mem::size_of};
-use types::{
-    account_address::{AccountAddress, ADDRESS_LENGTH},
-    transaction::Version,
-};
 
 define_schema!(
     TransactionByAccountSchema,
@@ -46,8 +43,8 @@ impl KeyCodec<TransactionByAccountSchema> for Key {
     fn decode_key(data: &[u8]) -> Result<Self> {
         ensure_slice_len_eq(data, size_of::<Self>())?;
 
-        let address = AccountAddress::try_from(&data[..ADDRESS_LENGTH])?;
-        let seq_num = (&data[ADDRESS_LENGTH..]).read_u64::<BigEndian>()?;
+        let address = AccountAddress::try_from(&data[..AccountAddress::LENGTH])?;
+        let seq_num = (&data[AccountAddress::LENGTH..]).read_u64::<BigEndian>()?;
 
         Ok((address, seq_num))
     }

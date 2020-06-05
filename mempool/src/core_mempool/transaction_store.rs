@@ -7,19 +7,23 @@ use crate::{
             AccountTransactions, ParkingLotIndex, PriorityIndex, PriorityQueueIter, TTLIndex,
             TimelineIndex,
         },
-        transaction::{MempoolAddTransactionStatus, MempoolTransaction, TimelineState},
+        transaction::{MempoolTransaction, TimelineState},
     },
-    proto::shared::mempool_status::MempoolAddTransactionStatusCode,
     OP_COUNTERS,
 };
-use config::config::MempoolConfig;
-use failure::prelude::*;
+use anyhow::{format_err, Result};
+use libra_config::config::MempoolConfig;
+use libra_logger::prelude::*;
+use libra_types::{
+    account_address::AccountAddress,
+    mempool_status::{MempoolStatus, MempoolStatusCode},
+    transaction::SignedTransaction,
+};
 use std::{
     collections::HashMap,
     ops::Bound,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use types::{account_address::AccountAddress, transaction::SignedTransaction};
 
 /// TransactionStore is in-memory storage for all transactions in mempool
 pub struct TransactionStore {
@@ -86,23 +90,20 @@ impl TransactionStore {
         &mut self,
         txn: MempoolTransaction,
         current_sequence_number: u64,
-    ) -> MempoolAddTransactionStatus {
+    ) -> MempoolStatus {
         if self.handle_gas_price_update(&txn).is_err() {
-            return MempoolAddTransactionStatus::new(
-                MempoolAddTransactionStatusCode::InvalidUpdate,
-                format!("Failed to update gas price to {}", txn.get_gas_price()),
-            );
+            return MempoolStatus::new(MempoolStatusCode::InvalidUpdate).with_message(format!(
+                "Failed to update gas price to {}",
+                txn.get_gas_price()
+            ));
         }
 
-        if self.check_if_full() {
-            return MempoolAddTransactionStatus::new(
-                MempoolAddTransactionStatusCode::MempoolIsFull,
-                format!(
-                    "mempool size: {}, capacity: {}",
-                    self.system_ttl_index.size(),
-                    self.capacity,
-                ),
-            );
+        if self.check_if_full(&txn, current_sequence_number) {
+            return MempoolStatus::new(MempoolStatusCode::MempoolIsFull).with_message(format!(
+                "mempool size: {}, capacity: {}",
+                self.system_ttl_index.size(),
+                self.capacity,
+            ));
         }
 
         let address = txn.get_sender();
@@ -112,11 +113,12 @@ impl TransactionStore {
             .entry(address)
             .or_insert_with(AccountTransactions::new);
 
+        self.clean_committed_transactions(&address, current_sequence_number);
+
         if let Some(txns) = self.transactions.get_mut(&address) {
             // capacity check
             if txns.len() >= self.capacity_per_user {
-                return MempoolAddTransactionStatus::new(
-                    MempoolAddTransactionStatusCode::TooManyTransactions,
+                return MempoolStatus::new(MempoolStatusCode::TooManyTransactions).with_message(
                     format!(
                         "txns length: {} capacity per user: {}",
                         txns.len(),
@@ -129,21 +131,25 @@ impl TransactionStore {
             self.system_ttl_index.insert(&txn);
             self.expiration_time_index.insert(&txn);
             txns.insert(sequence_number, txn);
-            OP_COUNTERS.set("txn.system_ttl_index", self.system_ttl_index.size());
+            self.track_indices();
         }
         self.process_ready_transactions(&address, current_sequence_number);
-        MempoolAddTransactionStatus::new(MempoolAddTransactionStatusCode::Valid, "".to_string())
+        MempoolStatus::new(MempoolStatusCode::Accepted)
     }
 
-    /// Check if mempool can handle new insertion requests
-    pub(crate) fn health_check(&self) -> bool {
-        self.system_ttl_index.size() < self.capacity || self.parking_lot_index.size() > 0
+    fn track_indices(&self) {
+        OP_COUNTERS.set("txn.system_ttl_index", self.system_ttl_index.size());
+        OP_COUNTERS.set("txn.parking_lot_index", self.parking_lot_index.size());
+        OP_COUNTERS.set("txn.priority_index", self.priority_index.size());
     }
 
     /// checks if Mempool is full
     /// If it's full, tries to free some space by evicting transactions from ParkingLot
-    fn check_if_full(&mut self) -> bool {
-        if self.system_ttl_index.size() >= self.capacity {
+    /// We only evict on attempt to insert a transaction that would be ready for broadcast upon insertion
+    fn check_if_full(&mut self, txn: &MempoolTransaction, curr_sequence_number: u64) -> bool {
+        if self.system_ttl_index.size() >= self.capacity
+            && self.check_txn_ready(txn, curr_sequence_number)
+        {
             // try to free some space in Mempool from ParkingLot
             if let Some((address, sequence_number)) = self.parking_lot_index.pop() {
                 if let Some(txn) = self
@@ -156,6 +162,32 @@ impl TransactionStore {
             }
         }
         self.system_ttl_index.size() >= self.capacity
+    }
+
+    /// check if a transaction would be ready for broadcast in mempool upon insertion (without inserting it)
+    /// Two ways this can happen:
+    /// 1. txn sequence number == curr_sequence_number
+    /// (this handles both cases where (1) txn is first possible txn for an account
+    /// and (2) previous txn is committed)
+    /// 2. the txn before this is ready for broadcast but not yet committed
+    fn check_txn_ready(&mut self, txn: &MempoolTransaction, curr_sequence_number: u64) -> bool {
+        let tx_sequence_number = txn.get_sequence_number();
+        if tx_sequence_number == curr_sequence_number {
+            return true;
+        } else if tx_sequence_number == 0 {
+            // shouldn't really get here because filtering out old txn sequence numbers happens earlier in workflow
+            unreachable!("[mempool] already committed txn detected, cannot be checked for readiness upon insertion");
+        }
+
+        // check previous txn in sequence is ready
+        if let Some(account_txns) = self.transactions.get(&txn.get_sender()) {
+            if let Some(prev_txn) = account_txns.get(&(tx_sequence_number - 1)) {
+                if let TimelineState::Ready(_) = prev_txn.timeline_state {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// check if transaction is already present in Mempool
@@ -202,27 +234,30 @@ impl TransactionStore {
                 }
                 sequence_number += 1;
             }
+
+            let mut parking_lot_txns = 0;
             for (_, txn) in txns.range_mut((Bound::Excluded(sequence_number), Bound::Unbounded)) {
                 match txn.timeline_state {
                     TimelineState::Ready(_) => {}
                     _ => {
                         self.parking_lot_index.insert(&txn);
+                        parking_lot_txns += 1;
                     }
                 }
             }
+            trace!("[Mempool] txns for account {:?}. Current sequence_number: {}, length: {}, parking lot: {}",
+                address, current_sequence_number, txns.len(), parking_lot_txns,
+            );
         }
     }
 
-    /// handles transaction commit
-    /// it includes deletion of all transactions with sequence number <= `sequence_number`
-    /// and potential promotion of sequential txns to PriorityIndex/TimelineIndex
-    pub(crate) fn commit_transaction(&mut self, account: &AccountAddress, sequence_number: u64) {
-        if let Some(txns) = self.transactions.get_mut(&account) {
-            // remove all previous seq number transactions for this account
-            // This can happen if transactions are sent to multiple nodes and one of
-            // nodes has sent the transaction to consensus but this node still has the
-            // transaction sitting in mempool
-            let mut active = txns.split_off(&(sequence_number + 1));
+    fn clean_committed_transactions(&mut self, address: &AccountAddress, sequence_number: u64) {
+        // remove all previous seq number transactions for this account
+        // This can happen if transactions are sent to multiple nodes and one of
+        // nodes has sent the transaction to consensus but this node still has the
+        // transaction sitting in mempool
+        if let Some(txns) = self.transactions.get_mut(&address) {
+            let mut active = txns.split_off(&sequence_number);
             let txns_for_removal = txns.clone();
             txns.clear();
             txns.append(&mut active);
@@ -231,7 +266,26 @@ impl TransactionStore {
                 self.index_remove(transaction);
             }
         }
-        self.process_ready_transactions(account, sequence_number + 1);
+    }
+
+    /// handles transaction commit
+    /// it includes deletion of all transactions with sequence number <= `account_sequence_number`
+    /// and potential promotion of sequential txns to PriorityIndex/TimelineIndex
+    pub(crate) fn commit_transaction(
+        &mut self,
+        account: &AccountAddress,
+        account_sequence_number: u64,
+    ) {
+        self.clean_committed_transactions(account, account_sequence_number);
+        self.process_ready_transactions(account, account_sequence_number);
+    }
+
+    pub(crate) fn reject_transaction(&mut self, account: &AccountAddress, _sequence_number: u64) {
+        if let Some(txns) = self.transactions.remove(&account) {
+            for transaction in txns.values() {
+                self.index_remove(&transaction);
+            }
+        }
     }
 
     /// removes transaction from all indexes
@@ -241,16 +295,7 @@ impl TransactionStore {
         self.priority_index.remove(&txn);
         self.timeline_index.remove(&txn);
         self.parking_lot_index.remove(&txn);
-        OP_COUNTERS.set("txn.system_ttl_index", self.system_ttl_index.size());
-    }
-
-    /// returns gas amount required to process all transactions for given account
-    pub(crate) fn get_required_balance(&mut self, address: &AccountAddress) -> u64 {
-        self.transactions.get_mut(&address).map_or(0, |txns| {
-            txns.iter().fold(0, |acc, (_, txn)| {
-                acc + txn.txn.gas_unit_price() * txn.gas_amount
-            })
-        })
+        self.track_indices();
     }
 
     /// Read `count` transactions from timeline since `timeline_id`
@@ -275,6 +320,28 @@ impl TransactionStore {
             }
         }
         (batch, last_timeline_id)
+    }
+
+    /// Returns block of transactions with timeline id in the range `start_timeline_id` exclusive to `end_timeline_id` inclusive
+    pub(crate) fn timeline_range(
+        &mut self,
+        start_timeline_id: u64,
+        end_timeline_id: u64,
+    ) -> Vec<SignedTransaction> {
+        let mut batch = vec![];
+        for (address, sequence_number) in self
+            .timeline_index
+            .range(start_timeline_id, end_timeline_id)
+        {
+            if let Some(txn) = self
+                .transactions
+                .get_mut(&address)
+                .and_then(|txns| txns.get(&sequence_number))
+            {
+                batch.push(txn.txn.clone());
+            }
+        }
+        batch
     }
 
     /// GC old transactions
@@ -315,7 +382,7 @@ impl TransactionStore {
                 }
             }
         }
-        OP_COUNTERS.set("txn.system_ttl_index", self.system_ttl_index.size());
+        self.track_indices();
     }
 
     pub(crate) fn iter_queue(&self) -> PriorityQueueIter {

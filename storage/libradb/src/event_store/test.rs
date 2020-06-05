@@ -3,24 +3,23 @@
 
 use super::*;
 use crate::LibraDB;
-use crypto::hash::ACCUMULATOR_PLACEHOLDER_HASH;
 use itertools::Itertools;
+use libra_crypto::hash::ACCUMULATOR_PLACEHOLDER_HASH;
+use libra_proptest_helpers::Index;
+use libra_temppath::TempPath;
+use libra_types::{
+    account_address::AccountAddress,
+    contract_event::ContractEvent,
+    event::EventKey,
+    proptest_types::{AccountInfoUniverse, ContractEventGen},
+};
 use proptest::{
     collection::{hash_set, vec},
     prelude::*,
     strategy::Union,
 };
-use proptest_helpers::Index;
 use rand::Rng;
 use std::collections::HashMap;
-use tools::tempdir::TempPath;
-use types::{
-    account_address::AccountAddress,
-    contract_event::ContractEvent,
-    event::EventKey,
-    proof::verify_event_accumulator_element,
-    proptest_types::{AccountInfoUniverse, ContractEventGen},
-};
 
 fn save(store: &EventStore, version: Version, events: &[ContractEvent]) -> HashValue {
     let mut cs = ChangeSet::new();
@@ -37,7 +36,7 @@ fn save(store: &EventStore, version: Version, events: &[ContractEvent]) -> HashV
 #[test]
 fn test_put_empty() {
     let tmp_dir = TempPath::new();
-    let db = LibraDB::new(&tmp_dir);
+    let db = LibraDB::new_for_test(&tmp_dir);
     let store = &db.event_store;
     let mut cs = ChangeSet::new();
     assert_eq!(
@@ -49,7 +48,7 @@ fn test_put_empty() {
 #[test]
 fn test_error_on_get_from_empty() {
     let tmp_dir = TempPath::new();
-    let db = LibraDB::new(&tmp_dir);
+    let db = LibraDB::new_for_test(&tmp_dir);
     let store = &db.event_store;
 
     assert!(store
@@ -63,7 +62,7 @@ proptest! {
     #[test]
     fn test_put_get_verify(events in vec(any::<ContractEvent>().no_shrink(), 1..100)) {
         let tmp_dir = TempPath::new();
-        let db = LibraDB::new(&tmp_dir);
+        let db = LibraDB::new_for_test(&tmp_dir);
         let store = &db.event_store;
 
         let root_hash = save(store, 100, &events);
@@ -74,7 +73,7 @@ proptest! {
                 .get_event_with_proof_by_version_and_index(100, idx as u64)
                 .unwrap();
             prop_assert_eq!(&event, expected_event);
-            verify_event_accumulator_element(root_hash, event.hash(),  idx as u64, &proof).unwrap();
+            proof.verify(root_hash, event.hash(), idx as u64).unwrap();
         }
         // error on index >= num_events
         prop_assert!(store
@@ -95,7 +94,7 @@ proptest! {
     ) {
 
         let tmp_dir = TempPath::new();
-        let db = LibraDB::new(&tmp_dir);
+        let db = LibraDB::new_for_test(&tmp_dir);
         let store = &db.event_store;
         // Save 3 chunks at different versions
         save(store, 99 /*version*/, &events1);
@@ -187,7 +186,7 @@ proptest! {
 fn test_get_events_by_access_path_impl(event_batches: Vec<Vec<ContractEvent>>) {
     // Put into db.
     let tmp_dir = TempPath::new();
-    let db = LibraDB::new(&tmp_dir);
+    let db = LibraDB::new_for_test(&tmp_dir);
     let store = &db.event_store;
 
     let mut cs = ChangeSet::new();
@@ -201,11 +200,9 @@ fn test_get_events_by_access_path_impl(event_batches: Vec<Vec<ContractEvent>>) {
     let mut events_by_event_key = HashMap::new();
     event_batches.into_iter().for_each(|batch| {
         batch.into_iter().for_each(|e| {
-            let mut events = events_by_event_key
-                .entry(e.key().clone())
-                .or_insert_with(Vec::new);
+            let mut events = events_by_event_key.entry(*e.key()).or_insert_with(Vec::new);
             assert_eq!(events.len() as u64, e.sequence_number());
-            events.push(e.clone());
+            events.push(e);
         })
     });
 

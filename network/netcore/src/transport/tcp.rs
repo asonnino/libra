@@ -2,66 +2,41 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! TCP Transport
-use crate::transport::Transport;
+use crate::{compat::IoCompat, transport::Transport};
 use futures::{
-    compat::{Compat01As03, Future01CompatExt},
     future::{self, Future},
     io::{AsyncRead, AsyncWrite},
     ready,
     stream::Stream,
 };
-use parity_multiaddr::{Multiaddr, Protocol};
+use libra_network_address::{parse_dns_tcp, parse_ip_tcp, NetworkAddress, Protocol};
 use std::{
+    convert::TryFrom,
+    fmt::Debug,
     io,
-    net::{Shutdown, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
 };
-use tokio::net::tcp::{ConnectFuture, Incoming, TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream};
 
 /// Transport to build TCP connections
 #[derive(Debug, Clone, Default)]
 pub struct TcpTransport {
     /// Size of the recv buffer size to set for opened sockets, or `None` to keep default.
-    recv_buffer_size: Option<usize>,
+    pub recv_buffer_size: Option<usize>,
     /// Size of the send buffer size to set for opened sockets, or `None` to keep default.
-    send_buffer_size: Option<usize>,
+    pub send_buffer_size: Option<usize>,
     /// TTL to set for opened sockets, or `None` to keep default.
-    ttl: Option<u32>,
+    pub ttl: Option<u32>,
     /// Keep alive duration to set for opened sockets, or `None` to keep default.
     #[allow(clippy::option_option)]
-    keepalive: Option<Option<Duration>>,
+    pub keepalive: Option<Option<Duration>>,
     /// `TCP_NODELAY` to set for opened sockets, or `None` to keep default.
-    nodelay: Option<bool>,
+    pub nodelay: Option<bool>,
 }
 
 impl TcpTransport {
-    pub fn set_recv_buffer_size(mut self, size: usize) -> Self {
-        self.recv_buffer_size = Some(size);
-        self
-    }
-
-    pub fn set_send_buffer_size(mut self, size: usize) -> Self {
-        self.send_buffer_size = Some(size);
-        self
-    }
-
-    pub fn set_ttl(mut self, ttl: u32) -> Self {
-        self.ttl = Some(ttl);
-        self
-    }
-
-    pub fn set_keepalive(mut self, keepalive: Option<Duration>) -> Self {
-        self.keepalive = Some(keepalive);
-        self
-    }
-
-    pub fn set_nodelay(mut self, nodelay: bool) -> Self {
-        self.nodelay = Some(nodelay);
-        self
-    }
-
     fn apply_config(&self, stream: &TcpStream) -> ::std::io::Result<()> {
         if let Some(size) = self.recv_buffer_size {
             stream.set_recv_buffer_size(size)?;
@@ -94,46 +69,63 @@ impl Transport for TcpTransport {
     type Inbound = future::Ready<io::Result<TcpSocket>>;
     type Outbound = TcpOutbound;
 
-    fn listen_on(&self, addr: Multiaddr) -> Result<(Self::Listener, Multiaddr), Self::Error> {
-        let socket_addr = multiaddr_to_socketaddr(&addr)?;
-        let config = self.clone();
-        let listener = TcpListener::bind(&socket_addr)?;
-        let local_addr = socketaddr_to_multiaddr(listener.local_addr()?);
+    fn listen_on(
+        &self,
+        addr: NetworkAddress,
+    ) -> Result<(Self::Listener, NetworkAddress), Self::Error> {
+        let ((ipaddr, port), addr_suffix) =
+            parse_ip_tcp(addr.as_slice()).ok_or_else(|| invalid_addr_error(&addr))?;
+
+        let listener = ::std::net::TcpListener::bind((ipaddr, port))?;
+        let listener = TcpListener::try_from(listener)?;
+
+        // append the addr_suffix so any trailing protocols get included in the
+        // actual listening adddress we return
+        let actual_addr =
+            NetworkAddress::from(listener.local_addr()?).extend_from_slice(addr_suffix);
+
         Ok((
             TcpListenerStream {
-                inner: Compat01As03::new(listener.incoming()),
-                config,
+                inner: listener,
+                config: self.clone(),
             },
-            local_addr,
+            actual_addr,
         ))
     }
 
-    fn dial(&self, addr: Multiaddr) -> Result<Self::Outbound, Self::Error> {
-        let socket_addr = multiaddr_to_socketaddr(&addr)?;
-        let config = self.clone();
-        let f = TcpStream::connect(&socket_addr).compat();
-        Ok(TcpOutbound { inner: f, config })
+    fn dial(&self, addr: NetworkAddress) -> Result<Self::Outbound, Self::Error> {
+        let (addr_string, _addr_suffix) =
+            parse_addr_and_port(addr.as_slice()).ok_or_else(|| invalid_addr_error(&addr))?;
+        // TODO(philiphayes): use `tokio::net::lookup_host()` then filter the results
+        // so e.g. `Protocol::Dns4` only returns `SocketAddrV4`s and `Protocol::Dns6`
+        // only returns `SocketAddrV6`.
+        let f: Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send + 'static>> =
+            Box::pin(TcpStream::connect(addr_string));
+
+        Ok(TcpOutbound {
+            inner: f,
+            config: self.clone(),
+        })
     }
 }
 
-#[derive(Debug)]
 #[must_use = "streams do nothing unless polled"]
 pub struct TcpListenerStream {
-    inner: Compat01As03<Incoming>,
+    inner: TcpListener,
     config: TcpTransport,
 }
 
 impl Stream for TcpListenerStream {
-    type Item = io::Result<(future::Ready<io::Result<TcpSocket>>, Multiaddr)>;
+    type Item = io::Result<(future::Ready<io::Result<TcpSocket>>, NetworkAddress)>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.inner).poll_next(context) {
+        match Pin::new(&mut self.inner.incoming()).poll_next(context) {
             Poll::Ready(Some(Ok(socket))) => {
                 if let Err(e) = self.config.apply_config(&socket) {
                     return Poll::Ready(Some(Err(e)));
                 }
                 let dialer_addr = match socket.peer_addr() {
-                    Ok(addr) => socketaddr_to_multiaddr(addr),
+                    Ok(addr) => NetworkAddress::from(addr),
                     Err(e) => return Poll::Ready(Some(Err(e))),
                 };
                 Poll::Ready(Some(Ok((
@@ -148,15 +140,14 @@ impl Stream for TcpListenerStream {
     }
 }
 
-#[derive(Debug)]
 #[must_use = "futures do nothing unless polled"]
 pub struct TcpOutbound {
-    inner: Compat01As03<ConnectFuture>,
+    inner: Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send + 'static>>,
     config: TcpTransport,
 }
 
 impl Future for TcpOutbound {
-    type Output = Result<TcpSocket, ::std::io::Error>;
+    type Output = io::Result<TcpSocket>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context) -> Poll<Self::Output> {
         let socket = ready!(Pin::new(&mut self.inner).poll(context))?;
@@ -174,13 +165,13 @@ impl Future for TcpOutbound {
 //TODO Probably should add some tests for this
 #[derive(Debug)]
 pub struct TcpSocket {
-    inner: Compat01As03<TcpStream>,
+    inner: IoCompat<TcpStream>,
 }
 
 impl TcpSocket {
     fn new(socket: TcpStream) -> Self {
         Self {
-            inner: Compat01As03::new(socket),
+            inner: IoCompat::new(socket),
         }
     }
 }
@@ -208,78 +199,54 @@ impl AsyncWrite for TcpSocket {
         Pin::new(&mut self.inner).poll_flush(context)
     }
 
-    fn poll_close(self: Pin<&mut Self>, _context: &mut Context) -> Poll<io::Result<()>> {
-        Poll::Ready(self.inner.get_ref().shutdown(Shutdown::Write))
+    fn poll_close(mut self: Pin<&mut Self>, context: &mut Context) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_close(context)
     }
 }
 
-fn socketaddr_to_multiaddr(socketaddr: SocketAddr) -> Multiaddr {
-    let ipaddr: Multiaddr = socketaddr.ip().into();
-    ipaddr.with(Protocol::Tcp(socketaddr.port()))
+fn invalid_addr_error(addr: &NetworkAddress) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("Invalid NetworkAddress: '{}'", addr),
+    )
 }
 
-fn multiaddr_to_socketaddr(addr: &Multiaddr) -> ::std::io::Result<SocketAddr> {
-    let mut iter = addr.iter();
-    let proto1 = iter.next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Invalid Multiaddr '{:?}'", addr),
-        )
-    })?;
-    let proto2 = iter.next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Invalid Multiaddr '{:?}'", addr),
-        )
-    })?;
-
-    if iter.next().is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Invalid Multiaddr '{:?}'", addr),
-        ));
-    }
-
-    match (proto1, proto2) {
-        (Protocol::Ip4(ip), Protocol::Tcp(port)) => Ok(SocketAddr::new(ip.into(), port)),
-        (Protocol::Ip6(ip), Protocol::Tcp(port)) => Ok(SocketAddr::new(ip.into(), port)),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Invalid Multiaddr '{:?}'", addr),
-        )),
-    }
+fn parse_addr_and_port(protos: &[Protocol]) -> Option<(String, &[Protocol])> {
+    parse_ip_tcp(protos)
+        .map(|((ip, port), suffix)| (format!("{}:{}", ip, port), suffix))
+        .or_else(|| {
+            parse_dns_tcp(protos)
+                .map(|((dnsname, port), suffix)| (format!("{}:{}", dnsname, port), suffix))
+        })
 }
 
 #[cfg(test)]
 mod test {
     use crate::transport::{tcp::TcpTransport, ConnectionOrigin, Transport, TransportExt};
     use futures::{
-        executor::block_on,
         future::{join, FutureExt},
         io::{AsyncReadExt, AsyncWriteExt},
         stream::StreamExt,
     };
 
-    #[test]
-    fn simple_listen_and_dial() -> Result<(), ::std::io::Error> {
-        let t = TcpTransport::default().and_then(|mut out, connection| {
-            async move {
-                match connection {
-                    ConnectionOrigin::Inbound => {
-                        out.write_all(b"Earth").await?;
-                        let mut buf = [0; 3];
-                        out.read_exact(&mut buf).await?;
-                        assert_eq!(&buf, b"Air");
-                    }
-                    ConnectionOrigin::Outbound => {
-                        let mut buf = [0; 5];
-                        out.read_exact(&mut buf).await?;
-                        assert_eq!(&buf, b"Earth");
-                        out.write_all(b"Air").await?;
-                    }
+    #[tokio::test]
+    async fn simple_listen_and_dial() -> Result<(), ::std::io::Error> {
+        let t = TcpTransport::default().and_then(|mut out, _addr, origin| async move {
+            match origin {
+                ConnectionOrigin::Inbound => {
+                    out.write_all(b"Earth").await?;
+                    let mut buf = [0; 3];
+                    out.read_exact(&mut buf).await?;
+                    assert_eq!(&buf, b"Air");
                 }
-                Ok(())
+                ConnectionOrigin::Outbound => {
+                    let mut buf = [0; 5];
+                    out.read_exact(&mut buf).await?;
+                    assert_eq!(&buf, b"Earth");
+                    out.write_all(b"Air").await?;
+                }
             }
+            Ok(())
         });
 
         let (listener, addr) = t.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())?;
@@ -290,7 +257,7 @@ mod test {
             incoming.map(Result::unwrap)
         });
 
-        let (outgoing, _incoming) = block_on(join(dial, listener));
+        let (outgoing, _incoming) = join(dial, listener).await;
         assert!(outgoing.is_ok());
         Ok(())
     }
