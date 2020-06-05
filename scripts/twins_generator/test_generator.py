@@ -1,4 +1,4 @@
-from generator import Configs, Generator, GeneratorError
+from generator import Configs, Generator
 
 from datetime import timedelta
 import argparse
@@ -32,14 +32,20 @@ def testcases(generator, partitions_with_leaders):
 
 
 def test_make_config_bad_inputs():
-    with pytest.raises(GeneratorError):
+    with pytest.raises(TypeError):
+        _ = Configs(2, 'a', 8)
+
+    with pytest.raises(ValueError):
         _ = Configs(2, -2, 8)
 
 
 def test_make_generator_bad_inputs():
     configs = Configs(4, 2, 8)
-    with pytest.raises(GeneratorError):
-        _ = Generator(configs, -3, '')
+    with pytest.raises(TypeError):
+        _ = Generator(configs, testcases_per_file='a')
+
+    with pytest.raises(ValueError):
+        _ = Generator(configs, machine_index=-1)
 
 
 def test_make_partitions():
@@ -87,22 +93,19 @@ def test_print():
     assert True
 
 
-# @pytest.mark.skip(reason='Performance benchmark.')
+@pytest.mark.skip(reason='Performance benchmark.')
 def test_performance():
-    from tempfile import TemporaryDirectory
-    with TemporaryDirectory() as directory:
-        generator = Generator(
-            Configs(4, 2, 5), testcases_per_file=100, folder_path=directory
-        )
-        print(f'Generating {generator.testcases_length} testcases..')
-        start_time = time.perf_counter()
-        generator.run(dryrun=True, workers=8)
-        elapsed_time = time.perf_counter() - start_time
-        print(f'Elapsed time: {str(timedelta(seconds=elapsed_time))}')
+    generator = Generator(Configs(4, 2, 5), testcases_per_file=100)
+    print(f'Generating {generator.testcases_length} testcases..')
+    start_time = time.perf_counter()
+    generator.run(dryrun=True, workers=8)
+    elapsed_time = time.perf_counter() - start_time
+    print(f'Elapsed time: {str(timedelta(seconds=elapsed_time))}')
 
 
 if __name__ == '__main__':
     """ Simple cli interface. """
+
     parser = argparse.ArgumentParser(description='Twins Generator.')
     parser.add_argument(
         '--nodes', help='the number of nodes', type=int
@@ -125,6 +128,24 @@ if __name__ == '__main__':
         default='./'
     )
     parser.add_argument(
+        '--index',
+        help='the index of the machine (default "1")',
+        type=int,
+        default=1
+    )
+    parser.add_argument(
+        '--machines',
+        help='the total number of machines (default "1")',
+        type=int,
+        default=1
+    )
+    parser.add_argument(
+        '--workers',
+        help='the number of processes (default "1")',
+        type=int,
+        default=1
+    )
+    parser.add_argument(
         '-v', dest='verb', action='store_true', help='activate verbose logging'
     )
     args = parser.parse_args()
@@ -139,7 +160,15 @@ if __name__ == '__main__':
         )
     if args.testcases_per_file <= 0:
         parser.error(
-            'argument "testcases_per_file" must be positif'
+            'argument "testcases_per_file" must be strictly positif'
+        )
+    if args.index <= 0 or args.index > args.machines:
+        parser.error(
+            'invalid machine index or number of machines'
+        )
+    if args.workers <= 0:
+        parser.error(
+            'argument "workers" must be strictly positif'
         )
 
     logging.basicConfig(
@@ -148,5 +177,12 @@ if __name__ == '__main__':
     )
 
     configs = Configs(args.nodes, args.partitions, args.rounds)
-    generator = Generator(configs, args.testcases_per_file, args.path)
-    generator.run()
+    generator = Generator(
+        configs,
+        filter=None,
+        testcases_per_file=args.testcases_per_file,
+        folder_path=args.path,
+        machine_index=args.index,
+        number_of_machines=args.machines
+    )
+    generator.run(workers=args.workers, dryrun=True)

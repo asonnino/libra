@@ -5,10 +5,7 @@ from os.path import join
 from copy import deepcopy
 from math import ceil, factorial as f
 from multiprocessing import Process
-
-
-class GeneratorError(Exception):
-    pass
+from tempfile import TemporaryDirectory
 
 
 class Format:
@@ -36,13 +33,16 @@ class Format:
 class Configs:
     def __init__(self, number_of_nodes, number_of_partitions, number_of_rounds):
         ok = isinstance(number_of_nodes, int)
-        ok &= number_of_nodes > 0
         ok &= isinstance(number_of_partitions, int)
-        ok &= number_of_partitions > 0
         ok &= isinstance(number_of_rounds, int)
+        if not ok:
+            raise TypeError('Bad input types.')
+
+        ok &= number_of_nodes > 0
+        ok &= number_of_partitions > 0
         ok &= number_of_rounds > 0
         if not ok:
-            raise GeneratorError('Bad input arguments.')
+            raise ValueError('Bad input values.')
 
         self.number_of_nodes = number_of_nodes
         self.number_of_partitions = number_of_partitions
@@ -57,7 +57,8 @@ class Configs:
 
 
 class Generator:
-    def __init__(self, configs, testcases_per_file=100, folder_path='./'):
+    def __init__(self, configs, filter=None, testcases_per_file=100,
+                 folder_path='./', machine_index=1, number_of_machines=1):
         """ Instantiate the generator.
 
         Generate indices of nodes. There are three kinds of nodes:
@@ -82,25 +83,38 @@ class Generator:
                 the testcases. Defaults to './'.
 
         Raises:
+            TypeError: Raised upon invalid input types.
+            ValueError: Raised upon invalid input values.
             GeneratorError: Raised upon invalid input arguments.
         """
         self.logger = logging.getLogger(name='generator')
+
         ok = isinstance(configs, Configs)
         ok &= isinstance(testcases_per_file, int)
-        ok &= testcases_per_file > 0
         ok &= isinstance(folder_path, str)
+        ok &= isinstance(machine_index, int)
+        ok &= isinstance(number_of_machines, int)
         if not ok:
-            raise GeneratorError('Bad input arguments.')
+            raise TypeError('Bad input types.')
+
+        ok &= int(testcases_per_file) > 0
+        ok &= int(machine_index) > 0
+        ok &= int(number_of_machines) >= int(machine_index)
+        if not ok:
+            raise ValueError('Bad input values.')
 
         self.configs = configs
-        self.testcases_per_file = testcases_per_file
+        self.testcases_per_file = int(testcases_per_file)
         self.folder_path = folder_path
+        self.machine_index = int(machine_index)
+        self.number_of_machines = int(number_of_machines)
+        self.filter = bool if filter is None else filter
 
         self.f = (self.configs.number_of_nodes - 1) // 3
         self.nodes = [x for x in range(self.configs.number_of_nodes+self.f)]
 
         if len(self.nodes) < self.configs.number_of_partitions:
-            raise GeneratorError(
+            raise ValueError(
                 'There should be at least as many nodes as partitions. '
                 f'Input: {len(self.nodes)} nodes and '
                 f'{self.configs.number_of_partitions} partitions.'
@@ -108,9 +122,10 @@ class Generator:
 
         self.logger.info(
             f'''Generator successfully instantiated with the following settings:
-            \t configs: {str(self.configs)}
+            \t Twins configs: {str(self.configs)}
             \t maximum testcases per file: {self.testcases_per_file}
-            \t output directory: {self.folder_path}'''
+            \t output directory: {self.folder_path}
+            \t machine #: {self.machine_index}/{self.number_of_machines}'''
         )
 
     @property
@@ -253,20 +268,24 @@ class Generator:
         """
         return product(scenarios, repeat=self.configs.number_of_rounds)
 
-    def print(self, testcases, machine_id, process_id, dryrun, filter=None):
-        if dryrun:
-            self.logger.info('Dry-run enabled: no files will be created.')
-
-        filter = bool if filter is None else filter
+    def _print(self, testcases, process_id, dryrun):
         num_of_chunks = ceil(self.testcases_length / self.testcases_per_file)
         chunks = ichunked(testcases, num_of_chunks)
-        #chunks = distribute(num_of_chunks, testcases)
         for i, chunk in enumerate(chunks):
-            basename = f'testcase-{machine_id}-{process_id}'
+            basename = f'testcase-{self.machine_index}-{process_id}'
             filename = f'tmp-{basename}' if dryrun else f'{basename}-{i}'
             with open(join(self.folder_path, filename), 'w') as f:
-                data = [Format.make(self, x) for x in chunk if filter(x)]
+                data = [Format.make(self, x) for x in chunk if self.filter(x)]
                 f.write(''.join(data))
+
+    def print(self, testcases, dryrun, workers):
+        chunks = distribute(workers, testcases)
+        jobs = []
+        for i in range(workers):
+            p = Process(target=self._print, args=(chunks[i], i, dryrun))
+            jobs.append(p)
+            p.start()
+        [p.join() for p in jobs]
 
     def run(self, dryrun=False, workers=1):
         self.logger.info(
@@ -283,12 +302,13 @@ class Generator:
         testcases = self.combine_scenarios_with_rounds(scenarios)
 
         # Print the resulting testcases to files
-        chunks = distribute(workers, testcases)
-        jobs = []
-        for i in range(workers):
-            p = Process(target=self.print, args=(chunks[i], 0, i, dryrun))
-            jobs.append(p)
-            p.start()
+        testcases = distribute(self.number_of_machines, testcases)
+        if dryrun:
+            self.logger.info('Dryrun enabled: no files will be created.')
+            with TemporaryDirectory() as directory:
+                self.folder_path = directory
+                self.print(testcases[self.machine_index-1], dryrun, workers)
+        else:
+            self.print(testcases[self.machine_index-1], dryrun, workers)
 
-        [p.join() for p in jobs]
         self.logger.info(f'Finished.')
