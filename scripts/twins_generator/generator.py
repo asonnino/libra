@@ -1,9 +1,11 @@
 import logging
 from itertools import product, zip_longest
+from more_itertools import ichunked
 from os.path import join
 from copy import deepcopy
 from math import ceil, factorial as f
 from threading import Thread
+
 
 class GeneratorError(Exception):
     pass
@@ -116,6 +118,18 @@ class Generator:
         """
         return self.nodes[self.configs.number_of_nodes:]
 
+    @property
+    def testcases_length(self):
+        """ Forecast the total number of testcases.
+
+        Returns:
+            int: The total number of testcases.
+        """
+        total = self.S(len(self.nodes), self.configs.number_of_partitions)
+        total *= len(self.target_nodes)
+        total **= self.configs.number_of_rounds
+        return total
+
     def get_twin(self, node):
         """ Get the twin of a specific node.
 
@@ -142,17 +156,6 @@ class Generator:
         assert n > 0 and k > 0 and n >= k
         S = [(-1)**i * (f(k)//f(i)//f(k - i)) * (k-i)**n for i in range(k+1)]
         return sum(S) // f(k)
-
-    def forecast_number_of_testcases(self):
-        """ Forecast the total number of testcases.
-
-        Returns:
-            int: The total number of testcases.
-        """
-        total = self.S(len(self.nodes), self.configs.number_of_partitions)
-        total *= len(self.target_nodes)
-        total **= self.configs.number_of_rounds
-        return total
 
     def make_partitions(self):
         """ Find all possible ways in which n nodes can be partitioned into k
@@ -228,38 +231,39 @@ class Generator:
         """
         return product(scenarios, repeat=self.configs.number_of_rounds)
 
-    def print(self, testcases, dryrun=False, filter=None):
+    def print(self, index, testcases, dryrun=False, filter=None):
         if dryrun:
             self.logger.info('Dry-run enabled: no files will be created.')
 
-        args = [iter(testcases)] * self.testcases_per_file
-        chunks = zip_longest(fillvalue='', *args)
+        num_of_chunks = ceil(self.testcases_length / self.testcases_per_file)
+        chunks = ichunked(testcases, num_of_chunks)
         for i, chunk in enumerate(chunks):
-            filename = 'tmp' if dryrun else f'testcase-{i}.bin'
+            filename = f'tmp-{index}' if dryrun else f'testcase-{index}-{i}'
             with open(join(self.folder_path, filename), 'w') as f:
                 for testcase in chunk:
                     if filter is not None and not filter(testcase):
                         continue
 
-                    twins_round_proposers_idx, round_partitions_idx={}, {}
+                    twins_round_proposers_idx, round_partitions_idx = {}, {}
                     for round_number, scenario in enumerate(testcase):
-                        leader, partition=scenario
-                        leaders=[leader]
+                        leader, partition = scenario
+                        leaders = [leader]
                         if leader in self.target_nodes:
                             leaders.append(self.get_twin(leader))
                         twins_round_proposers_idx[round_number] = leaders
                         round_partitions_idx[round_number] = partition
 
-                    f.write(f'{self.configs.number_of_rounds}\n')
-                    f.write(f'{self.configs.number_of_nodes}\n')
-                    f.write(f'{self.configs.number_of_partitions}\n')
-                    f.write(f'{twins_round_proposers_idx}\n')
-                    f.write(f'{round_partitions_idx}\n')
-                    f.write('\n')
+                    f.write(
+                        f'''{self.configs.number_of_rounds}
+                        {self.configs.number_of_nodes}
+                        {self.configs.number_of_partitions}
+                        {twins_round_proposers_idx}
+                        {round_partitions_idx}'''
+                    )
 
-    def run(self, dryrun=False, filter=None, workers=1):
+    def run(self, dryrun=False, filter=None, number_of_workers=1):
         self.logger.info(
-            f'Generating {self.forecast_number_of_testcases()} testcases...'
+            f'Generating {self.testcases_length} testcases...'
         )
 
         # Make partitions
@@ -272,19 +276,18 @@ class Generator:
         testcases = self.combine_scenarios_with_rounds(scenarios)
 
         # Print the resulting testcases to files
-        '''
-
-        for i in range(workers):
-            args = [iter(testcases)] * ceil(self.forecast_number_of_testcases / workers)
-            part = zip_longest(fillvalue='', *args)
+        from more_itertools import distribute
+        threads = []
+        chunks = distribute(number_of_workers, testcases)
+        for i in range(number_of_workers):
             t = Thread(
-                self.print,
-                args=(i, part, dryrun=dryrun, filter=filter)
+                target=self.print, args=(i, chunks[i], dryrun, filter)
             )
             t.start()
-        '''
+            threads.append(t)
+        [t.join() for t in threads]
 
-        self.print(testcases, dryrun=dryrun, filter=filter)
+        #self.print(0, testcases, dryrun=dryrun, filter=filter)
         self.logger.info(f'Finished.')
 
         '''

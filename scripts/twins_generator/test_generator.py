@@ -78,8 +78,8 @@ def test_combine_scenarios_with_rounds(generator, partitions_with_leaders):
     assert len([x for x in testcases]) == length
 
 
-def test_forecast_number_of_testcases(generator, testcases):
-    assert len(testcases) == generator.forecast_number_of_testcases()
+def test_testcases_length(generator, testcases):
+    assert len(testcases) == generator.testcases_length
 
 
 def test_print():
@@ -89,10 +89,10 @@ def test_print():
 
 #@pytest.mark.skip(reason='Performance benchmark.')
 def test_performance():
-    generator = Generator(Configs(4, 2, 8))
-    print(f'Generating {generator.forecast_number_of_testcases()} testcases..')
+    generator = Generator(Configs(4, 2, 5), testcases_per_file=100)
+    print(f'Generating {generator.testcases_length} testcases..')
     start_time = time.time()
-    generator.run(dryrun=True)
+    generator.run(dryrun=True, number_of_workers=16)
     elapsed_time = time.time() - start_time
     print(f'Elapsed time: {str(timedelta(seconds=elapsed_time))}')
 
