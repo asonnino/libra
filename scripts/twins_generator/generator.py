@@ -3,14 +3,28 @@ from itertools import product
 from more_itertools import ichunked, distribute
 from os.path import join
 from copy import deepcopy
-from math import ceil, factorial as f
+from math import factorial as f
 from multiprocessing import Process
 from tempfile import TemporaryDirectory
+from contextlib import nullcontext
 
 
 class Format:
+
     @staticmethod
     def make(generator, testcase):
+        """ Defines the format used to print testcases to files.
+
+        This format needs to be understood by the Twins Executor.
+
+
+        Args:
+            generator (Generator): The generator instance.
+            testcase (iterable): A testcase to print.
+
+        Returns:
+            str: A formatted string ready to be print to file.
+        """
         twins_round_proposers_idx, round_partitions_idx = {}, {}
         for round_number, scenario in enumerate(testcase):
             leader, partition = scenario
@@ -21,75 +35,45 @@ class Format:
             round_partitions_idx[round_number] = partition
 
         return (
-            f'{generator.configs.number_of_rounds}\n'
-            f'{generator.configs.number_of_nodes}\n'
-            f'{generator.configs.number_of_partitions}\n'
+            f'{generator.number_of_rounds}\n'
+            f'{generator.number_of_nodes}\n'
+            f'{generator.number_of_partitions}\n'
             f'{twins_round_proposers_idx}\n'
             f'{round_partitions_idx}\n'
             '\n'
         )
 
 
-class Configs:
-    def __init__(self, number_of_nodes, number_of_partitions, number_of_rounds):
-        ok = isinstance(number_of_nodes, int)
-        ok &= isinstance(number_of_partitions, int)
-        ok &= isinstance(number_of_rounds, int)
-        if not ok:
-            raise TypeError('Bad input types.')
-
-        ok &= number_of_nodes > 0
-        ok &= number_of_partitions > 0
-        ok &= number_of_rounds > 0
-        if not ok:
-            raise ValueError('Bad input values.')
-
-        self.number_of_nodes = number_of_nodes
-        self.number_of_partitions = number_of_partitions
-        self.number_of_rounds = number_of_rounds
-
-    def __str__(self):
-        return (
-            f'(number of nodes: {self.number_of_nodes}, '
-            f'number of partitions: {self.number_of_partitions}, '
-            f'number of rounds: {self.number_of_rounds})'
-        )
-
-
 class Generator:
-    def __init__(self, configs, filter=None, testcases_per_file=100,
-                 folder_path='./', machine_index=1, number_of_machines=1):
+    def __init__(self, number_of_nodes, number_of_partitions, number_of_rounds,
+                 filter=None, testcases_per_file=100, folder_path='./',
+                 machine_index=1, number_of_machines=1):
         """ Instantiate the generator.
 
-        Generate indices of nodes. There are three kinds of nodes:
-        (1) Target nodes: Represented by 'f', these are the nodes for which
-            we will create Twins, to emulate byzantine behavior.
-        (2) Honest nodes: These are the honest nodes
-        (3) Twin nodes: These are the twins of target nodes (see 1 above)
-
-        Below, we generate indices using the ordering convention:
-        target_nodes, honest_nodes, twin_nodes
-        |----------------------------------------------------------------------|
-        |    0..f-1    |  f..NUM_OF_NODES-1   | NUM_OF_NODES..NUM_OF_NODES+f-1 |
-        |++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++|
-        | target_nodes |    honest_nodes      |           twin_nodes           |
-        |----------------------------------------------------------------------|
-
         Args:
-            configs (Configs): The generator configs.
+            number_of_nodes (int): The number of nodes.
+            number_of_partitions (int): The number of partitions.
+            number_of_rounds (int): The number of rounds.
+            filter (Object, optional): A filter used to filter testcases before
+                printing them to file. Defaults to None.
             testcases_per_file (int, optional): The maximum number of testcases
-                to print in a single file. Defaults to 100.
-            folder_path (str, optional): The output directory where to print
-                the testcases. Defaults to './'.
+                that can be printing int a single file. Defaults to 100.
+            folder_path (str, optional): The directory path where to print the
+                testcases. Defaults to './'.
+            machine_index (int, optional): The index of the machine on which
+                this generator instance is running. Defaults to 1.
+            number_of_machines (int, optional): The total number of machines
+                used to generate scenarios. Defaults to 1.
 
         Raises:
             TypeError: Raised upon invalid input types.
             ValueError: Raised upon invalid input values.
-            GeneratorError: Raised upon invalid input arguments.
         """
         self.logger = logging.getLogger(name='generator')
 
-        ok = isinstance(configs, Configs)
+        ok = isinstance(number_of_nodes, int)
+        ok &= isinstance(number_of_partitions, int)
+        ok &= isinstance(number_of_rounds, int)
         ok &= isinstance(testcases_per_file, int)
         ok &= isinstance(folder_path, str)
         ok &= isinstance(machine_index, int)
@@ -97,36 +81,35 @@ class Generator:
         if not ok:
             raise TypeError('Bad input types.')
 
-        ok &= int(testcases_per_file) > 0
-        ok &= int(machine_index) > 0
-        ok &= int(number_of_machines) >= int(machine_index)
+        ok &= number_of_nodes > 0
+        ok &= number_of_partitions > 0
+        ok &= number_of_rounds > 0
+        ok &= testcases_per_file > 0
+        ok &= machine_index > 0
+        ok &= number_of_machines >= machine_index
         if not ok:
             raise ValueError('Bad input values.')
 
-        self.configs = configs
-        self.testcases_per_file = int(testcases_per_file)
+        self.number_of_nodes = number_of_nodes
+        self.number_of_partitions = number_of_partitions
+        self.number_of_rounds = number_of_rounds
+        self.testcases_per_file = testcases_per_file
         self.folder_path = folder_path
-        self.machine_index = int(machine_index)
-        self.number_of_machines = int(number_of_machines)
+        self.machine_index = machine_index
+        self.number_of_machines = number_of_machines
         self.filter = bool if filter is None else filter
 
-        self.f = (self.configs.number_of_nodes - 1) // 3
-        self.nodes = [x for x in range(self.configs.number_of_nodes+self.f)]
+        self.f = (self.number_of_nodes - 1) // 3
+        self.nodes = [x for x in range(self.number_of_nodes+self.f)]
 
-        if len(self.nodes) < self.configs.number_of_partitions:
+        if len(self.nodes) < self.number_of_partitions:
             raise ValueError(
                 'There should be at least as many nodes as partitions. '
                 f'Input: {len(self.nodes)} nodes and '
-                f'{self.configs.number_of_partitions} partitions.'
+                f'{self.number_of_partitions} partitions.'
             )
 
-        self.logger.info(
-            f'''Generator successfully instantiated with the following settings:
-            \t Twins configs: {str(self.configs)}
-            \t maximum testcases per file: {self.testcases_per_file}
-            \t output directory: {self.folder_path}
-            \t machine #: {self.machine_index}/{self.number_of_machines}'''
-        )
+        self.logger.info(self.__repr__())
 
     @property
     def target_nodes(self):
@@ -138,34 +121,28 @@ class Generator:
         return self.nodes[:self.f]
 
     @property
-    def honest_nodes(self):
-        """ The list of nodes that do not have a twin.
-
-        Returns:
-            list(int): A list of nodes' indeces.
-        """
-        return self.nodes[self.f:self.configs.number_of_nodes]
-
-    @property
-    def twin_nodes(self):
-        """ The list of nodes that are twins of  `target_nodes`.
-
-        Returns:
-            list(int): A list of nodes' indeces.
-        """
-        return self.nodes[self.configs.number_of_nodes:]
-
-    @property
     def testcases_length(self):
         """ Forecast the total number of testcases.
 
         Returns:
             int: The total number of testcases.
         """
-        total = self.S(len(self.nodes), self.configs.number_of_partitions)
+        total = self.S(len(self.nodes), self.number_of_partitions)
         total *= len(self.target_nodes)
-        total **= self.configs.number_of_rounds
+        total **= self.number_of_rounds
         return total
+
+    def __repr__(self):
+        twins_configs = (
+            f'(number of nodes: {self.number_of_nodes}, '
+            f'number of partitions: {self.number_of_partitions}, '
+            f'number of rounds: {self.number_of_rounds})'
+        )
+        return f'''Generator instantiated with the following settings:
+            \t Twins configs: {twins_configs}
+            \t maximum testcases per file: {self.testcases_per_file}
+            \t output directory: {self.folder_path}
+            \t machine #: {self.machine_index}/{self.number_of_machines}'''
 
     def get_twin(self, node):
         """ Get the twin of a specific node.
@@ -177,7 +154,7 @@ class Generator:
             int: A node's index.
         """
         assert node in self.target_nodes
-        return self.nodes[self.configs.number_of_nodes+node]
+        return self.nodes[self.number_of_nodes+node]
 
     def S(self, n, k):
         """ Compute the Stirling numbers of the second kind.
@@ -204,17 +181,19 @@ class Generator:
         (all different, or at least all labeled) into k nonempty subsets."
 
         E.g. for n={0,1,2} and k=2, possible partition are:
-        [   [ [0,1], [2] ],
+        [
+            [ [0,1], [2] ],
             [ [0,2], [1] ],
             [ [1,2], [0] ],
-            [ [2], [0,1] ], etc.
+            [ [2], [0,1] ],
+            ...
         ]
 
         Returns:
             list: All possible partitions.
         """
         def stirling2(n, k):
-            """ Provies all solutions of the Stirling Number of the Second Kind.
+            """ Provides solutions of the Stirling Number of the Second Kind.
 
             Args:
                 n (int): The number of objects.
@@ -242,16 +221,26 @@ class Generator:
 
                 return s_n1_k1 + k_s_n1_k
 
-        return stirling2(len(self.nodes), self.configs.number_of_partitions)
+        return stirling2(len(self.nodes), self.number_of_partitions)
 
     def combine_partitions_with_leaders(self, partitions):
-        """ Assign leaders to partitions.
+        """ Find all possible ways in which we can assign leaders to partitions.
+
+        E.g. for l={0,1} leaders, n={0,1,2} nodes and k=2 partitions, possible
+        combinations are:
+        [
+            (0, [ [0,1], [2] ]),
+            (0, [ [0,2], [1] ]),
+            (1, [ [1,2], [0] ]),
+            (0, [ [2], [0,1] ]),
+            ...
+        ]
 
         Args:
             partitions (list): List of all partitions.
 
         Yields:
-            tuple: A tuple of (leader, partition)
+            iterable: An iterator of tuples of (leader, partition)
         """
         for partition in partitions:
             for leader in self.target_nodes:
@@ -260,25 +249,48 @@ class Generator:
     def combine_scenarios_with_rounds(self, scenarios):
         """ Combine the input parition-leader scenarios with rounds.
 
+        E.g. for l={0,1} leaders, n={0,1,2} nodes, k=2 partitions, and r=2
+        rounds, possible combinations are:
+        [
+            [(0, [ [0,1], [2] ]), (0, [ [0,1], [2] ])],
+            [(0, [ [0,1], [2] ]), (0, [ [0,2], [1] ])],
+            [(1, [ [1,2], [0] ]), (1, [ [1,2], [0] ])],
+            [(0, [ [2], [0,1] ]), (1, [ [1,2], [0] ])],
+            ...
+        ]
+
         Args:
-            tuple: An iterator containing tuples of (leader, partition).
+            iterable: An iterator of tuples of (leader, partition).
 
         Returns:
-            list: an iterator of testcases.
+            iterable: An iterator of testcases.
         """
-        return product(scenarios, repeat=self.configs.number_of_rounds)
+        return product(scenarios, repeat=self.number_of_rounds)
 
     def _print(self, testcases, process_id, dryrun):
-        num_of_chunks = ceil(self.testcases_length / self.testcases_per_file)
-        chunks = ichunked(testcases, num_of_chunks)
+        """ Used by a single process print testcases to files.
+
+        Args:
+            testcases (iterable): An iterator of testcases.
+            process_id (int): The processe id.
+            dryrun (bool): Whether dryrun mode is enabled.
+        """
+        chunks = ichunked(testcases, self.testcases_per_file)
         for i, chunk in enumerate(chunks):
             basename = f'testcase-{self.machine_index}-{process_id}'
             filename = f'tmp-{basename}' if dryrun else f'{basename}-{i}'
+            data = [Format.make(self, x) for x in chunk if self.filter(x)]
             with open(join(self.folder_path, filename), 'w') as f:
-                data = [Format.make(self, x) for x in chunk if self.filter(x)]
                 f.write(''.join(data))
 
     def print(self, testcases, dryrun, workers):
+        """ Multiprocess print testcases to files.
+
+        Args:
+            testcases (iterable): An iterator of testcases.
+            dryrun (bool): Whether dryrun mode is enabled.
+            workers (int): The number of processes to create.
+        """
         chunks = distribute(workers, testcases)
         jobs = []
         for i in range(workers):
@@ -288,27 +300,68 @@ class Generator:
         [p.join() for p in jobs]
 
     def run(self, dryrun=False, workers=1):
+        """ Run the generator: generate all testcases and print them to files.
+
+        Args:
+            dryrun (bool, optional): No files are actually written when dryrun
+                is enabled. Defaults to False.
+            workers (int, optional): The number of processes to use.
+                Defaults to 1.
+        """
         self.logger.info(
             f'Generating {self.testcases_length} testcases...'
         )
 
         # Make partitions
+        self.logger.debug(
+            f'STEP 1. Finding all possible ways in which {len(self.nodes)} '
+            f'nodes can be partitioned into {self.number_of_partitions} '
+            'partitions...'
+        )
         partitions = self.make_partitions()
+        self.logger.debug(
+            f'{self.number_of_nodes} nodes can be partitioned into '
+            f'{self.number_of_partitions} partitions in '
+            f'{self.S(len(self.nodes), self.number_of_partitions)} ways.'
+        )
 
         # Combine partitions with leaders
+        self.logger.debug(
+            'STEP 2. Finding all possible ways in which '
+            f'{self.S(len(self.nodes), self.number_of_partitions)} partitions '
+            f'can be combined with {len(self.target_nodes)} leaders...'
+        )
         scenarios = self.combine_partitions_with_leaders(partitions)
+        self.logger.debug(
+            f'{self.S(len(self.nodes), self.number_of_partitions)} partitions '
+            f'can be combined with {len(self.target_nodes)} leaders in '
+            f'{int(self.testcases_length**(1/self.number_of_rounds))} '
+            f'possible ways.'
+        )
 
         # Combine the parition-leader scenarios from above with rounds
+        self.logger.debug(
+            'STEP 3. Finding all possible ways in which '
+            f'{int(self.testcases_length**(1/self.number_of_rounds))} '
+            'parition-leader scenarios combinations can be combined with '
+            f'{self.number_of_rounds} rounds...'
+        )
         testcases = self.combine_scenarios_with_rounds(scenarios)
+        self.logger.debug(
+            f'{int(self.testcases_length**(1/self.number_of_rounds))} '
+            'parition-leader scenarios can be combined with '
+            f'{self.number_of_rounds} rounds in {self.testcases_length} '
+            'possible ways.'
+        )
 
         # Print the resulting testcases to files
+        self.logger.debug(
+            f'Printing all testcases to file using {workers} processes...'
+        )
         testcases = distribute(self.number_of_machines, testcases)
-        if dryrun:
-            self.logger.info('Dryrun enabled: no files will be created.')
-            with TemporaryDirectory() as directory:
-                self.folder_path = directory
-                self.print(testcases[self.machine_index-1], dryrun, workers)
-        else:
+        context_manager = TemporaryDirectory() if dryrun else nullcontext()
+        with context_manager as directory:
+            self.folder_path = self.folder_path if not dryrun else directory
             self.print(testcases[self.machine_index-1], dryrun, workers)
 
         self.logger.info(f'Finished.')
