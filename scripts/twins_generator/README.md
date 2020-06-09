@@ -39,5 +39,5 @@ The following graph displays a benchmark run with 4 nodes, 2 partitions and 6 ro
 
 ![benchmark](generator-11390625.png)
 
-We can see that the generator takes less than 1 minute to generate about 11M testcases.
+We can see that the generator takes less than 1 minute to generate about 11M testcases (ie. we can generate over 15 billion testcases a day).
 The graph shows that the best results are obtained when running the generator with at least 5 processes (this makes sense as the laptop used for experiments has 6 physical cores); increasing the number of processes over 5 or the number of testcases per file over 10,000 do not improve performance.
