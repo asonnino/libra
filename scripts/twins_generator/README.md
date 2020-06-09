@@ -35,7 +35,7 @@ Then run one of the following commands:
 $ python -O benchmark.py # Run a fast benchmark (should take a few minutes)
 $ python -O benchmark.py full # Run a detailed benchmark and plot results
 ```
-The following graph displays a benchmark run with 4 nodes, 2 partitions and 6 rounds. Experiments are run on am Apple laptop (MacBook Pro) with a 2.9 GHz Intel Core i9 (6 physical and 12 logical cores), and 32 GB 2400 MHz DDR4 RAM.
+The following graph displays a benchmark run with 4 nodes, 2 partitions and 6 rounds. Experiments are run on an Apple laptop (MacBook Pro) with a 2.9 GHz Intel Core i9 (6 physical and 12 logical cores), and 32 GB 2400 MHz DDR4 RAM.
 
 ![benchmark](generator-11390625.png)
 
