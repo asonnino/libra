@@ -37,7 +37,7 @@ $ python -O benchmark.py full # Run a detailed benchmark and plot results
 ```
 The following graph displays a benchmark run with 4 nodes, 2 partitions and 6 rounds. Experiments are run on am Apple laptop (MacBook Pro) with a 2.9 GHz Intel Core i9 (6 physical and 12 logical cores), and 32 GB 2400 MHz DDR4 RAM.
 
-![benchmark](scripts/twins_generator/generator-11390625.png)
+![benchmark](generator-11390625.png)
 
 We can see that the generator take less than 1 minute to generate about 11M testcases.
 The graph shows that the best results are obtained when running the generator with at least 5 processes (this makes sense as the laptop used for experiments has 5 physical ccores); increasing the number of processes over 5 or the number of testcases per file do not improve performance.
