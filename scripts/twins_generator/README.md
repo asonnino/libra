@@ -1,5 +1,5 @@
 # Twins Generator
-The Twins generator has been carefullly design to not have any external dependency, so it should work out of the box:
+The Twins generator has been carefullly designed to not require any external dependency, so it should work out of the box:
 ```
 generator = Generator(4, 2, 8) # Create a generator instance with 4 nodes, 2 partitions, and 8 rounds.
 generator.run() # Run the generator and print testcases to files.
