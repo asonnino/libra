@@ -10,7 +10,6 @@ from contextlib import nullcontext
 
 
 class Format:
-
     @staticmethod
     def make(generator, testcase):
         """ Defines the format used to print testcases to files.
@@ -102,10 +101,18 @@ class Generator:
         self.nodes = [x for x in range(self.number_of_nodes+self.f)]
 
         if len(self.nodes) < self.number_of_partitions:
-            raise ValueError(
+            message = (
                 'There should be at least as many nodes as partitions. '
                 f'Input: {len(self.nodes)} nodes and '
                 f'{self.number_of_partitions} partitions.'
+            )
+            self.logger.error(f'ValueError: {message}')
+            raise ValueError(message)
+
+        if self.testcases_length > 1000000000:
+            self.logger.warning(
+                'Running the generator with these configurations will '
+                'generate more than 1 billion testcases.'
             )
 
         self.logger.info(self.__repr__())
