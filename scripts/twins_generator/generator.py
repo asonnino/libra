@@ -46,8 +46,8 @@ class Format:
 
 class Generator:
     def __init__(self, number_of_nodes, number_of_partitions, number_of_rounds,
-                 filter=None, testcases_per_file=100, folder_path='./',
-                 machine_index=1, number_of_machines=1):
+                 filter=None, folder_path='./', machine_index=1,
+                 number_of_machines=1):
         """ Instantiate the generator.
 
         Args:
@@ -56,8 +56,6 @@ class Generator:
             number_of_rounds (int): The number of rounds.
             filter (Object, optional): A filter used to filter testcases before
                 printing them to file. Defaults to None.
-            testcases_per_file (int, optional): The maximum number of testcases
-                that can be printing int a single file. Defaults to 100.
             folder_path (str, optional): The directory path where to print the
                 testcases. Defaults to './'.
             machine_index (int, optional): The index of the machine on which
@@ -74,26 +72,27 @@ class Generator:
         ok = isinstance(number_of_nodes, int)
         ok &= isinstance(number_of_partitions, int)
         ok &= isinstance(number_of_rounds, int)
-        ok &= isinstance(testcases_per_file, int)
         ok &= isinstance(folder_path, str)
         ok &= isinstance(machine_index, int)
         ok &= isinstance(number_of_machines, int)
         if not ok:
-            raise TypeError('Bad input types.')
+            message = 'Bad input types.'
+            self.logger.error(f'TypeError: {message}')
+            raise TypeError(message)
 
         ok &= number_of_nodes > 0
         ok &= number_of_partitions > 0
         ok &= number_of_rounds > 0
-        ok &= testcases_per_file > 0
         ok &= machine_index > 0
         ok &= number_of_machines >= machine_index
         if not ok:
-            raise ValueError('Bad input values.')
+            message = 'Bad input values.'
+            self.logger.error(f'ValueError: {message}')
+            raise ValueError(message)
 
         self.number_of_nodes = number_of_nodes
         self.number_of_partitions = number_of_partitions
         self.number_of_rounds = number_of_rounds
-        self.testcases_per_file = testcases_per_file
         self.folder_path = folder_path
         self.machine_index = machine_index
         self.number_of_machines = number_of_machines
@@ -140,7 +139,6 @@ class Generator:
         )
         return f'''Generator instantiated with the following settings:
             \t Twins configs: {twins_configs}
-            \t maximum testcases per file: {self.testcases_per_file}
             \t output directory: {self.folder_path}
             \t machine #: {self.machine_index}/{self.number_of_machines}'''
 
@@ -267,39 +265,46 @@ class Generator:
         """
         return product(scenarios, repeat=self.number_of_rounds)
 
-    def _print(self, testcases, process_id, dryrun):
+    def _print(self, testcases, process_id, dryrun, testcases_per_file):
         """ Used by a single process print testcases to files.
 
         Args:
             testcases (iterable): An iterator of testcases.
             process_id (int): The processe id.
             dryrun (bool): Whether dryrun mode is enabled.
+            testcases_per_file (int, optional): The maximum number of testcases
+                that can be printing int a single file.
         """
-        chunks = ichunked(testcases, self.testcases_per_file)
+        chunks = ichunked(testcases, testcases_per_file)
         for i, chunk in enumerate(chunks):
             basename = f'testcase-{self.machine_index}-{process_id}'
             filename = f'tmp-{basename}' if dryrun else f'{basename}-{i}'
             data = [Format.make(self, x) for x in chunk if self.filter(x)]
-            with open(join(self.folder_path, filename), 'w') as f:
+            with open(join(self.folder_path, filename), 'a') as f:
                 f.write(''.join(data))
 
-    def print(self, testcases, dryrun, workers):
+    def print(self, testcases, dryrun, workers, testcases_per_file):
         """ Multiprocess print testcases to files.
 
         Args:
             testcases (iterable): An iterator of testcases.
             dryrun (bool): Whether dryrun mode is enabled.
             workers (int): The number of processes to create.
+            testcases_per_file (int, optional): The maximum number of testcases
+                that can be printing int a single file.
         """
         chunks = distribute(workers, testcases)
         jobs = []
         for i in range(workers):
-            p = Process(target=self._print, args=(chunks[i], i, dryrun))
+            p = Process(
+                target=self._print,
+                args=(chunks[i], i, dryrun, testcases_per_file)
+            )
             jobs.append(p)
             p.start()
         [p.join() for p in jobs]
 
-    def run(self, dryrun=False, workers=1):
+    def run(self, dryrun=False, workers=1, testcases_per_file=1000):
         """ Run the generator: generate all testcases and print them to files.
 
         Args:
@@ -307,7 +312,24 @@ class Generator:
                 is enabled. Defaults to False.
             workers (int, optional): The number of processes to use.
                 Defaults to 1.
+            testcases_per_file (int, optional): The maximum number of testcases
+                that can be printing int a single file. Defaults to 1000.
         """
+        ok = isinstance(dryrun, bool)
+        ok &= isinstance(workers, int)
+        ok &= isinstance(testcases_per_file, int)
+        if not ok:
+            message = 'Bad input types.'
+            self.logger.error(f'TypeError: {message}')
+            raise TypeError(message)
+
+        ok &= workers > 0
+        ok &= testcases_per_file > 0
+        if not ok:
+            message = 'Bad input values.'
+            self.logger.error(f'ValueError: {message}')
+            raise ValueError(message)
+
         self.logger.info(
             f'Generating {self.testcases_length} testcases...'
         )
@@ -362,6 +384,11 @@ class Generator:
         context_manager = TemporaryDirectory() if dryrun else nullcontext()
         with context_manager as directory:
             self.folder_path = self.folder_path if not dryrun else directory
-            self.print(testcases[self.machine_index-1], dryrun, workers)
+            self.print(
+                testcases[self.machine_index-1],
+                dryrun,
+                workers,
+                testcases_per_file
+            )
 
         self.logger.info(f'Finished.')

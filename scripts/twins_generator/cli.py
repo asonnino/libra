@@ -1,6 +1,7 @@
 """ Simple cli interface.
-    Example usage:
-    $ python -O cli.py --nodes 4 --partitions 2 --rounds 4 --workers 16 -dryrun
+
+Example usage:
+$ python -O cli.py --nodes 4 --partitions 2 --rounds 4 --workers 16 -dryrun
 """
 from generator import Generator
 import argparse
@@ -87,9 +88,12 @@ generator = Generator(
     args.partitions,
     args.rounds,
     filter=None,
-    testcases_per_file=args.testcases_per_file,
     folder_path=args.path,
     machine_index=args.index,
     number_of_machines=args.machines
 )
-generator.run(workers=args.workers, dryrun=args.dryrun)
+generator.run(
+    workers=args.workers,
+    dryrun=args.dryrun,
+    testcases_per_file=args.testcases_per_file
+)

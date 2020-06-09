@@ -3,7 +3,6 @@ import pytest
 import builtins
 from unittest.mock import patch, mock_open, MagicMock
 from math import ceil
-import multiprocessing
 
 
 @pytest.fixture
@@ -84,10 +83,18 @@ def test_testcases_length(gen, testcases):
 
 def test_print_process(gen, testcases):
     with patch('builtins.open', mock_open()) as patcher:
-        gen._print(testcases, 1, True)
-        number_of_files = ceil(gen.testcases_length / gen.testcases_per_file)
+        gen._print(testcases, 1, True, 1000)
+        number_of_files = ceil(gen.testcases_length / 1000)
         assert patcher.call_count == number_of_files
 
 
 def test_run(gen):
     gen.run(True, 1)
+
+
+def test_run_type_input_type_error(gen):
+    gen.run(True, 'a')
+
+
+def test_run_type_input_value_error(gen):
+    gen.run(True, 0)
