@@ -7,7 +7,7 @@
 //!
 //! This crate contains helpers for executing tests against the Libra VM.
 
-use libra_types::{transaction::TransactionStatus, vm_error::VMStatus};
+use libra_types::{transaction::TransactionStatus, vm_status::VMStatus};
 
 #[cfg(test)]
 mod tests;
@@ -17,6 +17,7 @@ pub mod account_universe;
 pub mod common_transactions;
 pub mod compile;
 pub mod data_store;
+pub mod execution_strategies;
 pub mod executor;
 pub mod gas_costs;
 pub mod keygen;

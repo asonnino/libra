@@ -1,14 +1,15 @@
-address 0x0 {
+address 0x1 {
 
 module LibraVMConfig {
-    use 0x0::LibraConfig;
+    use 0x1::LibraConfig;
+    use 0x1::Signer;
 
     // The struct to hold all config data needed to operate the LibraVM.
     // * publishing_option: Defines Scripts/Modules that are allowed to execute in the current configruation.
     // * gas_schedule: Cost of running the VM.
-    struct T {
+    struct LibraVMConfig {
         publishing_option: vector<u8>,
-        gas_schedule: Self::GasSchedule,
+        gas_schedule: GasSchedule,
     }
 
     // The gas schedule keeps two separate schedules for the gas:
@@ -25,7 +26,7 @@ module LibraVMConfig {
     struct GasSchedule {
         instruction_schedule: vector<u8>,
         native_schedule: vector<u8>,
-        gas_constants: Self::GasConstants,
+        gas_constants: GasConstants,
     }
 
     struct GasConstants {
@@ -61,7 +62,8 @@ module LibraVMConfig {
 
     // Initialize the table under the association account
     public fun initialize(
-        config_account: &signer,
+        lr_account: &signer,
+        association_root_account: &signer,
         publishing_option: vector<u8>,
         instruction_schedule: vector<u8>,
         native_schedule: vector<u8>,
@@ -79,9 +81,9 @@ module LibraVMConfig {
         };
 
 
-        LibraConfig::publish_new_config<Self::T>(
-            config_account,
-            T {
+        LibraConfig::publish_new_config_with_delegate<LibraVMConfig>(
+            lr_account,
+            LibraVMConfig {
                 publishing_option,
                 gas_schedule: GasSchedule {
                     instruction_schedule,
@@ -89,13 +91,15 @@ module LibraVMConfig {
                     gas_constants,
                 }
             },
+            Signer::address_of(association_root_account),
         );
+        LibraConfig::claim_delegated_modify_config<LibraVMConfig>(association_root_account, Signer::address_of(lr_account));
     }
 
     public fun set_publishing_option(account: &signer, publishing_option: vector<u8>) {
-        let current_config = LibraConfig::get<Self::T>();
+        let current_config = LibraConfig::get<LibraVMConfig>();
         current_config.publishing_option = publishing_option;
-        LibraConfig::set<Self::T>(account, current_config);
+        LibraConfig::set<LibraVMConfig>(account, current_config);
     }
 }
 

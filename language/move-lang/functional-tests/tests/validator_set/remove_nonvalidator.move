@@ -5,11 +5,11 @@
 
 //! sender: alice
 script {
-use 0x0::LibraSystem;
-fun main() {
-    // alice cannot remove itself
-    LibraSystem::remove_validator({{alice}});
-}
+    use 0x1::LibraSystem;
+    fun main(account: &signer) {
+        // alice cannot remove herself
+        LibraSystem::remove_validator(account, {{alice}});
+    }
 }
 
 // check: ABORTED
@@ -17,11 +17,11 @@ fun main() {
 //! new-transaction
 //! sender: alice
 script {
-use 0x0::LibraSystem;
-fun main() {
-    // alice cannot remove bob
-    LibraSystem::remove_validator({{bob}});
-}
+    use 0x1::LibraSystem;
+    fun main(account: &signer) {
+        // alice cannot remove bob
+        LibraSystem::remove_validator(account, {{bob}});
+    }
 }
 
 // check: ABORTED
@@ -29,11 +29,11 @@ fun main() {
 //! new-transaction
 //! sender: bob
 script {
-use 0x0::LibraSystem;
-fun main() {
-    // bob cannot remove alice
-    LibraSystem::remove_validator({{alice}});
-}
+    use 0x1::LibraSystem;
+    fun main(account: &signer) {
+        // bob cannot remove alice
+        LibraSystem::remove_validator(account, {{alice}});
+    }
 }
 
 // check: ABORTED

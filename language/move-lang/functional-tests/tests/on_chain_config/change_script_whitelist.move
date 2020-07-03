@@ -24,7 +24,7 @@ module FooConfig {
 //! args: b"01",
 // Step 2: Change option to CustomScript
 script {
-use 0x0::LibraVMConfig;
+use 0x1::LibraVMConfig;
 
 fun main(config: &signer, args: vector<u8>) {
     LibraVMConfig::set_publishing_option(config, args)
@@ -45,4 +45,4 @@ module FooConfig2 {
     }
 }
 
-// check: UNKNOWN_MODULE
+// check: INVALID_MODULE_PUBLISHER

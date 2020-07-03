@@ -17,7 +17,10 @@ use crate::{
 };
 use channel::{libra_channel, message_queues::QueueStyle};
 use futures::{channel::oneshot, io::AsyncWriteExt, sink::SinkExt, stream::StreamExt};
-use libra_config::config::RoleType;
+use libra_config::{
+    config::RoleType,
+    network_id::{NetworkContext, NetworkId},
+};
 use libra_network_address::NetworkAddress;
 use libra_types::PeerId;
 use memsocket::MemorySocket;
@@ -25,7 +28,7 @@ use netcore::{
     compat::IoCompat,
     transport::{boxed::BoxedTransport, memory::MemoryTransport, ConnectionOrigin, TransportExt},
 };
-use std::{collections::HashMap, iter::FromIterator, num::NonZeroUsize};
+use std::{collections::HashMap, iter::FromIterator, num::NonZeroUsize, sync::Arc};
 use tokio::runtime::Handle;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
@@ -92,8 +95,11 @@ fn build_test_peer_manager(
     let peer_manager = PeerManager::new(
         executor,
         build_test_transport(),
-        peer_id,
-        RoleType::Validator,
+        Arc::new(NetworkContext::new(
+            NetworkId::Validator,
+            RoleType::Validator,
+            peer_id,
+        )),
         "/memory/0".parse().unwrap(),
         peer_manager_request_rx,
         connection_reqs_rx,
@@ -578,7 +584,10 @@ fn test_dial_disconnect() {
 
         // Expect NewPeer notification from PeerManager.
         let conn_notif = conn_status_rx.next().await.unwrap();
-        assert!(matches!(conn_notif, ConnectionNotification::NewPeer(_, _)));
+        assert!(matches!(
+            conn_notif,
+            ConnectionNotification::NewPeer(_, _, _)
+        ));
 
         // Send DisconnectPeer request to PeerManager.
         let (disconnect_resp_tx, disconnect_resp_rx) = oneshot::channel();

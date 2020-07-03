@@ -1,5 +1,5 @@
 module ConfigHolder {
-    use 0x0::LibraConfig;
+    use 0x1::LibraConfig;
     resource struct Holder<T> {
         cap: LibraConfig::ModifyConfigCapability<T>
     }
@@ -10,16 +10,16 @@ module ConfigHolder {
 
     public fun get<T>(): LibraConfig::ModifyConfigCapability<T>
     acquires Holder {
-        let Holder<T>{ cap } = move_from<Holder<T>>({{config}});
+        let Holder<T>{ cap } = move_from<Holder<T>>({{association}});
         cap
     }
 }
 
 //! new-transaction
 script {
-    use 0x0::LibraConfig;
+    use 0x1::LibraConfig::{Self};
     fun main(account: &signer) {
-        LibraConfig::initialize(account, account);
+        LibraConfig::initialize(account);
     }
 }
 // check: ABORTED
@@ -27,7 +27,7 @@ script {
 
 //! new-transaction
 script {
-    use 0x0::LibraConfig;
+    use 0x1::LibraConfig;
     fun main() {
         let _x = LibraConfig::get<u64>();
     }
@@ -37,7 +37,7 @@ script {
 
 //! new-transaction
 script {
-    use 0x0::LibraConfig;
+    use 0x1::LibraConfig;
     fun main(account: &signer) {
         LibraConfig::set(account, 0);
     }
@@ -47,22 +47,23 @@ script {
 
 //! new-transaction
 script {
-    use 0x0::LibraConfig;
+    use 0x1::LibraConfig::{Self};
     use {{default}}::ConfigHolder;
     fun main(account: &signer) {
         ConfigHolder::hold(
             account,
             LibraConfig::publish_new_config_with_capability(account, 0)
         );
+
     }
 }
 // check: ABORTED
-// check: 1
+// check: 919414
 
 //! new-transaction
-//! sender: config
+//! sender: association
 script {
-    use 0x0::LibraConfig;
+    use 0x1::LibraConfig::{Self};
     use {{default}}::ConfigHolder;
     fun main(account: &signer) {
         ConfigHolder::hold(
@@ -75,7 +76,7 @@ script {
 
 //! new-transaction
 script {
-    use 0x0::LibraConfig;
+    use 0x1::LibraConfig;
     use {{default}}::ConfigHolder;
     fun main(account: &signer) {
         let cap = ConfigHolder::get<u64>();
@@ -87,20 +88,20 @@ script {
 
 //! new-transaction
 script {
-    use 0x0::LibraConfig;
+    use 0x1::LibraConfig::{Self};
     fun main(account: &signer) {
-        LibraConfig::publish_new_config(account, 0)
+        LibraConfig::publish_new_config(account, 0);
     }
 }
 // check: ABORTED
-// check: 1
+// check: 919416
 
 //! new-transaction
 script {
-    use 0x0::LibraConfig;
+    use 0x1::LibraConfig::{Self};
     fun main(account: &signer) {
-        LibraConfig::publish_new_config_with_delegate(account, 0, {{config}})
+        LibraConfig::publish_new_config_with_delegate(account, 0, {{association}});
     }
 }
 // check: ABORTED
-// check: 1
+// check: 919417

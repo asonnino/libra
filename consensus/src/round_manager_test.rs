@@ -9,6 +9,7 @@ use crate::{
         rotating_proposer_election::RotatingProposer,
         round_state::{ExponentialTimeInterval, RoundState},
     },
+    metrics_safety_rules::MetricsSafetyRules,
     network::{IncomingBlockRetrievalRequest, NetworkSender},
     network_interface::{ConsensusMsg, ConsensusNetworkEvents, ConsensusNetworkSender},
     network_tests::{NetworkPlayground, TwinId},
@@ -40,7 +41,8 @@ use futures::{
     stream::select,
     Stream, StreamExt, TryStreamExt,
 };
-use libra_crypto::{hash::CryptoHash, HashValue};
+use libra_crypto::{ed25519::Ed25519PrivateKey, hash::CryptoHash, HashValue, Uniform};
+use libra_secure_storage::Storage;
 use libra_types::{
     epoch_state::EpochState,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
@@ -50,9 +52,9 @@ use libra_types::{
 };
 use network::{
     peer_manager::{conn_notifs_channel, ConnectionRequestSender, PeerManagerRequestSender},
-    protocols::network::Event,
+    protocols::network::{Event, NewNetworkEvents, NewNetworkSender},
 };
-use safety_rules::{ConsensusState, PersistentSafetyStorage, SafetyRulesManager};
+use safety_rules::{ConsensusState, PersistentSafetyStorage, SafetyRulesManager, TSafetyRules};
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use tokio::runtime::Handle;
 
@@ -95,18 +97,17 @@ impl NodeSetup {
             Waypoint::new_epoch_boundary(&LedgerInfo::mock_genesis(Some(validator_set))).unwrap();
 
         let mut nodes = vec![];
-        //let mut id = 0;
-        //for signer in signers.iter().take(num_nodes) {
         for (id, signer) in signers.iter().take(num_nodes).enumerate() {
             let (initial_data, storage) = MockStorage::start_for_testing((&validators).into());
 
-            let author = signer.author();
             let safety_storage = PersistentSafetyStorage::initialize(
-                Box::new(libra_secure_storage::InMemoryStorage::new()),
+                Storage::from(libra_secure_storage::InMemoryStorage::new()),
+                signer.author(),
                 signer.private_key().clone(),
+                Ed25519PrivateKey::generate_for_testing(),
                 waypoint,
             );
-            let safety_rules_manager = SafetyRulesManager::new_local(author, safety_storage);
+            let safety_rules_manager = SafetyRulesManager::new_local(safety_storage, false);
 
             nodes.push(Self::new(
                 playground,
@@ -118,7 +119,6 @@ impl NodeSetup {
                 safety_rules_manager,
                 id,
             ));
-            //id += 1;
         }
         nodes
     }
@@ -128,11 +128,6 @@ impl NodeSetup {
         executor: Handle,
         signer: ValidatorSigner,
         proposer_author: Author,
-        /*
-        storage: Arc<MockStorage<TestPayload>>,
-        initial_data: RecoveryData<TestPayload>,
-        safety_rules_manager: SafetyRulesManager<TestPayload>,
-        */
         storage: Arc<MockStorage>,
         initial_data: RecoveryData,
         safety_rules_manager: SafetyRulesManager,
@@ -176,27 +171,27 @@ impl NodeSetup {
             commit_cb_sender,
             Arc::clone(&storage),
         ));
+        let time_service = Arc::new(ClockTimeService::new(executor));
 
         let block_store = Arc::new(BlockStore::new(
             storage.clone(),
             initial_data,
             state_computer,
             10, // max pruned blocks in mem
+            time_service.clone(),
         ));
-
-        let time_service = Arc::new(ClockTimeService::new(executor));
 
         let proposal_generator = ProposalGenerator::new(
             author,
             block_store.clone(),
-            Box::new(MockTransactionManager::new(None)),
+            Arc::new(MockTransactionManager::new(None)),
             time_service.clone(),
             1,
         );
 
-        let round_state = Self::create_round_state(time_service.clone());
+        let round_state = Self::create_round_state(time_service);
         let proposer_election = Self::create_proposer_election(proposer_author);
-        let mut safety_rules = safety_rules_manager.client();
+        let mut safety_rules = MetricsSafetyRules::new(safety_rules_manager.client());
         let proof = storage.retrieve_epoch_change_proof(0).unwrap();
         safety_rules.initialize(&proof).unwrap();
 
@@ -208,9 +203,8 @@ impl NodeSetup {
             proposal_generator,
             safety_rules,
             network,
-            Box::new(MockTransactionManager::new(None)),
+            Arc::new(MockTransactionManager::new(None)),
             storage.clone(),
-            time_service,
         );
         block_on(round_manager.start(last_vote_sent));
         Self {
@@ -299,7 +293,7 @@ fn new_round_on_quorum_cert() {
             .unwrap();
         let vote_msg = node.next_vote().await;
         // Adding vote to form a QC
-        node.round_manager.process_vote(vote_msg).await.unwrap();
+        node.round_manager.process_vote_msg(vote_msg).await.unwrap();
 
         // round 2 should start
         let proposal_msg = node.next_proposal().await;
@@ -327,16 +321,16 @@ fn vote_on_successful_proposal() {
 
         let proposal = Block::new_proposal(vec![], 1, 1, genesis_qc.clone(), &node.signer);
         let proposal_id = proposal.id();
-        node.round_manager
-            .process_proposed_block(proposal)
-            .await
-            .unwrap();
+        node.round_manager.process_proposal(proposal).await.unwrap();
         let vote_msg = node.next_vote().await;
         assert_eq!(vote_msg.vote().author(), node.signer.author());
         assert_eq!(vote_msg.vote().vote_data().proposed().id(), proposal_id);
         let consensus_state = node.round_manager.consensus_state();
         let waypoint = consensus_state.waypoint();
-        assert_eq!(consensus_state, ConsensusState::new(1, 1, 0, waypoint));
+        assert_eq!(
+            consensus_state,
+            ConsensusState::new(1, 1, 0, waypoint, true)
+        );
     });
 }
 
@@ -360,11 +354,11 @@ fn no_vote_on_old_proposal() {
         node.next_proposal().await;
 
         node.round_manager
-            .process_proposed_block(new_block)
+            .process_proposal(new_block)
             .await
             .unwrap();
         node.round_manager
-            .process_proposed_block(old_block)
+            .process_proposal(old_block)
             .await
             .unwrap_err();
         let vote_msg = node.next_vote().await;
@@ -396,20 +390,17 @@ fn no_vote_on_mismatch_round() {
         );
         assert!(node
             .round_manager
-            .pre_process_proposal(bad_proposal)
+            .process_proposal_msg(bad_proposal)
             .await
             .is_err());
         let good_proposal = ProposalMsg::new(
             correct_block.clone(),
             SyncInfo::new(genesis_qc.clone(), genesis_qc.clone(), None),
         );
-        assert_eq!(
-            node.round_manager
-                .pre_process_proposal(good_proposal.clone())
-                .await
-                .unwrap(),
-            good_proposal.take_proposal()
-        );
+        node.round_manager
+            .process_proposal_msg(good_proposal)
+            .await
+            .unwrap();
     });
 }
 
@@ -478,7 +469,7 @@ fn no_vote_on_invalid_proposer() {
         );
         assert!(node
             .round_manager
-            .pre_process_proposal(bad_proposal)
+            .process_proposal_msg(bad_proposal)
             .await
             .is_err());
         let good_proposal = ProposalMsg::new(
@@ -486,13 +477,10 @@ fn no_vote_on_invalid_proposer() {
             SyncInfo::new(genesis_qc.clone(), genesis_qc.clone(), None),
         );
 
-        assert_eq!(
-            node.round_manager
-                .pre_process_proposal(good_proposal.clone())
-                .await
-                .unwrap(),
-            good_proposal.take_proposal(),
-        );
+        node.round_manager
+            .process_proposal_msg(good_proposal.clone())
+            .await
+            .unwrap();
     });
 }
 
@@ -520,20 +508,17 @@ fn new_round_on_timeout_certificate() {
             block_skip_round,
             SyncInfo::new(genesis_qc.clone(), genesis_qc.clone(), Some(tc)),
         );
-        assert_eq!(
-            node.round_manager
-                .pre_process_proposal(skip_round_proposal.clone())
-                .await
-                .unwrap(),
-            skip_round_proposal.take_proposal()
-        );
+        node.round_manager
+            .process_proposal_msg(skip_round_proposal)
+            .await
+            .unwrap();
         let old_good_proposal = ProposalMsg::new(
             correct_block.clone(),
             SyncInfo::new(genesis_qc.clone(), genesis_qc.clone(), None),
         );
         assert!(node
             .round_manager
-            .pre_process_proposal(old_good_proposal.clone())
+            .process_proposal_msg(old_good_proposal)
             .await
             .is_err());
     });
@@ -679,7 +664,7 @@ fn recover_on_restart() {
     let waypoint = consensus_state.waypoint();
     assert_eq!(
         consensus_state,
-        ConsensusState::new(1, num_proposals, 0, waypoint)
+        ConsensusState::new(1, num_proposals, 0, waypoint, true)
     );
     for (block, _) in data {
         assert_eq!(node.block_store.block_exists(block.id()), true);
@@ -790,7 +775,7 @@ fn sync_info_sent_on_stale_sync_info() {
         // process the stale sync info carried in the vote
         ahead_node
             .round_manager
-            .process_vote(timeout_vote_msg)
+            .process_vote_msg(timeout_vote_msg)
             .await
             .unwrap();
         let sync_info = behind_node.next_sync_info().await;
@@ -817,7 +802,7 @@ fn sync_on_partial_newer_sync_info() {
                 .unwrap();
             let vote_msg = node.next_vote().await;
             // Adding vote to form a QC
-            node.round_manager.process_vote(vote_msg).await.unwrap();
+            node.round_manager.process_vote_msg(vote_msg).await.unwrap();
         }
         let block_4 = node.next_proposal().await;
         node.round_manager
@@ -839,7 +824,12 @@ fn sync_on_partial_newer_sync_info() {
         // Create a sync info with newer quorum cert but older commit cert
         let sync_info = SyncInfo::new(block_4_qc.clone(), certificate_for_genesis(), None);
         node.round_manager
-            .sync_up(&sync_info, node.signer.author(), true)
+            .ensure_round_and_sync_up(
+                sync_info.highest_round() + 1,
+                &sync_info,
+                node.signer.author(),
+                true,
+            )
             .await
             .unwrap();
         // QuorumCert added

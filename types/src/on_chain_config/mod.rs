@@ -16,12 +16,14 @@ use move_core_types::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 
+mod dual_attestation_limit;
 mod libra_version;
 mod registered_currencies;
 mod validator_set;
 mod vm_config;
 
 pub use self::{
+    dual_attestation_limit::DualAttestationLimit,
     libra_version::LibraVersion,
     registered_currencies::RegisteredCurrencies,
     validator_set::ValidatorSet,
@@ -35,8 +37,10 @@ pub use self::{
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ConfigID(&'static str, &'static str);
 
+const CONFIG_ADDRESS_STR: &str = "0xA550C18";
+
 pub fn config_address() -> AccountAddress {
-    AccountAddress::from_hex_literal("0xF1A95").expect("failed to get address")
+    AccountAddress::from_hex_literal(CONFIG_ADDRESS_STR).expect("failed to get address")
 }
 
 impl ConfigID {
@@ -54,6 +58,7 @@ pub const ON_CHAIN_CONFIG_REGISTRY: &[ConfigID] = &[
     LibraVersion::CONFIG_ID,
     ValidatorSet::CONFIG_ID,
     RegisteredCurrencies::CONFIG_ID,
+    DualAttestationLimit::CONFIG_ID,
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -93,7 +98,7 @@ pub trait ConfigStorage {
 /// that is stored in storage as a serialized byte array
 pub trait OnChainConfig: Send + Sync + DeserializeOwned {
     // association_address
-    const ADDRESS: &'static str = "0xF1A95";
+    const ADDRESS: &'static str = CONFIG_ADDRESS_STR;
     const IDENTIFIER: &'static str;
     const CONFIG_ID: ConfigID = ConfigID(Self::ADDRESS, Self::IDENTIFIER);
 
@@ -137,11 +142,11 @@ pub fn access_path_for_config(address: AccountAddress, config_name: Identifier) 
         AccessPath::resource_access_vec(&StructTag {
             address: CORE_CODE_ADDRESS,
             module: Identifier::new("LibraConfig").unwrap(),
-            name: Identifier::new("T").unwrap(),
+            name: Identifier::new("LibraConfig").unwrap(),
             type_params: vec![TypeTag::Struct(StructTag {
                 address: CORE_CODE_ADDRESS,
-                module: config_name,
-                name: Identifier::new("T").unwrap(),
+                module: config_name.clone(),
+                name: config_name,
                 type_params: vec![],
             })],
         }),

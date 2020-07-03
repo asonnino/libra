@@ -304,16 +304,18 @@ impl TransactionStore {
         &mut self,
         timeline_id: u64,
         count: usize,
-    ) -> (Vec<SignedTransaction>, u64) {
+    ) -> (Vec<(u64, SignedTransaction)>, u64) {
         let mut batch = vec![];
         let mut last_timeline_id = timeline_id;
-        for (address, sequence_number) in self.timeline_index.read_timeline(timeline_id, count) {
+        for (id, (address, sequence_number)) in
+            self.timeline_index.read_timeline(timeline_id, count)
+        {
             if let Some(txn) = self
                 .transactions
                 .get_mut(&address)
                 .and_then(|txns| txns.get(&sequence_number))
             {
-                batch.push(txn.txn.clone());
+                batch.push((id, txn.txn.clone()));
                 if let TimelineState::Ready(timeline_id) = txn.timeline_state {
                     last_timeline_id = timeline_id;
                 }
@@ -322,26 +324,29 @@ impl TransactionStore {
         (batch, last_timeline_id)
     }
 
-    /// Returns block of transactions with timeline id in the range `start_timeline_id` exclusive to `end_timeline_id` inclusive
-    pub(crate) fn timeline_range(
+    /// Returns transactions with timeline ID in `timeline_ids`
+    /// as list of (timeline_id, transaction)
+    pub(crate) fn filter_read_timeline(
         &mut self,
-        start_timeline_id: u64,
-        end_timeline_id: u64,
-    ) -> Vec<SignedTransaction> {
-        let mut batch = vec![];
-        for (address, sequence_number) in self
-            .timeline_index
-            .range(start_timeline_id, end_timeline_id)
-        {
-            if let Some(txn) = self
-                .transactions
-                .get_mut(&address)
-                .and_then(|txns| txns.get(&sequence_number))
-            {
-                batch.push(txn.txn.clone());
-            }
-        }
-        batch
+        timeline_ids: Vec<u64>,
+    ) -> Vec<(u64, SignedTransaction)> {
+        timeline_ids
+            .into_iter()
+            .filter_map(|timeline_id| {
+                if let Some((address, sequence_number)) =
+                    self.timeline_index.get_timeline_entry(timeline_id)
+                {
+                    if let Some(txn) = self
+                        .transactions
+                        .get_mut(&address)
+                        .and_then(|txns| txns.get(&sequence_number))
+                    {
+                        return Some((timeline_id, txn.txn.clone()));
+                    }
+                }
+                None
+            })
+            .collect()
     }
 
     /// GC old transactions

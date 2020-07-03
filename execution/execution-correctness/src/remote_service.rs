@@ -6,8 +6,9 @@ use crate::serializer::{
 };
 use executor::Executor;
 use executor_types::Error;
+use libra_crypto::ed25519::Ed25519PrivateKey;
 use libra_logger::warn;
-use libra_secure_net::{NetworkClient, NetworkServer};
+use libra_secure_net::{Error as NetError, NetworkClient, NetworkServer};
 use libra_vm::LibraVM;
 use std::net::SocketAddr;
 use storage_client::StorageClient;
@@ -22,11 +23,15 @@ pub trait RemoteService {
     fn server_address(&self) -> SocketAddr;
 }
 
-pub fn execute(storage_addr: SocketAddr, listen_addr: SocketAddr) {
+pub fn execute(
+    storage_addr: SocketAddr,
+    listen_addr: SocketAddr,
+    prikey: Option<Ed25519PrivateKey>,
+) {
     let block_executor = Box::new(Executor::<LibraVM>::new(
         StorageClient::new(&storage_addr).into(),
     ));
-    let mut serializer_service = SerializerService::new(block_executor);
+    let mut serializer_service = SerializerService::new(block_executor, prikey);
     let mut network_server = NetworkServer::new(listen_addr);
 
     loop {
@@ -59,8 +64,15 @@ impl RemoteClient {
 impl TSerializerClient for RemoteClient {
     fn request(&mut self, input: ExecutionCorrectnessInput) -> Result<Vec<u8>, Error> {
         let input_message = lcs::to_bytes(&input)?;
-        self.network_client.write(&input_message)?;
-        let result = self.network_client.read()?;
+        let result = loop {
+            while self.network_client.write(&input_message).is_err() {}
+            let res = self.network_client.read();
+            match res {
+                Ok(res) => break res,
+                Err(NetError::RemoteStreamClosed) => (),
+                Err(err) => return Err(err.into()),
+            }
+        };
         Ok(result)
     }
 }

@@ -9,10 +9,10 @@
 //! new-transaction
 // Reconfiguration can only be invoked by association.
 script {
-use 0x0::LibraConfig;
+use 0x1::LibraConfig;
 
-fun main() {
-    LibraConfig::reconfigure()
+fun main(account: &signer) {
+    LibraConfig::reconfigure(account);
 }
 }
 
@@ -20,30 +20,28 @@ fun main() {
 // check: 1
 
 //! new-transaction
-//! sender: config
+//! sender: association
 script {
-use 0x0::LibraConfig;
+use 0x1::LibraConfig;
 
-fun main() {
-    LibraConfig::reconfigure()
+fun main(account: &signer) {
+    LibraConfig::reconfigure(account);
 }
 }
-
 // check: NewEpochEvent
 // check: EXECUTED
 
 //! new-transaction
-//! sender: config
+//! sender: association
 // Cannot trigger two reconfiguration within the same block.
 script {
-use 0x0::LibraConfig;
+use 0x1::LibraConfig;
 
-fun main() {
-    LibraConfig::reconfigure()
+fun main(account: &signer) {
+    LibraConfig::reconfigure(account);
 }
 }
-
-// check: ABORT
+// check: ABORTED
 // check: 23
 
 //! block-prologue
@@ -51,14 +49,13 @@ fun main() {
 //! block-time: 3
 
 //! new-transaction
-//! sender: config
+//! sender: association
 script {
-use 0x0::LibraConfig;
+use 0x1::LibraConfig;
 
-fun main() {
-    LibraConfig::reconfigure()
+fun main(account: &signer) {
+    LibraConfig::reconfigure(account);
 }
 }
-
 // check: NewEpochEvent
 // check: EXECUTED

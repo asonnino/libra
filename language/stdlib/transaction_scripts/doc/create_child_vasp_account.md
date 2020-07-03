@@ -5,13 +5,13 @@
 
 ### Table of Contents
 
--  [Function `main`](#SCRIPT_main)
+-  [Function `create_child_vasp_account`](#SCRIPT_create_child_vasp_account)
 
 
 
-<a name="SCRIPT_main"></a>
+<a name="SCRIPT_create_child_vasp_account"></a>
 
-## Function `main`
+## Function `create_child_vasp_account`
 
 Create a
 <code>ChildVASP</code> account for sender
@@ -22,10 +22,11 @@ Create a
 <code>auth_key_prefix | child_address</code>.
 If
 <code>add_all_currencies</code> is true, the child address will have a zero balance in all available
-currencies in the system
+currencies in the system.
+This account will a child of the transaction sender, which must be a ParentVASP.
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="#SCRIPT_main">main</a>&lt;unknown#0&gt;(parent_vasp: &signer, child_address: address, auth_key_prefix: vector&lt;u8&gt;, add_all_currencies: bool, child_initial_balance: u64)
+<pre><code><b>public</b> <b>fun</b> <a href="#SCRIPT_create_child_vasp_account">create_child_vasp_account</a>&lt;CoinType&gt;(parent_vasp: &signer, child_address: address, auth_key_prefix: vector&lt;u8&gt;, add_all_currencies: bool, child_initial_balance: u64)
 </code></pre>
 
 
@@ -34,14 +35,14 @@ currencies in the system
 <summary>Implementation</summary>
 
 
-<pre><code><b>fun</b> <a href="#SCRIPT_main">main</a>&lt;CoinType&gt;(
+<pre><code><b>fun</b> <a href="#SCRIPT_create_child_vasp_account">create_child_vasp_account</a>&lt;CoinType&gt;(
     parent_vasp: &signer,
     child_address: address,
     auth_key_prefix: vector&lt;u8&gt;,
     add_all_currencies: bool,
     child_initial_balance: u64
 ) {
-    <a href="../../modules/doc/LibraAccount.md#0x0_LibraAccount_create_child_vasp_account">LibraAccount::create_child_vasp_account</a>&lt;CoinType&gt;(
+    <a href="../../modules/doc/LibraAccount.md#0x1_LibraAccount_create_child_vasp_account">LibraAccount::create_child_vasp_account</a>&lt;CoinType&gt;(
         parent_vasp,
         child_address,
         auth_key_prefix,
@@ -49,7 +50,11 @@ currencies in the system
     );
     // Give the newly created child `child_initial_balance` coins
     <b>if</b> (child_initial_balance &gt; 0) {
-        <a href="../../modules/doc/LibraAccount.md#0x0_LibraAccount_pay_from_sender">LibraAccount::pay_from_sender</a>&lt;CoinType&gt;(child_address, child_initial_balance)
+        <b>let</b> vasp_withdrawal_cap = <a href="../../modules/doc/LibraAccount.md#0x1_LibraAccount_extract_withdraw_capability">LibraAccount::extract_withdraw_capability</a>(parent_vasp);
+        <a href="../../modules/doc/LibraAccount.md#0x1_LibraAccount_pay_from">LibraAccount::pay_from</a>&lt;CoinType&gt;(
+            &vasp_withdrawal_cap, child_address, child_initial_balance, x"", x""
+        );
+        <a href="../../modules/doc/LibraAccount.md#0x1_LibraAccount_restore_withdraw_capability">LibraAccount::restore_withdraw_capability</a>(vasp_withdrawal_cap);
     };
 }
 </code></pre>

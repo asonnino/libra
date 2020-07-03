@@ -11,7 +11,7 @@ use libra_key_manager::{
 };
 use libra_logger::info;
 use libra_secure_push_metrics::MetricsPusher;
-use libra_secure_storage::{BoxStorage, Storage};
+use libra_secure_storage::Storage;
 use libra_secure_time::RealTimeService;
 use std::{convert::TryInto, env, process};
 
@@ -36,6 +36,8 @@ fn main() {
         .is_async(key_manager_config.logger.is_async)
         .level(key_manager_config.logger.level)
         .init();
+    libra_logger::init_struct_log_from_env().expect("Failed to initialize structured logging");
+
     MetricsPusher::new(COUNTERS.clone()).start();
 
     create_and_execute_key_manager(key_manager_config).unwrap_or_else(|e| {
@@ -46,17 +48,14 @@ fn main() {
 
 fn create_and_execute_key_manager(key_manager_config: KeyManagerConfig) -> Result<(), Error> {
     let libra_interface = create_libra_interface(key_manager_config.json_rpc_endpoint);
-    let storage: Box<dyn Storage> = (&key_manager_config.secure_backend)
+    let storage: Storage = (&key_manager_config.secure_backend)
         .try_into()
         .expect("Unable to initialize storage");
     let time_service = RealTimeService::new();
 
     KeyManager::new(
-        // TODO(joshlind/davidiw): This needs to be pulled from storage OPERATOR_ACCOUNT for now
-        // and eventually OWNER_ACCOUNT
-        key_manager_config.validator_account,
         libra_interface,
-        BoxStorage(storage),
+        storage,
         time_service,
         key_manager_config.rotation_period_secs,
         key_manager_config.sleep_period_secs,

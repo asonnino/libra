@@ -1,7 +1,10 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{libra_interface::JsonRpcLibraInterface, Action, Error, KeyManager, LibraInterface};
+use crate::{
+    libra_interface::JsonRpcLibraInterface, Action, Error, KeyManager, LibraInterface,
+    GAS_UNIT_PRICE, MAX_GAS_AMOUNT,
+};
 use anyhow::Result;
 use executor::{db_bootstrapper, Executor};
 use executor_types::BlockExecutor;
@@ -11,20 +14,22 @@ use libra_config::{
     utils,
     utils::get_genesis_txn,
 };
-use libra_crypto::{ed25519::Ed25519PrivateKey, HashValue, PrivateKey, Uniform};
-use libra_global_constants::OPERATOR_KEY;
+use libra_crypto::{ed25519::Ed25519PrivateKey, x25519, HashValue, PrivateKey, Uniform};
+use libra_global_constants::{OPERATOR_ACCOUNT, OPERATOR_KEY};
+use libra_network_address::RawNetworkAddress;
 use libra_secure_storage::{InMemoryStorageInternal, KVStorage, Value};
 use libra_secure_time::{MockTimeService, TimeService};
 use libra_types::{
     account_address::AccountAddress,
     account_config,
+    account_config::{association_address, LBR_NAME},
     account_state::AccountState,
     block_info::BlockInfo,
     block_metadata::{BlockMetadata, LibraBlockResource},
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     mempool_status::{MempoolStatus, MempoolStatusCode},
     on_chain_config::{ConfigurationResource, ValidatorSet},
-    transaction::Transaction,
+    transaction::{RawTransaction, Script, Transaction},
     validator_config::ValidatorConfig,
     validator_info::ValidatorInfo,
 };
@@ -37,6 +42,8 @@ use tokio::runtime::Runtime;
 use vm_validator::{
     mocks::mock_vm_validator::MockVMValidator, vm_validator::TransactionValidation,
 };
+
+const TXN_EXPIRATION_SECS: u64 = 100;
 
 struct Node<T: LibraInterface> {
     account: AccountAddress,
@@ -289,19 +296,22 @@ impl LibraInterface for MockLibraInterface {
 }
 
 // Creates and returns NodeConfig and KeyManagerConfig structs that are consistent for testing.
-fn create_test_configs() -> (NodeConfig, KeyManagerConfig) {
-    let (node_config, _genesis_key) = config_builder::test_config();
-
-    let mut key_manager_config = KeyManagerConfig::default();
-    key_manager_config.validator_account = node_config.validator_network.clone().unwrap().peer_id();
-
+fn get_test_configs() -> (NodeConfig, KeyManagerConfig) {
+    let (node_config, _) = config_builder::test_config();
+    let key_manager_config = KeyManagerConfig::default();
     (node_config, key_manager_config)
+}
+
+// Returns the association private key used for testing.
+fn get_test_association_key() -> Ed25519PrivateKey {
+    let (_, association_key) = config_builder::test_config();
+    association_key
 }
 
 // Creates and returns a test node that uses the JsonRpcLibraInterface.
 // This setup is useful for testing nodes as they operate in a production environment.
 fn setup_node_using_json_rpc() -> (Node<JsonRpcLibraInterface>, Runtime) {
-    let (node_config, key_manager_config) = create_test_configs();
+    let (node_config, key_manager_config) = get_test_configs();
 
     let (_storage, db_rw) = setup_libra_db(&node_config);
     let (libra, server) = setup_libra_interface_and_json_server(db_rw.clone());
@@ -316,8 +326,7 @@ fn setup_node_using_json_rpc() -> (Node<JsonRpcLibraInterface>, Runtime) {
 // Creates and returns a Node using the MockLibraInterface implementation.
 // This setup is useful for testing and verifying new development features quickly.
 fn setup_node_using_test_mocks() -> Node<MockLibraInterface> {
-    let (node_config, key_manager_config) = create_test_configs();
-
+    let (node_config, key_manager_config) = get_test_configs();
     let (storage, db_rw) = setup_libra_db(&node_config);
     let libra = MockLibraInterface { storage };
     let executor = Executor::new(db_rw);
@@ -342,14 +351,22 @@ fn setup_node<T: LibraInterface + Clone>(
     executor: Executor<LibraVM>,
     libra: T,
 ) -> Node<T> {
-    let account = key_manager_config.validator_account;
     let time = MockTimeService::new();
     let libra_test_harness = LibraInterfaceTestHarness::new(libra);
+    let storage = setup_secure_storage(&node_config, time.clone());
+    let account = AccountAddress::try_from(
+        storage
+            .get(OPERATOR_ACCOUNT)
+            .unwrap()
+            .value
+            .string()
+            .unwrap(),
+    )
+    .unwrap();
 
     let key_manager = KeyManager::new(
-        account,
         libra_test_harness.clone(),
-        setup_secure_storage(&node_config, time.clone()),
+        storage,
         time.clone(),
         key_manager_config.rotation_period_secs,
         key_manager_config.sleep_period_secs,
@@ -370,19 +387,23 @@ fn setup_secure_storage(
 
     let mut a_keypair = test_config.operator_keypair.unwrap();
     let a_prikey = Value::Ed25519PrivateKey(a_keypair.take_private().unwrap());
-
     sec_storage.set(OPERATOR_KEY, a_prikey).unwrap();
 
-    let mut c_keypair = test_config.consensus_keypair.unwrap();
-    let c_prikey = c_keypair.take_private().unwrap();
-    let c_prikey0 = Value::Ed25519PrivateKey(c_prikey.clone());
-    let c_prikey1 = Value::Ed25519PrivateKey(c_prikey);
+    let operator_account = libra_types::account_address::from_public_key(&a_keypair.public_key());
+    sec_storage
+        .set(
+            OPERATOR_ACCOUNT,
+            Value::String(operator_account.to_string()),
+        )
+        .unwrap();
 
-    sec_storage.set(crate::CONSENSUS_KEY, c_prikey0).unwrap();
-    // Ugly hack but we need this until we support retrieving a policy from within storage and that
-    // currently is not easy, since we would need to convert from Vault -> Libra policy.
-    let previous = format!("{}_previous", crate::CONSENSUS_KEY);
-    sec_storage.set(&previous, c_prikey1).unwrap();
+    let sr_test_config = config.consensus.safety_rules.test.as_ref().unwrap();
+    let c_keypair = sr_test_config.consensus_keypair.as_ref().unwrap();
+    let c_prikey = c_keypair.clone().take_private().unwrap();
+    sec_storage
+        .set(crate::CONSENSUS_KEY, Value::Ed25519PrivateKey(c_prikey))
+        .unwrap();
+
     sec_storage
 }
 
@@ -454,14 +475,17 @@ fn test_manual_rotation_on_chain() {
 }
 
 fn verify_manual_rotation_on_chain<T: LibraInterface>(mut node: Node<T>) {
-    let (node_config, _) = create_test_configs();
+    let (node_config, _) = get_test_configs();
+
     let test_config = node_config.test.unwrap();
     let account_prikey = test_config
         .operator_keypair
         .unwrap()
         .take_private()
         .unwrap();
-    let genesis_pubkey = test_config
+
+    let sr_test_config = node_config.consensus.safety_rules.test.unwrap();
+    let genesis_pubkey = sr_test_config
         .consensus_keypair
         .unwrap()
         .take_private()
@@ -480,14 +504,31 @@ fn verify_manual_rotation_on_chain<T: LibraInterface>(mut node: Node<T>) {
     let mut rng = StdRng::from_seed([44u8; 32]);
     let new_privkey = Ed25519PrivateKey::generate(&mut rng);
     let new_pubkey = new_privkey.public_key();
-    let txn = crate::build_rotation_transaction(
+    let new_network_pubkey = x25519::PrivateKey::generate(&mut rng).public_key();
+    let txn1 = crate::build_rotation_transaction(
         node.account,
         0,
-        &account_prikey,
         &new_pubkey,
-        Duration::from_secs(node.time.now() + 100),
+        &new_network_pubkey,
+        &RawNetworkAddress::new(Vec::new()),
+        &new_network_pubkey,
+        &RawNetworkAddress::new(Vec::new()),
+        Duration::from_secs(node.time.now() + TXN_EXPIRATION_SECS),
     );
-    node.execute_and_commit(vec![txn]);
+    let txn1 = txn1
+        .sign(&account_prikey, account_prikey.public_key())
+        .unwrap();
+    let txn1 = Transaction::UserTransaction(txn1.into_inner());
+
+    let association_prikey = get_test_association_key();
+    let txn2 = build_reconfiguration_transaction(
+        account_config::association_address(),
+        1,
+        &association_prikey,
+        Duration::from_secs(node.time.now() + TXN_EXPIRATION_SECS),
+    );
+
+    node.execute_and_commit(vec![txn1, txn2]);
 
     let new_config = node.libra.retrieve_validator_config(node.account).unwrap();
     let new_info = node.libra.retrieve_validator_info(node.account).unwrap();
@@ -530,6 +571,7 @@ fn verify_init_and_basic_rotation<T: LibraInterface>(mut node: Node<T>) {
     assert_ne!(pre_exe_rotated_info.consensus_public_key(), &new_key);
 
     // Execute key rotation on-chain
+    submit_reconfiguration_transaction(&node);
     node.execute_and_commit(node.libra.take_all_transactions());
     let rotated_info = node.libra.retrieve_validator_info(node.account).unwrap();
     assert_ne!(
@@ -568,7 +610,7 @@ fn test_execute() {
 }
 
 fn verify_execute<T: LibraInterface>(mut node: Node<T>) {
-    let (_, key_manager_config) = create_test_configs();
+    let (_, key_manager_config) = get_test_configs();
 
     // Verify correct initial state (i.e., nothing to be done by key manager)
     assert_eq!(0, node.time.now());
@@ -614,6 +656,7 @@ fn verify_execute<T: LibraInterface>(mut node: Node<T>) {
     // executed to re-sync everything up (on-chain).
     node.update_libra_timestamp();
     node.key_manager.execute_once().unwrap();
+    submit_reconfiguration_transaction(&node);
     node.execute_and_commit(node.libra.take_all_transactions());
     assert_eq!(
         Action::NoAction,
@@ -660,4 +703,47 @@ fn verify_execute_error<T: LibraInterface>(mut node: Node<T>) {
     // Check that execute() now returns an error and doesn't spin forever.
     node.update_libra_timestamp();
     assert!(node.key_manager.execute().is_err());
+}
+
+// Creates and submits a reconfiguration transaction to the given libra interface.
+fn submit_reconfiguration_transaction<T: LibraInterface>(node: &Node<T>) {
+    let association_prikey = get_test_association_key();
+    let association_account = association_address();
+    let seq_id = node
+        .libra
+        .retrieve_sequence_number(association_account)
+        .unwrap();
+    let expiration = Duration::from_secs(node.time.now() + TXN_EXPIRATION_SECS);
+
+    let txn = build_reconfiguration_transaction(
+        association_account,
+        seq_id,
+        &association_prikey,
+        expiration,
+    );
+    node.libra.submit_transaction(txn).unwrap();
+}
+
+fn build_reconfiguration_transaction(
+    sender: AccountAddress,
+    seq_id: u64,
+    signing_key: &Ed25519PrivateKey,
+    expiration: Duration,
+) -> Transaction {
+    let script = Script::new(
+        libra_transaction_scripts::RECONFIGURE_TXN.clone(),
+        vec![],
+        vec![],
+    );
+    let raw_txn = RawTransaction::new_script(
+        sender,
+        seq_id,
+        script,
+        MAX_GAS_AMOUNT,
+        GAS_UNIT_PRICE,
+        LBR_NAME.to_owned(),
+        expiration,
+    );
+    let signed_txn = raw_txn.sign(signing_key, signing_key.public_key()).unwrap();
+    Transaction::UserTransaction(signed_txn.into_inner())
 }

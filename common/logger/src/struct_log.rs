@@ -11,6 +11,7 @@ use std::{
     fs::{File, OpenOptions},
     io,
     io::Write as IoWrite,
+    marker::PhantomData,
     net::UdpSocket,
     str::FromStr,
     sync::{
@@ -35,32 +36,42 @@ const INITIALIZING: usize = 1;
 const INITIALIZED: usize = 2;
 
 // severity level - lower is worse
-const SEVERITY_CRITICAL: usize = 1;
-const SEVERITY_WARNING: usize = 2;
+const SEVERITY_SECURITY: usize = 1;
+const SEVERITY_CRITICAL: usize = 2;
+const SEVERITY_WARNING: usize = 3;
 
 #[derive(Default, Serialize)]
 pub struct StructuredLogEntry {
+    /// log message set by macros like info!
     #[serde(skip_serializing_if = "Option::is_none")]
     log: Option<String>,
+    /// description of the log
     #[serde(skip_serializing_if = "Option::is_none")]
     pattern: Option<&'static str>,
+    /// name of the event
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<&'static str>,
+    /// rust module (e.g. consensus::round_manager)
     #[serde(skip_serializing_if = "Option::is_none")]
     module: Option<&'static str>,
+    /// filename + line (e.g. consensus/src/round_manager.rs:678)
     #[serde(skip_serializing_if = "Option::is_none")]
     location: Option<&'static str>,
+    /// git revision
     #[serde(skip_serializing_if = "Option::is_none")]
     git_rev: Option<&'static str>,
+    /// time of the log
     #[serde(skip_serializing_if = "Option::is_none")]
     timestamp: Option<String>,
+    /// warning, critical, or security
     #[serde(skip_serializing_if = "Option::is_none")]
     severity: Option<usize>,
+    /// arbitrary data that can be logged
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     data: HashMap<&'static str, Value>,
 }
 
-#[must_use = "use StructuredLogEntry::send to send structured log"]
+#[must_use = "use send_struct_log! macro to send structured log"]
 impl StructuredLogEntry {
     pub fn new_unnamed() -> Self {
         let mut ret = Self::default();
@@ -73,6 +84,12 @@ impl StructuredLogEntry {
         ret.name = Some(name);
         ret.timestamp = Some(Utc::now().format("%F %T").to_string());
         ret
+    }
+
+    /// refer to security_log() to create security logs
+    pub(crate) fn security(mut self) -> Self {
+        self.severity = Some(SEVERITY_SECURITY);
+        self
     }
 
     pub fn critical(mut self) -> Self {
@@ -96,6 +113,10 @@ impl StructuredLogEntry {
             serde_json::to_value(value).expect("Failed to serialize StructuredLogEntry key"),
         );
         self
+    }
+
+    pub fn field<D: Serialize>(self, field: &LoggingField<D>, value: D) -> Self {
+        self.data(field.0, value)
     }
 
     #[doc(hidden)] // set from macro
@@ -141,6 +162,27 @@ impl StructuredLogEntry {
     #[doc(hidden)]
     pub fn send(self) {
         struct_logger().send(self);
+    }
+}
+
+/// Field is similar to .data but restricts type of the value to a specific type.
+///
+/// Example:
+///
+/// mod logging {
+///    pub const MY_FIELD:LoggingField<u64> = LoggingField::new("my_field");
+/// }
+///
+/// mod my_code {
+///    fn my_fn() {
+///        send_struct_log!(StructuredLogEntry::new(...).field(&logging::MY_FIELD, 0))
+///    }
+/// }
+pub struct LoggingField<D>(&'static str, PhantomData<D>);
+
+impl<D> LoggingField<D> {
+    pub const fn new(name: &'static str) -> Self {
+        Self(name, PhantomData)
     }
 }
 
@@ -351,8 +393,8 @@ impl UDPStructLogThread {
                     continue;
                 }
                 Err(e) => {
+                    // do not break on error, move on to the next log message
                     println!("[Logging] Error while sending data to socket: {}", e);
-                    break;
                 }
             }
         }

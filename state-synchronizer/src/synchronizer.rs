@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
     coordinator::{CoordinatorMessage, SyncCoordinator, SyncRequest},
+    counters,
     executor_proxy::{ExecutorProxy, ExecutorProxyTrait},
     network::{StateSynchronizerEvents, StateSynchronizerSender},
     SynchronizerState,
@@ -13,11 +14,14 @@ use futures::{
     future::Future,
     SinkExt,
 };
-use libra_config::config::{NodeConfig, RoleType, StateSyncConfig, UpstreamConfig};
+use libra_config::{
+    config::{NodeConfig, RoleType, StateSyncConfig, UpstreamConfig},
+    network_id::NetworkId,
+};
 use libra_mempool::{CommitNotification, CommitResponse};
 use libra_types::{
     contract_event::ContractEvent, ledger_info::LedgerInfoWithSignatures, transaction::Transaction,
-    waypoint::Waypoint, PeerId,
+    waypoint::Waypoint,
 };
 use std::{
     boxed::Box,
@@ -40,7 +44,7 @@ pub struct StateSynchronizer {
 impl StateSynchronizer {
     /// Setup state synchronizer. spawns coordinator and downloader routines on executor
     pub fn bootstrap(
-        network: Vec<(PeerId, StateSynchronizerSender, StateSynchronizerEvents)>,
+        network: Vec<(NetworkId, StateSynchronizerSender, StateSynchronizerEvents)>,
         state_sync_to_mempool_sender: mpsc::Sender<CommitNotification>,
         storage: Arc<dyn DbReader>,
         executor: Box<dyn ChunkExecutor>,
@@ -70,7 +74,7 @@ impl StateSynchronizer {
 
     pub fn bootstrap_with_executor_proxy<E: ExecutorProxyTrait + 'static>(
         runtime: Runtime,
-        network: Vec<(PeerId, StateSynchronizerSender, StateSynchronizerEvents)>,
+        network: Vec<(NetworkId, StateSynchronizerSender, StateSynchronizerEvents)>,
         state_sync_to_mempool_sender: mpsc::Sender<CommitNotification>,
         role: RoleType,
         waypoint: Option<Waypoint>,
@@ -86,7 +90,7 @@ impl StateSynchronizer {
 
         let network_senders: HashMap<_, _> = network
             .iter()
-            .map(|(network_id, sender, _events)| (*network_id, sender.clone()))
+            .map(|(network_id, sender, _events)| (network_id.clone(), sender.clone()))
             .collect();
 
         let coordinator = SyncCoordinator::new(
@@ -109,9 +113,7 @@ impl StateSynchronizer {
     }
 
     pub fn create_client(&self) -> Arc<StateSyncClient> {
-        Arc::new(StateSyncClient {
-            coordinator_sender: self.coordinator_sender.clone(),
-        })
+        Arc::new(StateSyncClient::new(self.coordinator_sender.clone()))
     }
 
     /// The function returns a future that is fulfilled when the state synchronizer is
@@ -131,6 +133,10 @@ pub struct StateSyncClient {
 }
 
 impl StateSyncClient {
+    pub fn new(coordinator_sender: mpsc::UnboundedSender<CoordinatorMessage>) -> Self {
+        Self { coordinator_sender }
+    }
+
     /// Sync validator's state to target.
     /// In case of success (`Result::Ok`) the LI of storage is at the given target.
     /// In case of failure (`Result::Error`) the LI of storage remains unchanged, and the validator
@@ -171,8 +177,11 @@ impl StateSyncClient {
                 ))
                 .await?;
 
-            match timeout(Duration::from_secs(1), callback_rcv).await {
+            match timeout(Duration::from_secs(5), callback_rcv).await {
                 Err(_) => {
+                    counters::COMMIT_TIMEOUT
+                        .with_label_values(&["consensus"])
+                        .inc();
                     Err(format_err!("[state sync client] failed to receive commit ACK from state synchronizer on time"))
                 }
                 Ok(resp) => {

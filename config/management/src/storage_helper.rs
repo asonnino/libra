@@ -4,11 +4,13 @@
 use crate::{error::Error, Command};
 use libra_crypto::ed25519::Ed25519PublicKey;
 use libra_global_constants::{
-    ASSOCIATION_KEY, CONSENSUS_KEY, EPOCH, FULLNODE_NETWORK_KEY, LAST_VOTED_ROUND, OPERATOR_KEY,
-    OWNER_KEY, PREFERRED_ROUND, VALIDATOR_NETWORK_KEY, WAYPOINT,
+    ASSOCIATION_KEY, CONSENSUS_KEY, EPOCH, EXECUTION_KEY, FULLNODE_NETWORK_KEY, LAST_VOTED_ROUND,
+    OPERATOR_KEY, OWNER_KEY, PREFERRED_ROUND, VALIDATOR_NETWORK_KEY, WAYPOINT,
 };
 use libra_network_address::NetworkAddress;
-use libra_secure_storage::{NamespacedStorage, OnDiskStorage, Storage, Value};
+use libra_secure_storage::{
+    CryptoStorage, KVStorage, NamespacedStorage, OnDiskStorage, Storage, Value,
+};
 use libra_types::{account_address::AccountAddress, transaction::Transaction, waypoint::Waypoint};
 use std::{fs::File, path::Path};
 use structopt::StructOpt;
@@ -25,9 +27,9 @@ impl StorageHelper {
         Self { temppath }
     }
 
-    pub fn storage(&self, namespace: String) -> Box<dyn Storage> {
+    pub fn storage(&self, namespace: String) -> Storage {
         let storage = OnDiskStorage::new(self.temppath.path().to_path_buf());
-        Box::new(NamespacedStorage::new(storage, namespace))
+        Storage::from(NamespacedStorage::new(Box::new(storage), namespace))
     }
 
     pub fn path(&self) -> &Path {
@@ -43,6 +45,7 @@ impl StorageHelper {
 
         storage.create_key(ASSOCIATION_KEY).unwrap();
         storage.create_key(CONSENSUS_KEY).unwrap();
+        storage.create_key(EXECUTION_KEY).unwrap();
         storage.create_key(FULLNODE_NETWORK_KEY).unwrap();
         storage.create_key(OWNER_KEY).unwrap();
         storage.create_key(OPERATOR_KEY).unwrap();
@@ -118,6 +121,28 @@ impl StorageHelper {
         command.genesis()
     }
 
+    pub fn insert_waypoint(&self, local_ns: &str, remote_ns: &str) -> Result<Waypoint, Error> {
+        let args = format!(
+            "
+                management
+                insert-waypoint
+                --local backend={backend};\
+                    path={path};\
+                    namespace={local_ns}
+                --remote backend={backend};\
+                    path={path};\
+                    namespace={remote_ns}
+            ",
+            backend = crate::secure_backend::DISK,
+            path = self.path_string(),
+            local_ns = local_ns,
+            remote_ns = remote_ns,
+        );
+
+        let command = Command::from_iter(args.split_whitespace());
+        command.insert_waypoint()
+    }
+
     pub fn operator_key(&self, local_ns: &str, remote_ns: &str) -> Result<Ed25519PublicKey, Error> {
         let args = format!(
             "
@@ -140,6 +165,7 @@ impl StorageHelper {
         command.operator_key()
     }
 
+    #[cfg(test)]
     pub fn owner_key(&self, local_ns: &str, remote_ns: &str) -> Result<Ed25519PublicKey, Error> {
         let args = format!(
             "
@@ -162,6 +188,7 @@ impl StorageHelper {
         command.owner_key()
     }
 
+    #[cfg(test)]
     pub fn set_layout(&self, path: &str, namespace: &str) -> Result<crate::layout::Layout, Error> {
         let args = format!(
             "
@@ -217,6 +244,7 @@ impl StorageHelper {
         command.validator_config()
     }
 
+    #[cfg(test)]
     pub fn verify(&self, namespace: &str) -> Result<String, Error> {
         let args = format!(
             "

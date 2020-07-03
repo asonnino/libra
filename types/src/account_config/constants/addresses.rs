@@ -10,16 +10,20 @@ pub fn association_address() -> AccountAddress {
         .expect("Parsing valid hex literal should always succeed")
 }
 
-pub fn transaction_fee_address() -> AccountAddress {
-    AccountAddress::from_hex_literal("0xFEE")
-        .expect("Parsing valid hex literal should always succeed")
-}
-
 pub fn validator_set_address() -> AccountAddress {
     crate::on_chain_config::config_address()
 }
 
 pub fn treasury_compliance_account_address() -> AccountAddress {
     AccountAddress::from_hex_literal("0xB1E55ED")
+        .expect("Parsing valid hex literal should always succeed")
+}
+
+pub fn reserved_vm_address() -> AccountAddress {
+    AccountAddress::new([0u8; AccountAddress::LENGTH])
+}
+
+pub fn testnet_dd_account_address() -> AccountAddress {
+    AccountAddress::from_hex_literal("0xDD")
         .expect("Parsing valid hex literal should always succeed")
 }

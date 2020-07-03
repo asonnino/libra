@@ -6,20 +6,26 @@
 //! byte code). This includes identifying the Move sub-language supported by the specification
 //! system, as well as type checking it and translating it to the spec language ast.
 
-use std::collections::{BTreeMap, BTreeSet, LinkedList, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, LinkedList, VecDeque},
+    fmt,
+    fmt::Formatter,
+};
 
 use itertools::Itertools;
-use num::{BigUint, FromPrimitive, Num};
-
-use bytecode_source_map::source_map::SourceMap;
 #[allow(unused_imports)]
 use log::{debug, info, warn};
+use num::{BigUint, FromPrimitive, Num};
+use regex::Regex;
+
+use bytecode_source_map::source_map::SourceMap;
+use move_ir_types::location::Spanned;
 use move_lang::{
     compiled_unit::{FunctionInfo, SpecInfo},
-    expansion::ast::{self as EA},
+    expansion::ast as EA,
     hlir::ast::{BaseType, SingleType},
     naming::ast::TParam,
-    parser::ast::{self as PA, FunctionName},
+    parser::ast::{self as PA, BinOp_, FunctionName},
     shared::{unique_map::UniqueMap, Name},
 };
 use vm::{
@@ -37,16 +43,12 @@ use crate::{
     env::{
         FieldId, FunId, FunctionData, GlobalEnv, Loc, ModuleId, MoveIrLoc, NodeId, SchemaId,
         SpecFunId, SpecVarId, StructData, StructId, TypeConstraint, TypeParameter,
-        SCRIPT_AST_FUN_NAME, SCRIPT_BYTECODE_FUN_NAME,
+        SCRIPT_BYTECODE_FUN_NAME,
     },
     project_1st, project_2nd,
     symbol::{Symbol, SymbolPool},
     ty::{PrimitiveType, Substitution, Type, TypeDisplayContext, BOOL_TYPE},
 };
-use move_ir_types::location::{sp, Spanned};
-use move_lang::parser::ast::BinOp_;
-use regex::Regex;
-use std::{fmt, fmt::Formatter};
 
 // =================================================================================================
 /// # Translator
@@ -488,7 +490,7 @@ impl<'env> Translator<'env> {
             );
             add_builtin(
                 self,
-                self.builtin_fun_symbol("all"),
+                self.builtin_fun_symbol("$spec_all"),
                 SpecFunEntry {
                     loc: loc.clone(),
                     oper: Operation::All,
@@ -499,7 +501,7 @@ impl<'env> Translator<'env> {
             );
             add_builtin(
                 self,
-                self.builtin_fun_symbol("any"),
+                self.builtin_fun_symbol("$spec_any"),
                 SpecFunEntry {
                     loc: loc.clone(),
                     oper: Operation::Any,
@@ -523,7 +525,7 @@ impl<'env> Translator<'env> {
             // Ranges
             add_builtin(
                 self,
-                self.builtin_fun_symbol("all"),
+                self.builtin_fun_symbol("$spec_all"),
                 SpecFunEntry {
                     loc: loc.clone(),
                     oper: Operation::All,
@@ -534,7 +536,7 @@ impl<'env> Translator<'env> {
             );
             add_builtin(
                 self,
-                self.builtin_fun_symbol("any"),
+                self.builtin_fun_symbol("$spec_any"),
                 SpecFunEntry {
                     loc: loc.clone(),
                     oper: Operation::Any,
@@ -582,7 +584,7 @@ impl<'env> Translator<'env> {
             );
             add_builtin(
                 self,
-                self.builtin_fun_symbol("domain"),
+                self.builtin_fun_symbol("$spec_domain"),
                 SpecFunEntry {
                     loc: loc.clone(),
                     oper: Operation::TypeDomain,
@@ -593,7 +595,7 @@ impl<'env> Translator<'env> {
             );
             add_builtin(
                 self,
-                self.builtin_fun_symbol("all"),
+                self.builtin_fun_symbol("$spec_all"),
                 SpecFunEntry {
                     loc: loc.clone(),
                     oper: Operation::All,
@@ -604,7 +606,7 @@ impl<'env> Translator<'env> {
             );
             add_builtin(
                 self,
-                self.builtin_fun_symbol("any"),
+                self.builtin_fun_symbol("$spec_any"),
                 SpecFunEntry {
                     loc: loc.clone(),
                     oper: Operation::Any,
@@ -1628,6 +1630,7 @@ impl<'env, 'translator> ModuleTranslator<'env, 'translator> {
             PK::Ensures => Some((Ensures, exp)),
             PK::Requires => Some((Requires, exp)),
             PK::AbortsIf => Some((AbortsIf, exp)),
+            PK::SucceedsIf => Some((SucceedsIf, exp)),
             PK::RequiresModule => Some((RequiresModule, exp)),
             PK::Invariant => Some((Invariant, exp)),
             PK::InvariantModule => Some((InvariantModule, exp)),
@@ -2634,12 +2637,17 @@ impl<'env, 'translator> ModuleTranslator<'env, 'translator> {
                 let handle_idx = module.function_def_at(def_idx).function;
                 let handle = module.function_handle_at(handle_idx);
                 let view = FunctionHandleView::new(&module, handle);
-                let mut name_str = view.name().as_str();
-                // Script functions have different names in AST and bytecode; adjust.
-                if name_str == SCRIPT_BYTECODE_FUN_NAME {
-                    name_str = SCRIPT_AST_FUN_NAME;
-                }
-                let name = self.symbol_pool().make(name_str);
+                let name_str = view.name().as_str();
+                let name = if name_str == SCRIPT_BYTECODE_FUN_NAME {
+                    // This is a pseudo script module, which has exactly one function. Determine
+                    // the name of this function.
+                    self.parent.fun_table.iter().filter_map(|(k, _)| {
+                        if k.module_name == self.module_name
+                        { Some(k.symbol) } else { None }
+                    }).next().expect("unexpected script with multiple or no functions")
+                } else {
+                    self.symbol_pool().make(name_str)
+                };
                 let fun_spec = self.fun_specs.remove(&name).unwrap_or_else(Spec::default);
                 if let Some(entry) = self.parent.fun_table.get(&self.qualified_by_module(name)) {
                     let arg_names = project_1st(&entry.params);
@@ -2701,7 +2709,6 @@ impl<'env, 'translator> ModuleTranslator<'env, 'translator> {
 
 // =================================================================================================
 /// # Expression and Type Translation
-
 #[derive(Debug)]
 pub struct ExpTranslator<'env, 'translator, 'module_translator> {
     parent: &'module_translator mut ModuleTranslator<'env, 'translator>,
@@ -3038,8 +3045,7 @@ impl<'env, 'translator, 'module_translator> ExpTranslator<'env, 'translator, 'mo
                 match &type_name.value {
                     Builtin(builtin_type_name) => match &builtin_type_name.value {
                         Address => Type::new_prim(PrimitiveType::Address),
-                        // TODO fix this for a real signer type
-                        Signer => Type::new_prim(PrimitiveType::Address),
+                        Signer => Type::new_prim(PrimitiveType::Signer),
                         U8 => Type::new_prim(PrimitiveType::U8),
                         U64 => Type::new_prim(PrimitiveType::U64),
                         U128 => Type::new_prim(PrimitiveType::U128),
@@ -3102,25 +3108,25 @@ impl<'env, 'translator, 'module_translator> ExpTranslator<'env, 'translator, 'mo
                     // Attempt to resolve as builtin type.
                     match n.value.as_str() {
                         "bool" => {
-                            return check_zero_args(self, Type::new_prim(PrimitiveType::Bool))
+                            return check_zero_args(self, Type::new_prim(PrimitiveType::Bool));
                         }
                         "u8" => return check_zero_args(self, Type::new_prim(PrimitiveType::U8)),
                         "u64" => return check_zero_args(self, Type::new_prim(PrimitiveType::U64)),
                         "u128" => {
-                            return check_zero_args(self, Type::new_prim(PrimitiveType::U128))
+                            return check_zero_args(self, Type::new_prim(PrimitiveType::U128));
                         }
                         "num" => return check_zero_args(self, Type::new_prim(PrimitiveType::Num)),
                         "range" => {
-                            return check_zero_args(self, Type::new_prim(PrimitiveType::Range))
+                            return check_zero_args(self, Type::new_prim(PrimitiveType::Range));
                         }
                         "address" => {
-                            return check_zero_args(self, Type::new_prim(PrimitiveType::Address))
+                            return check_zero_args(self, Type::new_prim(PrimitiveType::Address));
                         }
                         "signer" => {
-                            return check_zero_args(self, Type::new_prim(PrimitiveType::Signer))
+                            return check_zero_args(self, Type::new_prim(PrimitiveType::Signer));
                         }
                         "type" => {
-                            return check_zero_args(self, Type::new_prim(PrimitiveType::TypeValue))
+                            return check_zero_args(self, Type::new_prim(PrimitiveType::TypeValue));
                         }
                         "vector" => {
                             if args.len() != 1 {
@@ -3226,19 +3232,6 @@ impl<'env, 'translator, 'module_translator> ExpTranslator<'env, 'translator, 'mo
             }
             EA::Exp_::Name(maccess, type_params) => {
                 self.translate_name(&loc, maccess, type_params.as_deref(), expected_type)
-            }
-            EA::Exp_::GlobalCall(n, type_params, args) => {
-                let maccess_ = EA::ModuleAccess_::Name(n.clone());
-                let maccess = sp(n.loc, maccess_);
-                // Need to make a &[&Exp] out of args.
-                let args = args.value.iter().map(|e| e).collect_vec();
-                self.translate_fun_call(
-                    expected_type,
-                    &loc,
-                    &maccess,
-                    type_params.as_deref(),
-                    &args,
-                )
             }
             EA::Exp_::Call(maccess, type_params, args) => {
                 // Need to make a &[&Exp] out of args.
@@ -3377,7 +3370,7 @@ impl<'env, 'translator, 'module_translator> ExpTranslator<'env, 'translator, 'mo
             if let Some(entry) = self.lookup_local(sym) {
                 // Check whether the local has the expected function type.
                 let sym_ty = entry.type_.clone();
-                let (arg_types, args) = self.translate_exp_list(args);
+                let (arg_types, args) = self.translate_exp_list(args, false);
                 let fun_t = Type::Fun(arg_types, Box::new(expected_type.clone()));
                 let sym_ty = self.check_type(&loc, &sym_ty, &fun_t, "in expression");
                 let local_id = self.new_node_id_with_type_loc(&sym_ty, &self.to_loc(&n.loc));
@@ -3415,7 +3408,7 @@ impl<'env, 'translator, 'module_translator> ExpTranslator<'env, 'translator, 'mo
     fn translate_exp_free(&mut self, exp: &EA::Exp) -> (Type, Exp) {
         let tvar = self.fresh_type_var();
         let exp = self.translate_exp(exp, &tvar);
-        (tvar, exp)
+        (self.subs.specialize(&tvar), exp)
     }
 
     /// Translates a sequence expression.
@@ -3688,8 +3681,9 @@ impl<'env, 'translator, 'module_translator> ExpTranslator<'env, 'translator, 'mo
     ) -> Exp {
         // Translate generic arguments, if any.
         let generics = generics.as_ref().map(|ts| self.translate_types(&ts));
-        // Translate arguments.
-        let (arg_types, args) = self.translate_exp_list(args);
+        // Translate arguments. Skip any lambda expressions; they are resolved after the overload
+        // is identified to avoid restrictions with type inference.
+        let (arg_types, mut translated_args) = self.translate_exp_list(args, true);
         // Lookup candidates.
         let cand_modules = if let Some(m) = module {
             vec![m.clone()]
@@ -3719,13 +3713,13 @@ impl<'env, 'translator, 'module_translator> ExpTranslator<'env, 'translator, 'mo
         let mut outruled = vec![];
         let mut matching = vec![];
         for cand in &cands {
-            if cand.arg_types.len() != args.len() {
+            if cand.arg_types.len() != translated_args.len() {
                 outruled.push((
                     cand,
                     format!(
                         "argument count mismatch (expected {} but found {})",
                         cand.arg_types.len(),
-                        args.len()
+                        translated_args.len()
                     ),
                 ));
                 continue;
@@ -3776,6 +3770,14 @@ impl<'env, 'translator, 'module_translator> ExpTranslator<'env, 'translator, 'mo
                 let (cand, subs, instantiation) = matching.remove(0);
                 // Commit the candidate substitution to this expression translator.
                 self.subs = subs;
+                // Now translate lambda-based arguments passing expected type to aid type inference.
+                for i in 0..translated_args.len() {
+                    let e = args[i];
+                    if matches!(e.value, EA::Exp_::Lambda(..)) {
+                        let expected_type = self.subs.specialize(&arg_types[i]);
+                        translated_args[i] = self.translate_exp(e, &expected_type);
+                    }
+                }
                 // Check result type against expected type.
                 let ty = self.check_type(
                     loc,
@@ -3786,7 +3788,7 @@ impl<'env, 'translator, 'module_translator> ExpTranslator<'env, 'translator, 'mo
                 // Construct result.
                 let id = self.new_node_id_with_type_loc(&ty, loc);
                 self.set_instantiation(id, instantiation);
-                Exp::Call(id, cand.oper.clone(), args)
+                Exp::Call(id, cand.oper.clone(), translated_args)
             }
             _ => {
                 let display = self.display_call_target(module, name);
@@ -3810,12 +3812,22 @@ impl<'env, 'translator, 'module_translator> ExpTranslator<'env, 'translator, 'mo
     }
 
     /// Translate a list of expressions and deliver them together with their types.
-    fn translate_exp_list(&mut self, exps: &[&EA::Exp]) -> (Vec<Type>, Vec<Exp>) {
+    fn translate_exp_list(
+        &mut self,
+        exps: &[&EA::Exp],
+        skip_lambda: bool,
+    ) -> (Vec<Type>, Vec<Exp>) {
         let mut types = vec![];
         let exps = exps
             .iter()
             .map(|e| {
-                let (t, e) = self.translate_exp_free(e);
+                let (t, e) = if !skip_lambda || !matches!(e.value, EA::Exp_::Lambda(..)) {
+                    self.translate_exp_free(e)
+                } else {
+                    // In skip-lambda mode, just create a fresh type variable. We translate
+                    // the expression in a second pass, once the expected type is known.
+                    (self.fresh_type_var(), Exp::Error(NodeId::new(0)))
+                };
                 types.push(t);
                 e
             })
@@ -3975,16 +3987,16 @@ impl<'env, 'translator, 'module_translator> ExpTranslator<'env, 'translator, 'mo
                 }
             }
         }
-        // Translate the body.
+        // Create a fresh type variable for the body and check expected type before analyzing
+        // body. This aids type inference for the lambda parameters.
         let ty = self.fresh_type_var();
-        let rbody = self.translate_exp(body, &ty);
-        // Check types and construct result.
         let rty = self.check_type(
             loc,
-            &Type::Fun(arg_types, Box::new(ty)),
+            &Type::Fun(arg_types, Box::new(ty.clone())),
             expected_type,
-            "in lambda body",
+            "in lambda",
         );
+        let rbody = self.translate_exp(body, &ty);
         let id = self.new_node_id_with_type_loc(&rty, loc);
         Exp::Lambda(id, decls, Box::new(rbody))
     }

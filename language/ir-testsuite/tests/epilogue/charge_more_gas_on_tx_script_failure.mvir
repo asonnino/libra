@@ -1,20 +1,10 @@
-//! account: alice, 0
-//! account: bob, 0
-
-//! new-transaction
-//! sender: association
-import 0x0.LBR;
-import 0x0.LibraAccount;
-import 0x0.Libra;
-main(blessed: &signer) {
-    LibraAccount.deposit<LBR.T>({{alice}}, LBR.mint(copy(blessed), 10000));
-    LibraAccount.deposit<LBR.T>({{bob}}, LBR.mint(move(blessed), 10000));
-    return;
-}
+//! account: alice, 10000Coin1
+//! account: bob, 10000Coin1
 
 //! new-transaction
 //! sender: alice
 //! gas-price: 1
+//! gas-currency: Coin1
 //! args: 0
 main(abrt: u64) {
     assert(move(abrt) == 0, 77);
@@ -27,6 +17,7 @@ main(abrt: u64) {
 //! new-transaction
 //! sender: bob
 //! gas-price: 1
+//! gas-currency: Coin1
 //! args: 1
 main(abrt: u64) {
     assert(move(abrt) == 0, 78);
@@ -37,11 +28,11 @@ main(abrt: u64) {
 // check: 78
 
 //! new-transaction
-import 0x0.LibraAccount;
-import 0x0.LBR;
+import 0x1.LibraAccount;
+import 0x1.Coin1;
 
 main() {
-    assert(LibraAccount.balance<LBR.T>({{bob}}) < LibraAccount.balance<LBR.T>({{alice}}), 79);
+    assert(LibraAccount.balance<Coin1.Coin1>({{bob}}) < LibraAccount.balance<Coin1.Coin1>({{alice}}), 79);
     return;
 }
 

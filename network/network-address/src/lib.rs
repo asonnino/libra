@@ -14,7 +14,7 @@ use std::{
     convert::{Into, TryFrom},
     fmt,
     iter::IntoIterator,
-    net::{self, IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{self, IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     num,
     str::FromStr,
     string::ToString,
@@ -139,9 +139,6 @@ pub enum Protocol {
     // probably need to move network wire into its own crate to avoid circular
     // dependency b/w network and types.
     Handshake(u8),
-    // TODO(philiphayes): gate behind cfg(test), should not even parse in prod.
-    // testing only, unauthenticated peer id exchange
-    PeerIdExchange,
 }
 
 /// A minimally parsed DNS name. We don't really do any checking other than
@@ -211,14 +208,6 @@ impl RawNetworkAddress {
     pub fn new(bytes: Vec<u8>) -> Self {
         Self(bytes)
     }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
 }
 
 impl Into<Vec<u8>> for RawNetworkAddress {
@@ -261,15 +250,6 @@ impl Arbitrary for RawNetworkAddress {
 impl NetworkAddress {
     fn new(protocols: Vec<Protocol>) -> Self {
         Self(protocols)
-    }
-
-    // TODO(philiphayes): could return NonZeroUsize?
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 
     pub fn as_slice(&self) -> &[Protocol] {
@@ -315,26 +295,6 @@ impl NetworkAddress {
             .push(Protocol::Handshake(handshake_version))
     }
 
-    /// Given a base `NetworkAddress`, append production protocols and
-    /// return the modified `NetworkAddress`.
-    ///
-    /// ### Example
-    ///
-    /// ```rust
-    /// use libra_network_address::NetworkAddress;
-    /// use std::str::FromStr;
-    ///
-    /// let addr = NetworkAddress::from_str("/memory/123").unwrap();
-    /// let addr = addr.append_test_protos(0);
-    /// assert_eq!(addr.to_string(), "/memory/123/ln-peerid-ex/ln-handshake/0");
-    /// ```
-    // TODO(philiphayes): gate with cfg(test)
-    // TODO(philiphayes): use handshake version enum
-    pub fn append_test_protos(self, handshake_version: u8) -> Self {
-        self.push(Protocol::PeerIdExchange)
-            .push(Protocol::Handshake(handshake_version))
-    }
-
     /// Check that a `NetworkAddress` looks like a typical LibraNet address with
     /// associated protocols.
     ///
@@ -349,8 +309,7 @@ impl NetworkAddress {
     ///
     /// followed by transport upgrade handshake protocols:
     ///
-    /// `"/ln-noise-ik/<pubkey>/ln-handshake/<version>"` or
-    /// cfg!(test) `"/ln-peerid-ex/ln-handshake/<version>"`
+    /// `"/ln-noise-ik/<pubkey>/ln-handshake/<version>"`
     ///
     /// ### Example
     ///
@@ -374,6 +333,22 @@ impl NetworkAddress {
             Protocol::NoiseIK(pubkey) => Some(*pubkey),
             _ => None,
         })
+    }
+
+    /// A function to rotate public keys for `NoiseIK` protocols
+    pub fn rotate_noise_public_key(
+        &mut self,
+        to_replace: &x25519::PublicKey,
+        new_public_key: &x25519::PublicKey,
+    ) {
+        for protocol in self.0.iter_mut() {
+            // Replace the public key in any Noise protocols that match the key
+            if let Protocol::NoiseIK(public_key) = protocol {
+                if public_key == to_replace {
+                    *protocol = Protocol::NoiseIK(*new_public_key);
+                }
+            }
+        }
     }
 
     #[cfg(any(test, feature = "fuzzing"))]
@@ -413,6 +388,24 @@ impl FromStr for NetworkAddress {
         }
 
         Ok(NetworkAddress::new(protocols))
+    }
+}
+
+impl ToSocketAddrs for NetworkAddress {
+    type Iter = std::vec::IntoIter<SocketAddr>;
+
+    fn to_socket_addrs(&self) -> Result<Self::Iter, std::io::Error> {
+        if let Some(((ipaddr, port), _)) = parse_ip_tcp(self.as_slice()) {
+            Ok(vec![SocketAddr::new(ipaddr, port)].into_iter())
+        } else if let Some(((ip_filter, dns_name, port), _)) = parse_dns_tcp(self.as_slice()) {
+            format!("{}:{}", dns_name, port).to_socket_addrs().map(|v| {
+                v.filter(|addr| ip_filter.matches(addr.ip()))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+            })
+        } else {
+            Ok(vec![].into_iter())
+        }
     }
 }
 
@@ -531,11 +524,8 @@ pub fn arb_libranet_addr() -> impl Strategy<Value = NetworkAddress> {
         any::<(DnsName, u16)>()
             .prop_map(|(name, port)| vec![Protocol::Dns6(name), Protocol::Tcp(port)]),
     ];
-    let arb_libranet_protos = prop_oneof![
-        any::<(x25519::PublicKey, u8)>()
-            .prop_map(|(pubkey, hs)| vec![Protocol::NoiseIK(pubkey), Protocol::Handshake(hs)]),
-        any::<u8>().prop_map(|hs| vec![Protocol::PeerIdExchange, Protocol::Handshake(hs)]),
-    ];
+    let arb_libranet_protos = any::<(x25519::PublicKey, u8)>()
+        .prop_map(|(pubkey, hs)| vec![Protocol::NoiseIK(pubkey), Protocol::Handshake(hs)]);
 
     (arb_transport_protos, arb_libranet_protos).prop_map(
         |(mut transport_protos, mut libranet_protos)| {
@@ -568,7 +558,6 @@ impl fmt::Display for Protocol {
                     .expect("ValidCryptoMaterialStringExt::to_encoded_string is infallible")
             ),
             Handshake(version) => write!(f, "/ln-handshake/{}", version),
-            PeerIdExchange => write!(f, "/ln-peerid-ex"),
         }
     }
 }
@@ -599,7 +588,6 @@ impl Protocol {
                 args.next().ok_or(ParseError::UnexpectedEnd)?,
             )?),
             "ln-handshake" => Protocol::Handshake(parse_one(args)?),
-            "ln-peerid-ex" => Protocol::PeerIdExchange,
             unknown => return Err(ParseError::UnknownProtocolType(unknown.to_string())),
         };
         Ok(protocol)
@@ -738,10 +726,27 @@ pub fn parse_ip_tcp(protos: &[Protocol]) -> Option<((IpAddr, u16), &[Protocol])>
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum IpFilter {
+    Any,
+    OnlyIp4,
+    OnlyIp6,
+}
+
+impl IpFilter {
+    pub fn matches(&self, ipaddr: IpAddr) -> bool {
+        match self {
+            IpFilter::Any => true,
+            IpFilter::OnlyIp4 => ipaddr.is_ipv4(),
+            IpFilter::OnlyIp6 => ipaddr.is_ipv6(),
+        }
+    }
+}
+
 /// parse the `&[Protocol]` into the `"/dns/<domain>/tcp/<port>"`,
 /// `"/dns4/<domain>/tcp/<port>"`, or `"/dns6/<domain>/tcp/<port>"` prefix and
 /// unparsed `&[Protocol]` suffix.
-pub fn parse_dns_tcp(protos: &[Protocol]) -> Option<((&DnsName, u16), &[Protocol])> {
+pub fn parse_dns_tcp(protos: &[Protocol]) -> Option<((IpFilter, &DnsName, u16), &[Protocol])> {
     use Protocol::*;
 
     if protos.len() < 2 {
@@ -750,9 +755,9 @@ pub fn parse_dns_tcp(protos: &[Protocol]) -> Option<((&DnsName, u16), &[Protocol
 
     let (prefix, suffix) = protos.split_at(2);
     match prefix {
-        [Dns(name), Tcp(port)] => Some(((name, *port), suffix)),
-        [Dns4(name), Tcp(port)] => Some(((name, *port), suffix)),
-        [Dns6(name), Tcp(port)] => Some(((name, *port), suffix)),
+        [Dns(name), Tcp(port)] => Some(((IpFilter::Any, name, *port), suffix)),
+        [Dns4(name), Tcp(port)] => Some(((IpFilter::OnlyIp4, name, *port), suffix)),
+        [Dns6(name), Tcp(port)] => Some(((IpFilter::OnlyIp6, name, *port), suffix)),
         _ => None,
     }
 }
@@ -762,15 +767,6 @@ pub fn parse_dns_tcp(protos: &[Protocol]) -> Option<((&DnsName, u16), &[Protocol
 pub fn parse_noise_ik(protos: &[Protocol]) -> Option<(&x25519::PublicKey, &[Protocol])> {
     match protos.split_first() {
         Some((Protocol::NoiseIK(pubkey), suffix)) => Some((pubkey, suffix)),
-        _ => None,
-    }
-}
-
-/// parse the `&[Protocol]` into the `"/ln-peerid-ex"` prefix and unparsed
-/// `&[Protocol]` suffix.
-pub fn parse_peerid_ex(protos: &[Protocol]) -> Option<&[Protocol]> {
-    match protos.split_first() {
-        Some((Protocol::PeerIdExchange, suffix)) => Some(suffix),
         _ => None,
     }
 }
@@ -794,8 +790,8 @@ fn parse_libranet_protos(protos: &[Protocol]) -> Option<&[Protocol]> {
     // <or> parse_dns_tcp
     // <or> cfg!(test) parse_memory
 
-    let transport_suffix = None
-        .or_else(|| parse_ip_tcp(protos).map(|x| x.1))
+    let transport_suffix = parse_ip_tcp(protos)
+        .map(|x| x.1)
         .or_else(|| parse_dns_tcp(protos).map(|x| x.1))
         .or_else(|| {
             if cfg!(test) {
@@ -808,17 +804,8 @@ fn parse_libranet_protos(protos: &[Protocol]) -> Option<&[Protocol]> {
     // parse authentication layer
     // ---
     // parse_noise_ik
-    // <or> cfg!(test) parse_peerid_ex
 
-    let auth_suffix = None
-        .or_else(|| parse_noise_ik(transport_suffix).map(|x| x.1))
-        .or_else(|| {
-            if cfg!(test) {
-                parse_peerid_ex(transport_suffix)
-            } else {
-                None
-            }
-        })?;
+    let auth_suffix = parse_noise_ik(transport_suffix).map(|x| x.1)?;
 
     // parse handshake layer
 
@@ -990,28 +977,28 @@ mod test {
         let expected_suffix: &[Protocol] = &[];
         assert_eq!(
             parse_dns_tcp(addr.as_slice()).unwrap(),
-            ((&dns_name, 123), expected_suffix)
+            ((IpFilter::Any, &dns_name, 123), expected_suffix)
         );
 
         let addr = NetworkAddress::from_str("/dns4/example.com/tcp/123").unwrap();
         let expected_suffix: &[Protocol] = &[];
         assert_eq!(
             parse_dns_tcp(addr.as_slice()).unwrap(),
-            ((&dns_name, 123), expected_suffix)
+            ((IpFilter::OnlyIp4, &dns_name, 123), expected_suffix)
         );
 
         let addr = NetworkAddress::from_str("/dns6/example.com/tcp/123").unwrap();
         let expected_suffix: &[Protocol] = &[];
         assert_eq!(
             parse_dns_tcp(addr.as_slice()).unwrap(),
-            ((&dns_name, 123), expected_suffix)
+            ((IpFilter::OnlyIp6, &dns_name, 123), expected_suffix)
         );
 
-        let addr = NetworkAddress::from_str("/dns/example.com/tcp/123/ln-peerid-ex").unwrap();
-        let expected_suffix: &[Protocol] = &[Protocol::PeerIdExchange];
+        let addr = NetworkAddress::from_str("/dns/example.com/tcp/123/memory/44").unwrap();
+        let expected_suffix: &[Protocol] = &[Protocol::Memory(44)];
         assert_eq!(
             parse_dns_tcp(addr.as_slice()).unwrap(),
-            ((&dns_name, 123), expected_suffix)
+            ((IpFilter::Any, &dns_name, 123), expected_suffix)
         );
 
         let addr = NetworkAddress::from_str("/tcp/999/memory/123").unwrap();
@@ -1039,20 +1026,6 @@ mod test {
 
         let addr = NetworkAddress::from_str("/tcp/999/memory/123").unwrap();
         assert_eq!(None, parse_noise_ik(addr.as_slice()));
-    }
-
-    #[test]
-    fn test_parse_peerid_ex() {
-        let addr = NetworkAddress::from_str("/ln-peerid-ex").unwrap();
-        let expected_suffix: &[Protocol] = &[];
-        assert_eq!(parse_peerid_ex(addr.as_slice()).unwrap(), expected_suffix);
-
-        let addr = NetworkAddress::from_str("/ln-peerid-ex/tcp/999").unwrap();
-        let expected_suffix: &[Protocol] = &[Protocol::Tcp(999)];
-        assert_eq!(parse_peerid_ex(addr.as_slice()).unwrap(), expected_suffix);
-
-        let addr = NetworkAddress::from_str("/tcp/999/memory/123").unwrap();
-        assert_eq!(None, parse_peerid_ex(addr.as_slice()));
     }
 
     #[test]

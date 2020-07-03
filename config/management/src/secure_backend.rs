@@ -3,7 +3,7 @@
 
 use crate::error::Error;
 use libra_config::config::{self, GitHubConfig, OnDiskStorageConfig, Token, VaultConfig};
-use libra_secure_storage::Storage;
+use libra_secure_storage::{KVStorage, Storage};
 use std::{
     collections::HashMap,
     convert::{TryFrom, TryInto},
@@ -15,6 +15,12 @@ pub const DISK: &str = "disk";
 pub const GITHUB: &str = "github";
 pub const MEMORY: &str = "memory";
 pub const VAULT: &str = "vault";
+
+#[derive(Copy, Clone, Debug)]
+pub enum StorageLocation {
+    LocalStorage,
+    RemoteStorage,
+}
 
 /// SecureBackend is a parameter that is stored as set of semi-colon separated key/value pairs. The
 /// only expected key is backend which defines which of the SecureBackends the parameters refer to.
@@ -30,6 +36,24 @@ pub struct SecureBackend {
 
 impl SecureBackend {
     const BACKEND: &'static str = "backend";
+    const NAMESPACE: &'static str = "namespace";
+
+    /// Creates and returns a new Storage instance using the SecureBackend.
+    /// This method ensures the storage instance is available before returning.
+    pub fn create_storage(self, location: StorageLocation) -> Result<Storage, Error> {
+        let storage: Storage = self.try_into()?;
+        storage.available().map_err(|e| match location {
+            StorageLocation::LocalStorage => Error::LocalStorageUnavailable(e.to_string()),
+            StorageLocation::RemoteStorage => Error::RemoteStorageUnavailable(e.to_string()),
+        })?;
+
+        Ok(storage)
+    }
+
+    pub fn set_namespace(mut self, namespace: String) -> Self {
+        self.parameters.insert(Self::NAMESPACE.into(), namespace);
+        self
+    }
 }
 
 impl FromStr for SecureBackend {
@@ -80,10 +104,10 @@ impl TryInto<config::SecureBackend> for SecureBackend {
                 config::SecureBackend::OnDiskStorage(config)
             }
             GITHUB => {
-                let owner = self
+                let repository_owner = self
                     .parameters
-                    .remove("owner")
-                    .ok_or_else(|| Error::BackendParsingError("missing owner".into()))?;
+                    .remove("repository_owner")
+                    .ok_or_else(|| Error::BackendParsingError("missing repository owner".into()))?;
                 let repository = self
                     .parameters
                     .remove("repository")
@@ -94,9 +118,9 @@ impl TryInto<config::SecureBackend> for SecureBackend {
                     .ok_or_else(|| Error::BackendParsingError("missing token".into()))?;
                 config::SecureBackend::GitHub(GitHubConfig {
                     namespace: self.parameters.remove("namespace"),
-                    owner,
+                    repository_owner,
                     repository,
-                    token: Token::new_disk(PathBuf::from(token)),
+                    token: Token::FromDisk(PathBuf::from(token)),
                 })
             }
             MEMORY => config::SecureBackend::InMemoryStorage,
@@ -114,7 +138,7 @@ impl TryInto<config::SecureBackend> for SecureBackend {
                     namespace: self.parameters.remove("namespace"),
                     server,
                     ca_certificate: certificate,
-                    token: Token::new_disk(PathBuf::from(token)),
+                    token: Token::FromDisk(PathBuf::from(token)),
                 })
             }
             _ => panic!("Invalid backend: {}", self.backend),
@@ -129,10 +153,10 @@ impl TryInto<config::SecureBackend> for SecureBackend {
     }
 }
 
-impl TryInto<Box<dyn Storage>> for SecureBackend {
+impl TryInto<Storage> for SecureBackend {
     type Error = Error;
 
-    fn try_into(self) -> Result<Box<dyn Storage>, Error> {
+    fn try_into(self) -> Result<Storage, Error> {
         let config: config::SecureBackend = self.try_into()?;
         Ok((&config).into())
     }
@@ -173,13 +197,13 @@ mod tests {
         let path_str = path.path().to_str().unwrap();
 
         let github = format!(
-            "backend=github;owner=libra;repository=libra;token={}",
+            "backend=github;repository_owner=libra;repository=libra;token={}",
             path_str
         );
         storage(&github).unwrap();
 
         let github = format!(
-            "backend=github;owner=libra;repository=libra;token={};namespace=test",
+            "backend=github;repository_owner=libra;repository=libra;token={};namespace=test",
             path_str
         );
         storage(&github).unwrap();
@@ -212,7 +236,7 @@ mod tests {
         assert!(storage(vault).is_err());
     }
 
-    fn storage(s: &str) -> Result<Box<dyn Storage>, Error> {
+    fn storage(s: &str) -> Result<Storage, Error> {
         let management_backend: SecureBackend = s.try_into()?;
         management_backend.try_into()
     }

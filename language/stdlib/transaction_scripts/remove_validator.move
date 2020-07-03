@@ -1,8 +1,10 @@
 script {
-    use 0x0::LibraSystem;
+    use 0x1::LibraSystem;
 
-    // Callable by Validator's operator
-    fun main(validator_address: address) {
-        LibraSystem::remove_validator(validator_address);
+    /// Adding `to_remove` to the set of pending validator removals. Fails if
+    /// the `to_remove` address is already in the validator set or already in the pending removals.
+    /// Callable by Validator's operator.
+    fun remove_validator(lr_account: &signer, validator_address: address) {
+        LibraSystem::remove_validator(lr_account, validator_address);
     }
 }

@@ -46,7 +46,7 @@ use crate::{
     system_store::SystemStore,
     transaction_store::TransactionStore,
 };
-use anyhow::{ensure, format_err, Result};
+use anyhow::{ensure, Result};
 use itertools::{izip, zip_eq};
 use jellyfish_merkle::{restore::JellyfishMerkleRestore, TreeReader, TreeWriter};
 use libra_crypto::hash::{CryptoHash, HashValue, SPARSE_MERKLE_PLACEHOLDER_HASH};
@@ -56,13 +56,11 @@ use libra_metrics::{
     IntGaugeVec, OpMetrics,
 };
 use libra_types::{
-    access_path::AccessPath,
     account_address::AccountAddress,
     account_state_blob::{AccountStateBlob, AccountStateWithProof},
     contract_event::{ContractEvent, EventWithProof},
     epoch_change::EpochChangeProof,
     event::EventKey,
-    get_with_proof::{RequestItem, ResponseItem},
     ledger_info::LedgerInfoWithSignatures,
     proof::{
         AccountStateProof, AccumulatorConsistencyProof, EventProof, SparseMerkleProof,
@@ -109,11 +107,10 @@ pub static LIBRA_STORAGE_LATEST_TXN_VERSION: Lazy<IntGauge> = Lazy::new(|| {
 });
 
 const MAX_LIMIT: u64 = 1000;
-const MAX_REQUEST_ITEMS: u64 = 100;
 
 // TODO: Either implement an iteration API to allow a very old client to loop through a long history
 // or guarantee that there is always a recent enough waypoint and client knows to boot from there.
-const MAX_NUM_EPOCH_CHANGE_LEDGER_INFO: usize = 100;
+const MAX_NUM_EPOCH_ENDING_LEDGER_INFO: usize = 100;
 
 fn error_if_too_many_requested(num_requested: u64, max_allowed: u64) -> Result<()> {
     if num_requested > max_allowed {
@@ -196,19 +193,65 @@ impl LibraDB {
     // ================================== Public API ==================================
 
     /// Returns ledger infos reflecting epoch bumps starting with the given epoch. If there are no
-    /// more than `MAX_NUM_EPOCH_CHANGE_LEDGER_INFO` results, this function returns all of them,
-    /// otherwise the first `MAX_NUM_EPOCH_CHANGE_LEDGER_INFO` results are returned and a flag
+    /// more than `MAX_NUM_EPOCH_ENDING_LEDGER_INFO` results, this function returns all of them,
+    /// otherwise the first `MAX_NUM_EPOCH_ENDING_LEDGER_INFO` results are returned and a flag
     /// (when true) will be used to indicate the fact that there is more.
-    pub fn get_epoch_change_ledger_infos(
+    pub fn get_epoch_ending_ledger_infos(
         &self,
         start_epoch: u64,
         end_epoch: u64,
     ) -> Result<(Vec<LedgerInfoWithSignatures>, bool)> {
-        self.ledger_store.get_first_n_epoch_change_ledger_infos(
+        self.get_epoch_ending_ledger_infos_impl(
             start_epoch,
             end_epoch,
-            MAX_NUM_EPOCH_CHANGE_LEDGER_INFO,
+            MAX_NUM_EPOCH_ENDING_LEDGER_INFO,
         )
+    }
+
+    fn get_epoch_ending_ledger_infos_impl(
+        &self,
+        start_epoch: u64,
+        end_epoch: u64,
+        limit: usize,
+    ) -> Result<(Vec<LedgerInfoWithSignatures>, bool)> {
+        ensure!(
+            start_epoch <= end_epoch,
+            "Bad epoch range [{}, {})",
+            start_epoch,
+            end_epoch,
+        );
+        // Note that the latest epoch can be the same with the current epoch (in most cases), or
+        // current_epoch + 1 (when the latest ledger_info carries next validator set)
+        let latest_epoch = self
+            .ledger_store
+            .get_latest_ledger_info()?
+            .ledger_info()
+            .next_block_epoch();
+        ensure!(
+            end_epoch <= latest_epoch,
+            "Unable to provide epoch change ledger info for still open epoch. asked upper bound: {}, last sealed epoch: {}",
+            end_epoch,
+            latest_epoch - 1,  // okay to -1 because genesis LedgerInfo has .next_block_epoch() == 1
+        );
+
+        let (paging_epoch, more) = if end_epoch - start_epoch > limit as u64 {
+            (start_epoch + limit as u64, true)
+        } else {
+            (end_epoch, false)
+        };
+
+        let lis = self
+            .ledger_store
+            .get_epoch_ending_ledger_info_iter(start_epoch, paging_epoch)?
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            lis.len() == (paging_epoch - start_epoch) as usize,
+            "DB corruption: missing epoch ending ledger info for epoch {}",
+            lis.last()
+                .map(|li| li.ledger_info().next_block_epoch())
+                .unwrap_or(start_epoch),
+        );
+        Ok((lis, more))
     }
 
     pub fn get_transaction_with_proof(
@@ -235,144 +278,6 @@ impl LibraDB {
             events,
             proof,
         })
-    }
-
-    /// This backs the `UpdateToLatestLedger` public read API which returns the latest
-    /// [`LedgerInfoWithSignatures`] together with items requested and proofs relative to the same
-    /// ledger info.
-    pub fn update_to_latest_ledger(
-        &self,
-        client_known_version: Version,
-        request_items: Vec<RequestItem>,
-    ) -> Result<(
-        Vec<ResponseItem>,
-        LedgerInfoWithSignatures,
-        EpochChangeProof,
-        AccumulatorConsistencyProof,
-    )> {
-        error_if_too_many_requested(request_items.len() as u64, MAX_REQUEST_ITEMS)?;
-
-        // Get the latest ledger info and signatures
-        let ledger_info_with_sigs = self.ledger_store.get_latest_ledger_info()?;
-        let ledger_info = ledger_info_with_sigs.ledger_info();
-        let ledger_version = ledger_info.version();
-
-        // TODO: cache last epoch change version to avoid a DB access in most cases.
-        let client_epoch = self.ledger_store.get_epoch(client_known_version)?;
-        let epoch_change_proof = if client_epoch < ledger_info.next_block_epoch() {
-            let (ledger_infos_with_sigs, more) =
-                self.get_epoch_change_ledger_infos(client_epoch, ledger_info.next_block_epoch())?;
-            EpochChangeProof::new(ledger_infos_with_sigs, more)
-        } else {
-            EpochChangeProof::new(vec![], /* more = */ false)
-        };
-
-        let client_new_version = if !epoch_change_proof.more {
-            ledger_version
-        } else {
-            epoch_change_proof
-                .ledger_info_with_sigs
-                .last()
-                .expect("Must have at least one LedgerInfo.")
-                .ledger_info()
-                .version()
-        };
-        let ledger_consistency_proof = self
-            .ledger_store
-            .get_consistency_proof(client_known_version, client_new_version)?;
-
-        // If the epoch change proof in the response is enough for the client to update to
-        // latest LedgerInfo, fulfill all request items. Otherwise the client will not be able to
-        // verify the latest LedgerInfo, so do not send response items back.
-        let response_items = if !epoch_change_proof.more {
-            self.get_response_items(request_items, ledger_version)?
-        } else {
-            vec![]
-        };
-
-        Ok((
-            response_items,
-            ledger_info_with_sigs,
-            epoch_change_proof,
-            ledger_consistency_proof,
-        ))
-    }
-
-    fn get_response_items(
-        &self,
-        request_items: Vec<RequestItem>,
-        ledger_version: Version,
-    ) -> Result<Vec<ResponseItem>> {
-        request_items
-            .into_iter()
-            .map(|request_item| match request_item {
-                RequestItem::GetAccountState { address } => Ok(ResponseItem::GetAccountState {
-                    account_state_with_proof: self.get_account_state_with_proof(
-                        address,
-                        ledger_version,
-                        ledger_version,
-                    )?,
-                }),
-                RequestItem::GetAccountTransactionBySequenceNumber {
-                    account,
-                    sequence_number,
-                    fetch_events,
-                } => {
-                    let transaction_with_proof = self.get_txn_by_account(
-                        account,
-                        sequence_number,
-                        ledger_version,
-                        fetch_events,
-                    )?;
-
-                    let proof_of_current_sequence_number = match transaction_with_proof {
-                        Some(_) => None,
-                        None => Some(self.get_account_state_with_proof(
-                            account,
-                            ledger_version,
-                            ledger_version,
-                        )?),
-                    };
-
-                    Ok(ResponseItem::GetAccountTransactionBySequenceNumber {
-                        transaction_with_proof,
-                        proof_of_current_sequence_number,
-                    })
-                }
-
-                RequestItem::GetEventsByEventAccessPath {
-                    access_path,
-                    start_event_seq_num,
-                    ascending,
-                    limit,
-                } => {
-                    let (events_with_proof, proof_of_latest_event) = self
-                        .get_events_by_query_path(
-                            &access_path,
-                            start_event_seq_num,
-                            ascending,
-                            limit,
-                            ledger_version,
-                        )?;
-                    Ok(ResponseItem::GetEventsByEventAccessPath {
-                        events_with_proof,
-                        proof_of_latest_event,
-                    })
-                }
-                RequestItem::GetTransactions {
-                    start_version,
-                    limit,
-                    fetch_events,
-                } => {
-                    let txn_list_with_proof =
-                        self.get_transactions(start_version, limit, ledger_version, fetch_events)?;
-
-                    Ok(ResponseItem::GetTransactions {
-                        txn_list_with_proof,
-                    })
-                }
-            })
-            .collect::<Result<Vec<_>>>()
     }
 
     // ================================== Backup APIs ===================================
@@ -410,44 +315,6 @@ impl LibraDB {
     }
 
     // ================================== Private APIs ==================================
-    /// Returns events specified by `query_path` with sequence number in range designated by
-    /// `start_seq_num`, `ascending` and `limit`. If ascending is true this query will return up to
-    /// `limit` events that were emitted after `start_event_seq_num`. Otherwise, it will return up
-    /// to `limit` events in the reverse order. Both cases are inclusive.
-    fn get_events_by_query_path(
-        &self,
-        query_path: &AccessPath,
-        start_seq_num: u64,
-        ascending: bool,
-        limit: u64,
-        ledger_version: Version,
-    ) -> Result<(Vec<EventWithProof>, AccountStateWithProof)> {
-        let account_state_with_proof =
-            self.get_account_state_with_proof(query_path.address, ledger_version, ledger_version)?;
-
-        let event_key = {
-            let (event_key_opt, _count) =
-                account_state_with_proof.get_event_key_and_count_by_query_path(&query_path.path)?;
-            if let Some(event_key) = event_key_opt {
-                event_key
-            } else {
-                return Ok((Vec::new(), account_state_with_proof));
-            }
-        };
-
-        let events_with_proof = self.get_events_by_event_key(
-            &event_key,
-            start_seq_num,
-            ascending,
-            limit,
-            ledger_version,
-        )?;
-
-        // We always need to return the account blob to prove that this is indeed the event that was
-        // being queried.
-        Ok((events_with_proof, account_state_with_proof))
-    }
-
     fn get_events_by_event_key(
         &self,
         event_key: &EventKey,
@@ -631,26 +498,13 @@ impl LibraDB {
 }
 
 impl DbReader for LibraDB {
-    fn update_to_latest_ledger(
-        &self,
-        client_known_version: Version,
-        request_items: Vec<RequestItem>,
-    ) -> Result<(
-        Vec<ResponseItem>,
-        LedgerInfoWithSignatures,
-        EpochChangeProof,
-        AccumulatorConsistencyProof,
-    )> {
-        Self::update_to_latest_ledger(&self, client_known_version, request_items)
-    }
-
-    fn get_epoch_change_ledger_infos(
+    fn get_epoch_ending_ledger_infos(
         &self,
         start_epoch: u64,
         end_epoch: u64,
     ) -> Result<EpochChangeProof> {
         let (ledger_info_with_sigs, more) =
-            Self::get_epoch_change_ledger_infos(&self, start_epoch, end_epoch)?;
+            Self::get_epoch_ending_ledger_infos(&self, start_epoch, end_epoch)?;
         Ok(EpochChangeProof::new(ledger_info_with_sigs, more))
     }
 
@@ -756,16 +610,9 @@ impl DbReader for LibraDB {
         Ok(events)
     }
 
-    fn get_ledger_info(&self, known_version: u64) -> Result<LedgerInfoWithSignatures> {
-        let known_epoch = self.ledger_store.get_epoch(known_version)?;
-        let (mut ledger_infos_with_sigs, _more) =
-            self.get_epoch_change_ledger_infos(known_epoch, known_epoch + 1)?;
-        ledger_infos_with_sigs.pop().ok_or_else(|| {
-            format_err!(
-                "No waypoint ledger info found for version {}",
-                known_version
-            )
-        })
+    /// Gets ledger info at specified version and ensures it's an epoch change.
+    fn get_epoch_ending_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures> {
+        self.ledger_store.get_epoch_ending_ledger_info(version)
     }
 
     fn get_state_proof_with_ledger_info(
@@ -777,7 +624,7 @@ impl DbReader for LibraDB {
         let known_epoch = self.ledger_store.get_epoch(known_version)?;
         let epoch_change_proof = if known_epoch < ledger_info.next_block_epoch() {
             let (ledger_infos_with_sigs, more) =
-                self.get_epoch_change_ledger_infos(known_epoch, ledger_info.next_block_epoch())?;
+                self.get_epoch_ending_ledger_infos(known_epoch, ledger_info.next_block_epoch())?;
             EpochChangeProof::new(ledger_infos_with_sigs, more)
         } else {
             EpochChangeProof::new(vec![], /* more = */ false)
@@ -871,6 +718,15 @@ impl DbReader for LibraDB {
         };
 
         Ok(tree_state)
+    }
+
+    fn get_block_timestamp(&self, version: u64) -> Result<u64> {
+        let ts = match self.transaction_store.get_block_metadata(version)? {
+            Some((_v, block_meta)) => block_meta.into_inner()?.1,
+            // genesis timestamp is 0
+            None => 0,
+        };
+        Ok(ts)
     }
 }
 

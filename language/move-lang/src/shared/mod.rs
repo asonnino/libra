@@ -11,7 +11,6 @@ use std::{
 };
 
 pub mod ast_debug;
-pub mod fake_natives;
 pub mod remembering_unique_map;
 pub mod unique_map;
 
@@ -25,7 +24,9 @@ pub const ADDRESS_LENGTH: usize = 16;
 pub struct Address([u8; ADDRESS_LENGTH]);
 
 impl Address {
-    pub const LIBRA_CORE: Address = Address::new([0u8; ADDRESS_LENGTH]);
+    pub const LIBRA_CORE: Address = Address::new([
+        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 1u8,
+    ]);
 
     pub const fn new(address: [u8; ADDRESS_LENGTH]) -> Self {
         Address(address)

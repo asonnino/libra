@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    account::{lbr_currency_code, Account, AccountData, AccountTypeSpecifier},
+    account::{lbr_currency_code, Account, AccountData, AccountRoleSpecifier},
     account_universe::{
         txn_one_account_result, AUTransactionGen, AccountPair, AccountPairGen, AccountUniverse,
     },
@@ -11,11 +11,13 @@ use crate::{
 };
 use libra_proptest_helpers::Index;
 use libra_types::{
+    account_config,
     transaction::{SignedTransaction, TransactionStatus},
-    vm_error::{StatusCode, VMStatus},
+    vm_status::{StatusCode, VMStatus},
 };
 use proptest::prelude::*;
 use proptest_derive::Arbitrary;
+use std::sync::Arc;
 
 /// Represents a create-account transaction performed in the account universe.
 ///
@@ -41,6 +43,7 @@ impl AUTransactionGen for CreateAccountGen {
             &self.new_account,
             sender.sequence_number,
             self.amount,
+            account_config::lbr_type_tag(),
         );
 
         let mut gas_used = sender.create_account_gas_cost();
@@ -61,7 +64,7 @@ impl AUTransactionGen for CreateAccountGen {
                 self.amount,
                 lbr_currency_code(),
                 0,
-                AccountTypeSpecifier::default(),
+                AccountRoleSpecifier::default(),
             ));
         } else {
             gas_used = 0;
@@ -99,6 +102,7 @@ impl AUTransactionGen for CreateExistingAccountGen {
             receiver.account(),
             sender.sequence_number,
             self.amount,
+            account_config::lbr_type_tag(),
         );
 
         // This transaction should never work, but it will fail differently if there's not enough
@@ -120,4 +124,16 @@ impl AUTransactionGen for CreateExistingAccountGen {
 
         (txn, (status, gas_used))
     }
+}
+
+pub fn create_account_strategy(
+    min: u64,
+    max: u64,
+) -> impl Strategy<Value = Arc<dyn AUTransactionGen + 'static>> {
+    prop_oneof![
+        3 => any_with::<CreateAccountGen>((min, max)).prop_map(CreateAccountGen::arced),
+        1 => any_with::<CreateExistingAccountGen>((min, max)).prop_map(
+            CreateExistingAccountGen::arced,
+        ),
+    ]
 }

@@ -5,17 +5,22 @@
 
 ### Table of Contents
 
--  [Function `main`](#SCRIPT_main)
+-  [Function `remove_validator`](#SCRIPT_remove_validator)
 
 
 
-<a name="SCRIPT_main"></a>
+<a name="SCRIPT_remove_validator"></a>
 
-## Function `main`
+## Function `remove_validator`
+
+Adding
+<code>to_remove</code> to the set of pending validator removals. Fails if
+the
+<code>to_remove</code> address is already in the validator set or already in the pending removals.
+Callable by Validator's operator.
 
 
-
-<pre><code><b>public</b> <b>fun</b> <a href="#SCRIPT_main">main</a>(validator_address: address)
+<pre><code><b>public</b> <b>fun</b> <a href="#SCRIPT_remove_validator">remove_validator</a>(lr_account: &signer, validator_address: address)
 </code></pre>
 
 
@@ -24,8 +29,8 @@
 <summary>Implementation</summary>
 
 
-<pre><code><b>fun</b> <a href="#SCRIPT_main">main</a>(validator_address: address) {
-    <a href="../../modules/doc/LibraSystem.md#0x0_LibraSystem_remove_validator">LibraSystem::remove_validator</a>(validator_address);
+<pre><code><b>fun</b> <a href="#SCRIPT_remove_validator">remove_validator</a>(lr_account: &signer, validator_address: address) {
+    <a href="../../modules/doc/LibraSystem.md#0x1_LibraSystem_remove_validator">LibraSystem::remove_validator</a>(lr_account, validator_address);
 }
 </code></pre>
 

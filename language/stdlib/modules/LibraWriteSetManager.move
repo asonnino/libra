@@ -1,14 +1,14 @@
-address 0x0 {
+address 0x1 {
 
 module LibraWriteSetManager {
-    use 0x0::LibraAccount;
-    use 0x0::Event;
-    use 0x0::Hash;
-    use 0x0::Signer;
-    use 0x0::Transaction;
-    use 0x0::LibraConfig;
+    use 0x1::CoreAddresses;
+    use 0x1::LibraAccount;
+    use 0x1::Event;
+    use 0x1::Hash;
+    use 0x1::Signer;
+    use 0x1::LibraConfig;
 
-    resource struct T {
+    resource struct LibraWriteSetManager {
         upgrade_events: Event::EventHandle<Self::UpgradeEvent>,
     }
 
@@ -16,13 +16,14 @@ module LibraWriteSetManager {
         writeset_payload: vector<u8>,
     }
 
-    public fun initialize(sig: &signer) {
-        Transaction::assert(Signer::address_of(sig) == 0xA550C18, 1);
+    public fun initialize(account: &signer) {
+        // Operational constraint
+        assert(Signer::address_of(account) == CoreAddresses::LIBRA_ROOT_ADDRESS(), 1);
 
         move_to(
-            sig,
-            T {
-                upgrade_events: Event::new_event_handle<Self::UpgradeEvent>(sig),
+            account,
+            LibraWriteSetManager {
+                upgrade_events: Event::new_event_handle<Self::UpgradeEvent>(account),
             }
         );
     }
@@ -33,28 +34,28 @@ module LibraWriteSetManager {
         writeset_public_key: vector<u8>,
     ) {
         let sender = Signer::address_of(account);
-        Transaction::assert(sender == 0xA550C18, 33);
+        assert(sender == CoreAddresses::LIBRA_ROOT_ADDRESS(), 33);
 
         let association_auth_key = LibraAccount::authentication_key(sender);
         let sequence_number = LibraAccount::sequence_number(sender);
 
-        Transaction::assert(writeset_sequence_number >= sequence_number, 3);
+        assert(writeset_sequence_number >= sequence_number, 3);
 
-        Transaction::assert(writeset_sequence_number == sequence_number, 11);
-        Transaction::assert(
+        assert(writeset_sequence_number == sequence_number, 11);
+        assert(
             Hash::sha3_256(writeset_public_key) == association_auth_key,
             2
         );
     }
 
-    fun epilogue(writeset_payload: vector<u8>) acquires T {
-        let t_ref = borrow_global_mut<T>(0xA550C18);
+    fun epilogue(lr_account: &signer, writeset_payload: vector<u8>) acquires LibraWriteSetManager {
+        let t_ref = borrow_global_mut<LibraWriteSetManager>(CoreAddresses::LIBRA_ROOT_ADDRESS());
 
         Event::emit_event<Self::UpgradeEvent>(
             &mut t_ref.upgrade_events,
             UpgradeEvent { writeset_payload },
         );
-        LibraConfig::reconfigure();
+        LibraConfig::reconfigure(lr_account)
     }
 }
 

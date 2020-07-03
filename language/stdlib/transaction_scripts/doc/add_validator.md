@@ -5,17 +5,23 @@
 
 ### Table of Contents
 
--  [Function `main`](#SCRIPT_main)
+-  [Function `add_validator`](#SCRIPT_add_validator)
 
 
 
-<a name="SCRIPT_main"></a>
+<a name="SCRIPT_add_validator"></a>
 
-## Function `main`
+## Function `add_validator`
+
+Add
+<code>new_validator</code> to the pending validator set.
+Fails if the
+<code>new_validator</code> address is already in the validator set
+or does not have a
+<code><a href="../../modules/doc/ValidatorConfig.md#0x1_ValidatorConfig">ValidatorConfig</a></code> resource stored at the address.
 
 
-
-<pre><code><b>public</b> <b>fun</b> <a href="#SCRIPT_main">main</a>(validator_address: address)
+<pre><code><b>public</b> <b>fun</b> <a href="#SCRIPT_add_validator">add_validator</a>(lr_account: &signer, validator_address: address)
 </code></pre>
 
 
@@ -24,8 +30,8 @@
 <summary>Implementation</summary>
 
 
-<pre><code><b>fun</b> <a href="#SCRIPT_main">main</a>(validator_address: address) {
-    <a href="../../modules/doc/LibraSystem.md#0x0_LibraSystem_add_validator">LibraSystem::add_validator</a>(validator_address);
+<pre><code><b>fun</b> <a href="#SCRIPT_add_validator">add_validator</a>(lr_account: &signer, validator_address: address) {
+    <a href="../../modules/doc/LibraSystem.md#0x1_LibraSystem_add_validator">LibraSystem::add_validator</a>(lr_account, validator_address);
 }
 </code></pre>
 

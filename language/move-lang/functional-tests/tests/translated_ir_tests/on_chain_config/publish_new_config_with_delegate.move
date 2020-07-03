@@ -3,7 +3,8 @@
 
 //! sender: alice
 module FooConfig {
-    use 0x0::LibraConfig;
+    use 0x1::LibraConfig::{Self};
+    use 0x1::CoreAddresses;
 
     struct T {
         version: u64,
@@ -16,7 +17,7 @@ module FooConfig {
     public fun claim(account: &signer) {
         LibraConfig::claim_delegated_modify_config<T>(
             account,
-            LibraConfig::default_config_address()
+            CoreAddresses::LIBRA_ROOT_ADDRESS(),
         );
     }
 
@@ -33,7 +34,7 @@ module FooConfig {
 //! block-time: 2
 
 //! new-transaction
-//! sender: config
+//! sender: association
 // Publish a new config item.
 script {
 use {{alice}}::FooConfig;
@@ -66,7 +67,7 @@ fun main(account: &signer) {
 //! block-time: 4
 
 //! new-transaction
-//! sender: config
+//! sender: association
 script {
 use {{alice}}::FooConfig;
 fun main(account: &signer) {

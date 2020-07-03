@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::SynchronizerState;
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use executor_types::ExecutedTrees;
 use libra_crypto::{hash::CryptoHash, HashValue};
 use libra_types::{
@@ -54,7 +54,7 @@ impl MockStorage {
 
     fn add_txns(&mut self, txns: &mut Vec<Transaction>) {
         self.transactions.append(txns);
-        let num_leaves = self.transactions.len();
+        let num_leaves = self.transactions.len() + 1;
         let frozen_subtree_roots = vec![HashValue::zero(); num_leaves.count_ones() as usize];
         self.synced_trees = ExecutedTrees::new(
             HashValue::zero(), /* dummy_state_root */
@@ -128,13 +128,17 @@ impl MockStorage {
         if verified_target_li.ledger_info().epoch() != self.epoch_num() {
             return;
         }
-        self.ledger_infos.insert(
-            verified_target_li.ledger_info().epoch(),
-            verified_target_li.clone(),
-        );
-        if let Some(next_epoch_state) = verified_target_li.ledger_info().next_epoch_state() {
-            self.epoch_num = next_epoch_state.epoch;
-            self.epoch_state = next_epoch_state.clone();
+
+        // store ledger info only if version matches last tx
+        if verified_target_li.ledger_info().version() == self.version() {
+            self.ledger_infos.insert(
+                verified_target_li.ledger_info().epoch(),
+                verified_target_li.clone(),
+            );
+            if let Some(next_epoch_state) = verified_target_li.ledger_info().next_epoch_state() {
+                self.epoch_num = next_epoch_state.epoch;
+                self.epoch_state = next_epoch_state.clone();
+            }
         }
     }
 
@@ -218,10 +222,13 @@ impl MockStorage {
             .clone();
     }
 
-    // Find LedgerInfo for a given version.
-    pub fn get_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures> {
+    // Find LedgerInfo for an epoch boundary version.
+    pub fn get_epoch_ending_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures> {
         for li in self.ledger_infos.values() {
             if li.ledger_info().version() == version {
+                li.ledger_info()
+                    .next_epoch_state()
+                    .ok_or_else(|| anyhow!("Not an epoch boundary at version {}.", version))?;
                 return Ok(li.clone());
             }
         }

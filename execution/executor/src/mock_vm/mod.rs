@@ -19,7 +19,7 @@ use libra_types::{
         RawTransaction, Script, SignedTransaction, Transaction, TransactionArgument,
         TransactionOutput, TransactionPayload, TransactionStatus,
     },
-    vm_error::{StatusCode, VMStatus},
+    vm_status::{StatusCode, VMStatus},
     write_set::{WriteOp, WriteSet, WriteSetMut},
 };
 use libra_vm::VMExecutor;
@@ -369,9 +369,6 @@ fn decode_transaction(txn: &SignedTransaction) -> MockVMTransaction {
         TransactionPayload::WriteSet(_) => {
             // Use WriteSet for reconfig only for testing.
             MockVMTransaction::Reconfiguration
-        }
-        TransactionPayload::Program => {
-            unimplemented!("MockVM does not support Program transaction payload.")
         }
         TransactionPayload::Module(_) => {
             unimplemented!("MockVM does not support Module transaction payload.")

@@ -1,22 +1,22 @@
 
-<a name="0x0_Empty"></a>
+<a name="0x1_Empty"></a>
 
-# Module `0x0::Empty`
+# Module `0x1::Empty`
 
 ### Table of Contents
 
--  [Struct `T`](#0x0_Empty_T)
--  [Function `create`](#0x0_Empty_create)
+-  [Struct `Empty`](#0x1_Empty_Empty)
+-  [Function `create`](#0x1_Empty_create)
 
 
 
-<a name="0x0_Empty_T"></a>
+<a name="0x1_Empty_Empty"></a>
 
-## Struct `T`
+## Struct `Empty`
 
 
 
-<pre><code><b>struct</b> <a href="#0x0_Empty_T">T</a>
+<pre><code><b>struct</b> <a href="#0x1_Empty">Empty</a>
 </code></pre>
 
 
@@ -38,13 +38,13 @@
 
 </details>
 
-<a name="0x0_Empty_create"></a>
+<a name="0x1_Empty_create"></a>
 
 ## Function `create`
 
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="#0x0_Empty_create">create</a>(): <a href="#0x0_Empty_T">Empty::T</a>
+<pre><code><b>public</b> <b>fun</b> <a href="#0x1_Empty_create">create</a>(): <a href="#0x1_Empty_Empty">Empty::Empty</a>
 </code></pre>
 
 
@@ -53,8 +53,8 @@
 <summary>Implementation</summary>
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="#0x0_Empty_create">create</a>(): <a href="#0x0_Empty_T">T</a> {
-    <a href="#0x0_Empty_T">T</a> { }
+<pre><code><b>public</b> <b>fun</b> <a href="#0x1_Empty_create">create</a>(): <a href="#0x1_Empty">Empty</a> {
+    <a href="#0x1_Empty">Empty</a> { }
 }
 </code></pre>
 

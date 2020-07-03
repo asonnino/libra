@@ -7,12 +7,12 @@
 
 //! new-transaction
 script{
-use 0x0::LibraBlock;
-use 0x0::LibraTimestamp;
+use 0x1::LibraBlock;
+use 0x1::LibraTimestamp;
 
 fun main() {
-    0x0::Transaction::assert(LibraBlock::get_current_block_height() == 1, 77);
-    0x0::Transaction::assert(LibraTimestamp::now_microseconds() == 1000000, 78);
+    assert(LibraBlock::get_current_block_height() == 1, 77);
+    assert(LibraTimestamp::now_microseconds() == 1000000, 78);
 }
 }
 // check: EXECUTED

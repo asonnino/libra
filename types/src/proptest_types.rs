@@ -4,24 +4,24 @@
 use crate::{
     access_path::AccessPath,
     account_address::{self, AccountAddress},
-    account_config::{AccountResource, BalanceResource},
+    account_config::{
+        AccountResource, BalanceResource, KeyRotationCapabilityResource, WithdrawCapabilityResource,
+    },
     account_state_blob::AccountStateBlob,
     block_info::{BlockInfo, Round},
     block_metadata::BlockMetadata,
     contract_event::ContractEvent,
-    epoch_change::EpochChangeProof,
     epoch_state::EpochState,
     event::{EventHandle, EventKey},
-    get_with_proof::{ResponseItem, UpdateToLatestLedgerResponse},
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     on_chain_config::ValidatorSet,
-    proof::{AccumulatorConsistencyProof, TransactionListProof},
+    proof::TransactionListProof,
     transaction::{
         ChangeSet, Module, RawTransaction, Script, SignatureCheckedTransaction, SignedTransaction,
         Transaction, TransactionArgument, TransactionListWithProof, TransactionPayload,
         TransactionStatus, TransactionToCommit, Version,
     },
-    vm_error::{StatusCode, VMStatus},
+    vm_status::{StatusCode, VMStatus},
     write_set::{WriteOp, WriteSet, WriteSetMut},
 };
 use libra_crypto::{
@@ -287,15 +287,6 @@ fn new_raw_transaction(
     expiration_time_secs: u64,
 ) -> RawTransaction {
     match payload {
-        TransactionPayload::Program => RawTransaction::new(
-            sender,
-            sequence_number,
-            TransactionPayload::Program,
-            max_gas_amount,
-            gas_unit_price,
-            gas_currency_code,
-            Duration::from_secs(expiration_time_secs),
-        ),
         TransactionPayload::Module(module) => RawTransaction::new_module(
             sender,
             sequence_number,
@@ -487,35 +478,6 @@ impl TransactionPayload {
     }
 }
 
-/// The `Arbitrary` impl only generates validation statuses since the full enum is too large.
-impl Arbitrary for StatusCode {
-    type Parameters = ();
-    type Strategy = BoxedStrategy<Self>;
-
-    fn arbitrary_with(_args: ()) -> Self::Strategy {
-        prop_oneof![
-            Just(StatusCode::UNKNOWN_VALIDATION_STATUS),
-            Just(StatusCode::INVALID_SIGNATURE),
-            Just(StatusCode::INVALID_AUTH_KEY),
-            Just(StatusCode::SEQUENCE_NUMBER_TOO_OLD),
-            Just(StatusCode::SEQUENCE_NUMBER_TOO_NEW),
-            Just(StatusCode::INSUFFICIENT_BALANCE_FOR_TRANSACTION_FEE),
-            Just(StatusCode::TRANSACTION_EXPIRED),
-            Just(StatusCode::SENDING_ACCOUNT_DOES_NOT_EXIST),
-            Just(StatusCode::REJECTED_WRITE_SET),
-            Just(StatusCode::INVALID_WRITE_SET),
-            Just(StatusCode::EXCEEDED_MAX_TRANSACTION_SIZE),
-            Just(StatusCode::UNKNOWN_SCRIPT),
-            Just(StatusCode::UNKNOWN_MODULE),
-            Just(StatusCode::MAX_GAS_UNITS_EXCEEDS_MAX_GAS_UNITS_BOUND),
-            Just(StatusCode::MAX_GAS_UNITS_BELOW_MIN_TRANSACTION_GAS_UNITS),
-            Just(StatusCode::GAS_UNIT_PRICE_BELOW_MIN_BOUND),
-            Just(StatusCode::GAS_UNIT_PRICE_ABOVE_MAX_BOUND),
-        ]
-        .boxed()
-    }
-}
-
 prop_compose! {
     fn arb_transaction_status()(vm_status in any::<VMStatus>()) -> TransactionStatus {
         vm_status.into()
@@ -541,7 +503,6 @@ impl Arbitrary for TransactionPayload {
             4 => Self::script_strategy(),
             1 => Self::module_strategy(),
             1 => Self::write_set_strategy(),
-            1 => Just(TransactionPayload::Program),
         ]
         .boxed()
     }
@@ -610,31 +571,6 @@ impl Arbitrary for LedgerInfoWithSignatures {
     type Strategy = BoxedStrategy<Self>;
 }
 
-prop_compose! {
-    fn arb_update_to_latest_ledger_response()(
-        response_items in vec(any::<ResponseItem>(), 0..10),
-        ledger_info_with_sigs in any::<LedgerInfoWithSignatures>(),
-        epoch_change_proof in any::<EpochChangeProof>(),
-        ledger_consistency_proof in any::<AccumulatorConsistencyProof>(),
-    ) -> UpdateToLatestLedgerResponse {
-        UpdateToLatestLedgerResponse::new(
-            response_items,
-            ledger_info_with_sigs,
-            epoch_change_proof,
-            ledger_consistency_proof,
-        )
-    }
-}
-
-impl Arbitrary for UpdateToLatestLedgerResponse {
-    type Parameters = ();
-    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        arb_update_to_latest_ledger_response().boxed()
-    }
-
-    type Strategy = BoxedStrategy<Self>;
-}
-
 #[derive(Arbitrary, Debug)]
 pub struct ContractEventGen {
     type_tag: TypeTag,
@@ -664,8 +600,8 @@ impl ContractEventGen {
 
 #[derive(Arbitrary, Debug)]
 struct AccountResourceGen {
-    delegated_key_rotation_capability: bool,
-    delegated_withdrawal_capability: bool,
+    withdrawal_capability: Option<WithdrawCapabilityResource>,
+    key_rotation_capability: Option<KeyRotationCapabilityResource>,
 }
 
 impl AccountResourceGen {
@@ -679,8 +615,8 @@ impl AccountResourceGen {
         AccountResource::new(
             account_info.sequence_number,
             account_info.public_key.to_bytes().to_vec(),
-            self.delegated_key_rotation_capability,
-            self.delegated_withdrawal_capability,
+            self.withdrawal_capability,
+            self.key_rotation_capability,
             account_info.sent_event_handle.clone(),
             account_info.received_event_handle.clone(),
             false,

@@ -6,7 +6,7 @@
 
 use crate::{common::strip, errors::*, genesis_accounts::make_genesis_accounts};
 use language_e2e_tests::{
-    account::{Account, AccountData, AccountTypeSpecifier},
+    account::{Account, AccountData, AccountRoleSpecifier},
     keygen::KeyGen,
 };
 use libra_config::generator;
@@ -28,6 +28,8 @@ static DEFAULT_BALANCE: Lazy<Balance> = Lazy::new(|| Balance {
 pub enum Role {
     /// Means that the account is a current validator; its address is in the on-chain validator set
     Validator,
+    /// Means that this this is only an account address (with known authentication keys)
+    Address,
 }
 
 #[derive(Debug, Clone)]
@@ -71,7 +73,7 @@ pub struct AccountDefinition {
     /// Special role this account has in the system (if any)
     pub role: Option<Role>,
     /// Specifier on what type of account this is. Default is VASP.
-    pub account_type_specifier: Option<AccountTypeSpecifier>,
+    pub account_type_specifier: Option<AccountRoleSpecifier>,
 }
 
 impl FromStr for Role {
@@ -80,6 +82,7 @@ impl FromStr for Role {
     fn from_str(s: &str) -> Result<Self> {
         match s {
             "validator" => Ok(Role::Validator),
+            "address" => Ok(Role::Address),
             other => Err(ErrorKind::Other(format!("Invalid account role {:?}", other)).into()),
         }
     }
@@ -98,6 +101,16 @@ impl Entry {
             self,
             Entry::AccountDefinition(AccountDefinition {
                 role: Some(Role::Validator),
+                ..
+            })
+        )
+    }
+
+    pub fn is_address(&self) -> bool {
+        matches!(
+            self,
+            Entry::AccountDefinition(AccountDefinition {
+                role: Some(Role::Address),
                 ..
             })
         )
@@ -130,7 +143,7 @@ impl FromStr for Entry {
             // These two are mutually exclusive, so we can double-use the third position
             let account_type_specifier = v
                 .get(3)
-                .and_then(|s| s.parse::<AccountTypeSpecifier>().ok());
+                .and_then(|s| s.parse::<AccountRoleSpecifier>().ok());
             return Ok(Entry::AccountDefinition(AccountDefinition {
                 name: v[0].to_string(),
                 balance,
@@ -149,6 +162,7 @@ pub struct Config {
     /// A map from account names to account data
     pub accounts: BTreeMap<String, AccountData>,
     pub genesis_accounts: BTreeMap<String, Account>,
+    pub addresses: BTreeMap<String, Account>,
     /// The validator set after genesis
     pub validator_accounts: usize,
 }
@@ -156,6 +170,7 @@ pub struct Config {
 impl Config {
     pub fn build(entries: &[Entry]) -> Result<Self> {
         let mut accounts = BTreeMap::new();
+        let mut addresses = BTreeMap::new();
         let mut validator_accounts = entries.iter().filter(|entry| entry.is_validator()).count();
         let total_validator_accounts = validator_accounts;
 
@@ -166,11 +181,9 @@ impl Config {
                 .nodes
                 .iter_mut()
                 .map(|c| {
-                    let peer_id = c.validator_network.as_ref().unwrap().peer_id();
                     let account_keypair =
                         c.test.as_mut().unwrap().operator_keypair.as_mut().unwrap();
-                    let privkey = account_keypair.take_private().unwrap();
-                    (peer_id, privkey)
+                    account_keypair.take_private().unwrap()
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -183,13 +196,31 @@ impl Config {
 
         // initialize the keys of validator entries with the validator set
         // enhance type of config to contain a validator set, use it to initialize genesis
-        for entry in entries {
+        for entry in entries.iter() {
             match entry {
+                Entry::AccountDefinition(def) if entry.is_address() => {
+                    let (privkey, pubkey) = keygen.generate_keypair();
+                    let account = Account::with_keypair(privkey, pubkey);
+                    let name = def.name.to_ascii_lowercase();
+                    let entry = addresses.entry(name);
+                    match entry {
+                        btree_map::Entry::Vacant(entry) => {
+                            entry.insert(account);
+                        }
+                        btree_map::Entry::Occupied(_) => {
+                            return Err(ErrorKind::Other(format!(
+                                "already has account '{}'",
+                                def.name,
+                            ))
+                            .into());
+                        }
+                    }
+                }
                 Entry::AccountDefinition(def) => {
                     let balance = def.balance.as_ref().unwrap_or(&DEFAULT_BALANCE).clone();
                     let account_data = if entry.is_validator() {
                         validator_accounts -= 1;
-                        let privkey = &validator_keys.get(validator_accounts).unwrap().1;
+                        let privkey = &validator_keys.get(validator_accounts).unwrap().clone();
                         AccountData::with_keypair(
                             privkey.clone(),
                             privkey.public_key(),
@@ -236,11 +267,12 @@ impl Config {
                 DEFAULT_BALANCE.currency_code.clone(),
                 /* sequence_number */
                 0,
-                /* is_empty_account_type */ AccountTypeSpecifier::default(),
+                /* is_empty_account_type */ AccountRoleSpecifier::default(),
             ));
         }
         Ok(Config {
             accounts,
+            addresses,
             genesis_accounts: make_genesis_accounts(),
             validator_accounts: total_validator_accounts,
         })
@@ -251,6 +283,7 @@ impl Config {
             .get(name)
             .map(|account_data| account_data.account())
             .or_else(|| self.genesis_accounts.get(name))
+            .or_else(|| self.addresses.get(name))
             .ok_or_else(|| ErrorKind::Other(format!("account '{}' does not exist", name)).into())
     }
 }

@@ -3,10 +3,10 @@
 
 #![forbid(unsafe_code)]
 
-use libra_config::config::{NodeConfig, RoleType, TestConfig};
+use libra_config::config::NodeConfig;
+use libra_management::config_builder::FullnodeType;
 use libra_swarm::{client, swarm::LibraSwarm};
 use libra_temppath::TempPath;
-use libra_types::on_chain_config::VMPublishingOption;
 use std::path::Path;
 use structopt::StructOpt;
 
@@ -37,39 +37,20 @@ fn main() {
     let args = Args::from_args();
     let num_nodes = args.num_nodes;
     let num_full_nodes = args.num_full_nodes;
-    let mut dev_config = NodeConfig::default();
-    dev_config.test = Some({
-        let mut config = TestConfig::default();
-        config.publishing_option = Some(VMPublishingOption::Open);
-        config
-    });
 
     libra_logger::Logger::new().init();
 
-    let mut validator_swarm = LibraSwarm::configure_swarm(
-        num_nodes,
-        RoleType::Validator,
-        args.config_dir.clone(),
-        Some(dev_config.clone()), /* template config */
-        None,                     /* upstream_config_dir */
-    )
-    .expect("Failed to configure validator swarm");
+    let mut validator_swarm =
+        LibraSwarm::configure_validator_swarm(num_nodes, args.config_dir.clone(), None)
+            .expect("Failed to configure validator swarm");
 
     let mut full_node_swarm = if num_full_nodes > 0 {
         Some(
-            LibraSwarm::configure_swarm(
-                num_full_nodes,
-                RoleType::FullNode,
-                None,             /* config dir */
-                Some(dev_config), /* template config */
-                Some(String::from(
-                    validator_swarm
-                        .dir
-                        .as_ref()
-                        .join("0")
-                        .to_str()
-                        .expect("Failed to convert std::fs::Path to String"),
-                )),
+            LibraSwarm::configure_fn_swarm(
+                None, /* config dir */
+                None,
+                &validator_swarm.config,
+                FullnodeType::ValidatorFullnode,
             )
             .expect("Failed to configure full node swarm"),
         )
@@ -77,21 +58,17 @@ fn main() {
         None
     };
     validator_swarm
-        .launch_attempt(RoleType::Validator, !args.enable_logging)
+        .launch_attempt(!args.enable_logging)
         .expect("Failed to launch validator swarm");
     if let Some(ref mut swarm) = full_node_swarm {
         swarm
-            .launch_attempt(RoleType::FullNode, !args.enable_logging)
+            .launch_attempt(!args.enable_logging)
             .expect("Failed to launch full node swarm");
     }
 
     let faucet_key_file_path = &validator_swarm.config.faucet_key_path;
     let validator_config = NodeConfig::load(&validator_swarm.config.config_files[0]).unwrap();
-    let waypoint = validator_config
-        .base
-        .waypoint
-        .waypoint_from_config()
-        .unwrap();
+    let waypoint = validator_config.base.waypoint.waypoint();
 
     println!("To run the Libra CLI client in a separate process and connect to the validator nodes you just spawned, use this command:");
 
@@ -102,20 +79,35 @@ fn main() {
         waypoint,
     );
 
-    let node_address_list = validator_swarm
-        .config
-        .config_files
-        .iter()
-        .map(|config| {
-            let port = NodeConfig::load(config).unwrap().rpc.address.port();
-            format!("localhost:{}", port)
-        })
+    let ports = validator_swarm.config.config_files.iter().map(|config| {
+        let validator_config = NodeConfig::load(config).unwrap();
+        let port = validator_config.rpc.address.port();
+        let debug_interface_port = validator_config
+            .debug_interface
+            .admission_control_node_debug_port;
+        (port, debug_interface_port)
+    });
+
+    let node_address_list = ports
+        .clone()
+        .map(|port| format!("localhost:{}", port.0))
         .collect::<Vec<String>>()
         .join(",");
 
     println!("To run transaction generator run:");
     println!(
         "\tcargo run -p cluster-test -- --mint-file {:?} --swarm --peers {:?} --emit-tx --workers-per-ac 1",
+        faucet_key_file_path, node_address_list,
+    );
+
+    let node_address_list = ports
+        .map(|port| format!("localhost:{}:{}", port.0, port.1))
+        .collect::<Vec<String>>()
+        .join(",");
+
+    println!("To run health check:");
+    println!(
+        "\tcargo run -p cluster-test -- --mint-file {:?} --swarm --peers {:?} --health-check --duration 30",
         faucet_key_file_path, node_address_list,
     );
 

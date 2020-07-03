@@ -4,13 +4,13 @@
 #![forbid(unsafe_code)]
 
 use crate::instance::Instance;
-use anyhow::Result;
 use config_builder::ValidatorConfig;
 use libra_crypto::{
     ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
     test_utils::KeyPair,
 };
 use rand::prelude::*;
+use reqwest::Client;
 use std::convert::TryInto;
 
 #[derive(Clone)]
@@ -18,12 +18,12 @@ pub struct Cluster {
     // guaranteed non-empty
     validator_instances: Vec<Instance>,
     fullnode_instances: Vec<Instance>,
-    prometheus_ip: Option<String>,
     mint_key_pair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey>,
 }
 
 impl Cluster {
-    pub fn from_host_port(peers: Vec<(String, u32)>, mint_file: &str) -> Self {
+    pub fn from_host_port(peers: Vec<(String, u32, Option<u32>)>, mint_file: &str) -> Self {
+        let http_client = Client::new();
         let instances: Vec<Instance> = peers
             .into_iter()
             .map(|host_port| {
@@ -31,6 +31,8 @@ impl Cluster {
                     format!("{}:{}", &host_port.0, host_port.1), /* short_hash */
                     host_port.0,
                     host_port.1,
+                    host_port.2,
+                    http_client.clone(),
                 )
             })
             .collect();
@@ -39,7 +41,6 @@ impl Cluster {
         Self {
             validator_instances: instances,
             fullnode_instances: vec![],
-            prometheus_ip: None,
             mint_key_pair,
         }
     }
@@ -54,26 +55,34 @@ impl Cluster {
         KeyPair::from(mint_key)
     }
 
-    pub fn new_k8s(
-        validator_instances: Vec<Instance>,
-        fullnode_instances: Vec<Instance>,
-    ) -> Result<Self> {
-        Ok(Self {
+    pub fn new(validator_instances: Vec<Instance>, fullnode_instances: Vec<Instance>) -> Self {
+        Self {
             validator_instances,
             fullnode_instances,
-            prometheus_ip: None,
             mint_key_pair: Self::get_mint_key_pair(),
-        })
+        }
     }
 
     pub fn random_validator_instance(&self) -> Instance {
         let mut rnd = rand::thread_rng();
-        self.validator_instances.choose(&mut rnd).unwrap().clone()
+        self.validator_instances
+            .choose(&mut rnd)
+            .expect("random_validator_instance requires non-empty validator_instances")
+            .clone()
     }
 
     pub fn validator_instances(&self) -> &[Instance] {
         &self.validator_instances
     }
+
+    pub fn random_full_node_instance(&self) -> Instance {
+        let mut rnd = rand::thread_rng();
+        self.fullnode_instances
+            .choose(&mut rnd)
+            .expect("random_full_node_instance requires non-empty fullnode_instances")
+            .clone()
+    }
+
     pub fn fullnode_instances(&self) -> &[Instance] {
         &self.fullnode_instances
     }
@@ -90,10 +99,6 @@ impl Cluster {
 
     pub fn into_fullnode_instances(self) -> Vec<Instance> {
         self.fullnode_instances
-    }
-
-    pub fn prometheus_ip(&self) -> Option<&String> {
-        self.prometheus_ip.as_ref()
     }
 
     pub fn mint_key_pair(&self) -> &KeyPair<Ed25519PrivateKey, Ed25519PublicKey> {
@@ -147,7 +152,6 @@ impl Cluster {
         Cluster {
             validator_instances: instances,
             fullnode_instances: vec![],
-            prometheus_ip: self.prometheus_ip.clone(),
             mint_key_pair: self.mint_key_pair.clone(),
         }
     }
@@ -156,7 +160,6 @@ impl Cluster {
         Cluster {
             validator_instances: vec![],
             fullnode_instances: instances,
-            prometheus_ip: self.prometheus_ip.clone(),
             mint_key_pair: self.mint_key_pair.clone(),
         }
     }
@@ -172,5 +175,9 @@ impl Cluster {
         }
         assert!(!instances.is_empty(), "No instances for subcluster");
         self.new_validator_sub_cluster(instances)
+    }
+
+    pub fn find_instance_by_pod(&self, pod: &str) -> Option<&Instance> {
+        self.all_instances().find(|i| i.peer_name() == pod)
     }
 }

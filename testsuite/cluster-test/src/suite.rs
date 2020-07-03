@@ -12,13 +12,14 @@ use crate::{
         RecoveryTimeParams,
     },
 };
+use anyhow::{format_err, Result};
 
 pub struct ExperimentSuite {
     pub experiments: Vec<Box<dyn Experiment>>,
 }
 
 impl ExperimentSuite {
-    pub fn new_pre_release(cluster: &Cluster) -> Self {
+    fn new_pre_release(cluster: &Cluster) -> Self {
         let mut experiments: Vec<Box<dyn Experiment>> = vec![];
         if env::var("RECOVERY_EXP").is_ok() {
             experiments.push(Box::new(
@@ -41,6 +42,9 @@ impl ExperimentSuite {
             PerformanceBenchmarkParams::new_nodes_down(10).build(cluster),
         ));
         experiments.push(Box::new(
+            PerformanceBenchmarkParams::new_fixed_tps(0, 10).build(cluster),
+        ));
+        experiments.push(Box::new(
             PerformanceBenchmarkThreeRegionSimulationParams {}.build(cluster),
         ));
         experiments.push(Box::new(
@@ -49,7 +53,7 @@ impl ExperimentSuite {
         Self { experiments }
     }
 
-    pub fn new_perf_suite(cluster: &Cluster) -> Self {
+    fn new_perf_suite(cluster: &Cluster) -> Self {
         let mut experiments: Vec<Box<dyn Experiment>> = vec![];
         experiments.push(Box::new(
             PerformanceBenchmarkParams::new_nodes_down(0).build(cluster),
@@ -58,8 +62,28 @@ impl ExperimentSuite {
             PerformanceBenchmarkParams::new_nodes_down(10).build(cluster),
         ));
         experiments.push(Box::new(
+            PerformanceBenchmarkParams::new_fixed_tps(0, 10).build(cluster),
+        ));
+        experiments.push(Box::new(
             PerformanceBenchmarkThreeRegionSimulationParams {}.build(cluster),
         ));
         Self { experiments }
+    }
+
+    fn new_land_blocking_suite(cluster: &Cluster) -> Self {
+        let mut experiments: Vec<Box<dyn Experiment>> = vec![];
+        experiments.push(Box::new(
+            PerformanceBenchmarkParams::new_nodes_down(0).build(cluster),
+        ));
+        Self { experiments }
+    }
+
+    pub fn new_by_name(cluster: &Cluster, name: &str) -> Result<Self> {
+        match name {
+            "perf" => Ok(Self::new_perf_suite(cluster)),
+            "pre_release" => Ok(Self::new_pre_release(cluster)),
+            "land_blocking" => Ok(Self::new_land_blocking_suite(cluster)),
+            other => Err(format_err!("Unknown suite: {}", other)),
+        }
     }
 }

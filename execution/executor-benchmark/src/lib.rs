@@ -12,7 +12,9 @@ use libra_crypto::{
 use libra_logger::prelude::*;
 use libra_types::{
     account_address::AccountAddress,
-    account_config::{association_address, lbr_type_tag, AccountResource, LBR_NAME},
+    account_config::{
+        association_address, coin1_tag, testnet_dd_account_address, AccountResource, COIN1_NAME,
+    },
     block_info::BlockInfo,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     transaction::{
@@ -32,7 +34,8 @@ use storage_client::StorageClient;
 use storage_interface::{DbReader, DbReaderWriter};
 use storage_service::start_storage_service_with_db;
 use transaction_builder::{
-    encode_mint_lbr_to_address_script, encode_transfer_with_metadata_script,
+    encode_create_testing_account_script, encode_testnet_mint_script,
+    encode_transfer_with_metadata_script,
 };
 
 struct AccountData {
@@ -98,27 +101,53 @@ impl TransactionGenerator {
     }
 
     fn run(&mut self, init_account_balance: u64, block_size: usize, num_transfer_blocks: usize) {
+        self.gen_account_creations(block_size);
         self.gen_mint_transactions(init_account_balance, block_size);
         self.gen_transfer_transactions(block_size, num_transfer_blocks);
     }
 
-    /// Generates transactions that allocate `init_account_balance` to every account.
-    fn gen_mint_transactions(&self, init_account_balance: u64, block_size: usize) {
-        let genesis_account = association_address();
+    fn gen_account_creations(&self, block_size: usize) {
+        let assoc_account = association_address();
 
         for (i, block) in self.accounts.chunks(block_size).enumerate() {
             let mut transactions = Vec::with_capacity(block_size);
             for (j, account) in block.iter().enumerate() {
                 let txn = create_transaction(
-                    genesis_account,
-                    (i * block_size + j + 1) as u64,
+                    assoc_account,
+                    1 + (i * block_size + j) as u64,
                     &self.genesis_key,
                     self.genesis_key.public_key(),
-                    encode_mint_lbr_to_address_script(
-                        &account.address,
+                    encode_create_testing_account_script(
+                        coin1_tag(),
+                        account.address,
                         account.auth_key_prefix(),
-                        init_account_balance,
+                        false, /* add all currencies */
                     ),
+                );
+                transactions.push(txn);
+            }
+
+            self.block_sender
+                .as_ref()
+                .unwrap()
+                .send(transactions)
+                .unwrap();
+        }
+    }
+
+    /// Generates transactions that allocate `init_account_balance` to every account.
+    fn gen_mint_transactions(&self, init_account_balance: u64, block_size: usize) {
+        let testnet_dd_account = testnet_dd_account_address();
+
+        for (i, block) in self.accounts.chunks(block_size).enumerate() {
+            let mut transactions = Vec::with_capacity(block_size);
+            for (j, account) in block.iter().enumerate() {
+                let txn = create_transaction(
+                    testnet_dd_account,
+                    (i * block_size + j) as u64,
+                    &self.genesis_key,
+                    self.genesis_key.public_key(),
+                    encode_testnet_mint_script(coin1_tag(), account.address, init_account_balance),
                 );
                 transactions.push(txn);
             }
@@ -148,7 +177,7 @@ impl TransactionGenerator {
                     &sender.private_key,
                     sender.public_key.clone(),
                     encode_transfer_with_metadata_script(
-                        lbr_type_tag(),
+                        coin1_tag(),
                         receiver.address,
                         1, /* amount */
                         vec![],
@@ -341,9 +370,9 @@ fn create_transaction(
         sender,
         sequence_number,
         program,
-        1_000_000,           /* max_gas_amount */
-        0,                   /* gas_unit_price */
-        LBR_NAME.to_owned(), /* gas_currency_code */
+        1_000_000,             /* max_gas_amount */
+        0,                     /* gas_unit_price */
+        COIN1_NAME.to_owned(), /* gas_currency_code */
         expiration_time,
     );
 
@@ -357,11 +386,11 @@ mod tests {
     #[test]
     fn test_benchmark() {
         super::run_benchmark(
-            25,         /* num_accounts */
-            10_000_000, /* init_account_balance */
-            5,          /* block_size */
-            5,          /* num_transfer_blocks */
-            None,       /* db_dir */
+            25,   /* num_accounts */
+            10,   /* init_account_balance */
+            5,    /* block_size */
+            5,    /* num_transfer_blocks */
+            None, /* db_dir */
         );
     }
 }

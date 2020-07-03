@@ -7,6 +7,7 @@ use crate::{
     AccountData, AccountStatus,
 };
 use anyhow::{bail, ensure, format_err, Error, Result};
+use compiled_stdlib::{transaction_scripts::StdlibScript, StdLibOptions};
 use libra_crypto::{
     ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature},
     test_utils::KeyPair,
@@ -21,8 +22,8 @@ use libra_types::{
     access_path::AccessPath,
     account_address::AccountAddress,
     account_config::{
-        association_address, from_currency_code_string, type_tag_for_currency_code,
-        ACCOUNT_RECEIVED_EVENT_PATH, ACCOUNT_SENT_EVENT_PATH, LBR_NAME,
+        association_address, from_currency_code_string, testnet_dd_account_address,
+        type_tag_for_currency_code, ACCOUNT_RECEIVED_EVENT_PATH, ACCOUNT_SENT_EVENT_PATH, LBR_NAME,
     },
     account_state::AccountState,
     ledger_info::LedgerInfoWithSignatures,
@@ -33,7 +34,7 @@ use libra_types::{
         parse_transaction_argument, Module, RawTransaction, Script, SignedTransaction,
         TransactionArgument, TransactionPayload, Version,
     },
-    vm_error::StatusCode,
+    vm_status::StatusCode,
     waypoint::Waypoint,
 };
 use libra_wallet::{io_utils, WalletLibrary};
@@ -54,8 +55,7 @@ use std::{
     str::{self, FromStr},
     thread, time,
 };
-use stdlib::transaction_scripts::StdlibScript;
-use transaction_builder::encode_register_validator_script;
+use transaction_builder::encode_set_validator_config_script;
 
 const CLIENT_WALLET_MNEMONIC_FILE: &str = "client.mnemonic";
 const GAS_UNIT_PRICE: u64 = 0;
@@ -105,8 +105,10 @@ pub struct ClientProxy {
     address_to_ref_id: HashMap<AccountAddress, usize>,
     /// Host that operates a faucet service
     faucet_server: String,
-    /// Account used for mint operations.
-    pub faucet_account: Option<AccountData>,
+    /// Account used for AssocRoot operations (e.g., adding a new transaction script)
+    pub assoc_root_account: Option<AccountData>,
+    /// Account used for "minting" operations
+    pub testnet_designated_dealer_account: Option<AccountData>,
     /// Wallet library managing user accounts.
     wallet: WalletLibrary,
     /// Whether to sync with validator on wallet recovery.
@@ -120,7 +122,8 @@ impl ClientProxy {
     /// Construct a new TestClient.
     pub fn new(
         url: &str,
-        faucet_account_file: &str,
+        assoc_root_account_file: &str,
+        testnet_designated_dealer_account_file: &str,
         sync_on_wallet_recovery: bool,
         faucet_server: Option<String>,
         mnemonic_file: Option<String>,
@@ -132,20 +135,31 @@ impl ClientProxy {
 
         let accounts = vec![];
 
-        // If we have a faucet account file, then load it to get the keypair
-        let faucet_account = if faucet_account_file.is_empty() {
+        let assoc_root_account = if assoc_root_account_file.is_empty() {
             None
         } else {
-            let faucet_account_key = generate_key::load_key(faucet_account_file);
-            let faucet_account_data = Self::get_account_data_from_address(
+            let assoc_root_account_key = generate_key::load_key(assoc_root_account_file);
+            let assoc_root_account_data = Self::get_account_data_from_address(
                 &mut client,
                 association_address(),
                 true,
-                Some(KeyPair::from(faucet_account_key)),
+                Some(KeyPair::from(assoc_root_account_key)),
                 None,
             )?;
-            // Load the keypair from file
-            Some(faucet_account_data)
+            Some(assoc_root_account_data)
+        };
+        let dd_account = if testnet_designated_dealer_account_file.is_empty() {
+            None
+        } else {
+            let dd_account_key = generate_key::load_key(testnet_designated_dealer_account_file);
+            let dd_account_data = Self::get_account_data_from_address(
+                &mut client,
+                testnet_dd_account_address(),
+                true,
+                Some(KeyPair::from(dd_account_key)),
+                None,
+            )?;
+            Some(dd_account_data)
         };
 
         let faucet_server = match faucet_server {
@@ -167,7 +181,8 @@ impl ClientProxy {
             accounts,
             address_to_ref_id,
             faucet_server,
-            faucet_account,
+            assoc_root_account,
+            testnet_designated_dealer_account: dd_account,
             wallet: Self::get_libra_wallet(mnemonic_file)?,
             sync_on_wallet_recovery,
             temp_files: vec![],
@@ -223,12 +238,20 @@ impl ClientProxy {
             }
         }
 
-        if let Some(faucet_account) = &self.faucet_account {
+        if let Some(assoc_root_account) = &self.assoc_root_account {
             println!(
-                "Faucet account address: {}, sequence_number: {}, status: {:?}",
-                hex::encode(&faucet_account.address),
-                faucet_account.sequence_number,
-                faucet_account.status,
+                "AssocRoot account address: {}, sequence_number: {}, status: {:?}",
+                hex::encode(&assoc_root_account.address),
+                assoc_root_account.sequence_number,
+                assoc_root_account.status,
+            );
+        }
+        if let Some(testnet_dd_account) = &self.testnet_designated_dealer_account {
+            println!(
+                "Testnet DD account address: {}, sequence_number: {}, status: {:?}",
+                hex::encode(&testnet_dd_account.address),
+                testnet_dd_account.sequence_number,
+                testnet_dd_account.status,
             );
         }
     }
@@ -311,9 +334,15 @@ impl ClientProxy {
             false
         };
         if reset_sequence_number {
-            if let Some(faucet_account) = &mut self.faucet_account {
-                if faucet_account.address == address {
-                    faucet_account.sequence_number = sequence_number;
+            if let Some(assoc_root_account) = &mut self.assoc_root_account {
+                if assoc_root_account.address == address {
+                    assoc_root_account.sequence_number = sequence_number;
+                    return Ok(sequence_number);
+                }
+            }
+            if let Some(testnet_dd_account) = &mut self.testnet_designated_dealer_account {
+                if testnet_dd_account.address == address {
+                    testnet_dd_account.sequence_number = sequence_number;
                     return Ok(sequence_number);
                 }
             }
@@ -392,7 +421,7 @@ impl ClientProxy {
         self.client
             .submit_transaction(self.accounts.get_mut(sender_ref_id), txn)?;
         if is_blocking {
-            self.wait_for_transaction(sender_address, sequence_number)?;
+            self.wait_for_transaction(sender_address, sequence_number + 1)?;
         }
         Ok(())
     }
@@ -423,23 +452,49 @@ impl ClientProxy {
 
         ensure!(num_coins > 0, "Invalid number of coins to mint.");
 
-        match self.faucet_account {
+        if self.assoc_root_account.is_some() {
+            let script = transaction_builder::encode_create_testing_account_script(
+                type_tag_for_currency_code(currency_code.clone()),
+                receiver,
+                receiver_auth_key.prefix().to_vec(),
+                false, /* add all currencies */
+            );
+            // If the receiver is local, create it now.
+            if let Some(pos) = self
+                .accounts
+                .iter()
+                .position(|account_data| account_data.address == receiver)
+            {
+                let status = &self.accounts.get(pos).unwrap().status;
+                if &AccountStatus::Local == status {
+                    // This needs to be blocking since the mint can't happen until it completes
+                    self.association_transaction_with_local_assoc_root_account(
+                        TransactionPayload::Script(script),
+                        true,
+                    )?;
+                    self.accounts.get_mut(pos).unwrap().status = AccountStatus::Persisted;
+                }
+            } else {
+                // We can't determine the account state. So try and create the account, but
+                // if it already exists don't error.
+                let _ = self.association_transaction_with_local_assoc_root_account(
+                    TransactionPayload::Script(script),
+                    true,
+                );
+            } // else, the account has already been created -- do nothing
+        }
+
+        match self.testnet_designated_dealer_account {
             Some(_) => {
-                let script = if mint_currency == "LBR" {
-                    transaction_builder::encode_mint_lbr_to_address_script(
-                        &receiver,
-                        receiver_auth_key.prefix().to_vec(),
-                        num_coins,
-                    )
-                } else {
-                    transaction_builder::encode_mint_script(
-                        type_tag_for_currency_code(currency_code),
-                        &receiver,
-                        receiver_auth_key.prefix().to_vec(),
-                        num_coins,
-                    )
-                };
-                self.association_transaction_with_local_faucet_account(script, is_blocking)
+                let script = transaction_builder::encode_testnet_mint_script(
+                    type_tag_for_currency_code(currency_code),
+                    receiver,
+                    num_coins,
+                );
+                self.association_transaction_with_local_testnet_dd_account(
+                    TransactionPayload::Script(script),
+                    is_blocking,
+                )
             }
             None => self.mint_coins_with_faucet_service(
                 receiver_auth_key,
@@ -465,10 +520,12 @@ impl ClientProxy {
             space_delim_strings.len() == 1,
             "Invalid number of arguments for setting publishing option"
         );
-        match self.faucet_account {
-            Some(_) => self.association_transaction_with_local_faucet_account(
-                transaction_builder::encode_publishing_option_script(
-                    VMPublishingOption::CustomScripts,
+        match self.assoc_root_account {
+            Some(_) => self.association_transaction_with_local_assoc_root_account(
+                TransactionPayload::Script(
+                    transaction_builder::encode_modify_publishing_option_script(
+                        VMPublishingOption::CustomScripts,
+                    ),
                 ),
                 is_blocking,
             ),
@@ -491,11 +548,40 @@ impl ClientProxy {
             space_delim_strings.len() == 1,
             "Invalid number of arguments for setting publishing option"
         );
-        match self.faucet_account {
-            Some(_) => self.association_transaction_with_local_faucet_account(
-                transaction_builder::encode_publishing_option_script(VMPublishingOption::Locked(
-                    StdlibScript::whitelist(),
-                )),
+        match self.assoc_root_account {
+            Some(_) => self.association_transaction_with_local_assoc_root_account(
+                TransactionPayload::Script(
+                    transaction_builder::encode_modify_publishing_option_script(
+                        VMPublishingOption::Locked(StdlibScript::whitelist()),
+                    ),
+                ),
+                is_blocking,
+            ),
+            None => unimplemented!(),
+        }
+    }
+
+    /// Only allow executing predefined script in the Move standard library in the network.
+    pub fn upgrade_stdlib(
+        &mut self,
+        space_delim_strings: &[&str],
+        is_blocking: bool,
+    ) -> Result<()> {
+        ensure!(
+            space_delim_strings[0] == "upgrade_stdlib",
+            "inconsistent command '{}' for upgrade_stdlib",
+            space_delim_strings[0]
+        );
+        ensure!(
+            space_delim_strings.len() == 1,
+            "Invalid number of arguments for upgrading_stdlib_transaction"
+        );
+
+        match self.assoc_root_account {
+            Some(_) => self.association_transaction_with_local_assoc_root_account(
+                TransactionPayload::WriteSet(
+                    transaction_builder::encode_stdlib_upgrade_transaction(StdLibOptions::Fresh),
+                ),
                 is_blocking,
             ),
             None => unimplemented!(),
@@ -514,32 +600,20 @@ impl ClientProxy {
             space_delim_strings[0]
         );
         ensure!(
-            space_delim_strings.len() == 3,
+            space_delim_strings.len() == 2,
             "Invalid number of arguments for removing validator"
         );
         let (account_address, _) =
             self.get_account_address_from_parameter(space_delim_strings[1])?;
-        let private_key = Ed25519PrivateKey::from_encoded_string(space_delim_strings[2])?;
-        let program = transaction_builder::encode_remove_validator_script(account_address);
-        let mut sender = Self::get_account_data_from_address(
-            &mut self.client,
-            account_address,
-            true,
-            Some(KeyPair::from(private_key)),
-            None,
-        )?;
-        let txn = self.create_txn_to_submit(
-            TransactionPayload::Script(program),
-            &sender,
-            None,
-            None,
-            None,
-        )?;
-        self.client.submit_transaction(Some(&mut sender), txn)?;
-        if is_blocking {
-            self.wait_for_transaction(sender.address, sender.sequence_number)?;
+        match self.assoc_root_account {
+            Some(_) => self.association_transaction_with_local_assoc_root_account(
+                TransactionPayload::Script(transaction_builder::encode_remove_validator_script(
+                    account_address,
+                )),
+                is_blocking,
+            ),
+            None => unimplemented!(),
         }
-        Ok(())
     }
 
     /// Add a new validator to the Validator Set.
@@ -550,32 +624,20 @@ impl ClientProxy {
             space_delim_strings[0]
         );
         ensure!(
-            space_delim_strings.len() == 3,
+            space_delim_strings.len() == 2,
             "Invalid number of arguments for adding validator"
         );
         let (account_address, _) =
             self.get_account_address_from_parameter(space_delim_strings[1])?;
-        let private_key = Ed25519PrivateKey::from_encoded_string(space_delim_strings[2])?;
-        let mut sender = Self::get_account_data_from_address(
-            &mut self.client,
-            account_address,
-            true,
-            Some(KeyPair::from(private_key)),
-            None,
-        )?;
-        let program = transaction_builder::encode_add_validator_script(account_address);
-        let txn = self.create_txn_to_submit(
-            TransactionPayload::Script(program),
-            &sender,
-            None,
-            None,
-            None,
-        )?;
-        self.client.submit_transaction(Some(&mut sender), txn)?;
-        if is_blocking {
-            self.wait_for_transaction(sender.address, sender.sequence_number)?;
+        match self.assoc_root_account {
+            Some(_) => self.association_transaction_with_local_assoc_root_account(
+                TransactionPayload::Script(transaction_builder::encode_add_validator_script(
+                    account_address,
+                )),
+                is_blocking,
+            ),
+            None => unimplemented!(),
         }
-        Ok(())
     }
 
     /// Register an account as validator candidate with ValidatorConfig
@@ -609,7 +671,8 @@ impl ClientProxy {
             Some(KeyPair::from(private_key)),
             None,
         )?;
-        let program = encode_register_validator_script(
+        let program = encode_set_validator_config_script(
+            address,
             consensus_public_key.to_bytes().to_vec(),
             network_identity_key.to_bytes(),
             network_address.into(),
@@ -1086,8 +1149,7 @@ impl ClientProxy {
                 account_data
                     .authentication_key
                     .clone()
-                    .map(|bytes| AuthenticationKey::try_from(bytes).ok())
-                    .flatten(),
+                    .and_then(|bytes| AuthenticationKey::try_from(bytes).ok()),
             ))
         }
     }
@@ -1339,27 +1401,50 @@ impl ClientProxy {
         Ok(auth_key)
     }
 
-    fn association_transaction_with_local_faucet_account(
+    fn association_transaction_with_local_assoc_root_account(
         &mut self,
-        program: Script,
+        payload: TransactionPayload,
         is_blocking: bool,
     ) -> Result<()> {
-        ensure!(self.faucet_account.is_some(), "No faucet account loaded");
-        let sender = self.faucet_account.as_ref().unwrap();
+        ensure!(
+            self.assoc_root_account.is_some(),
+            "No assoc root account loaded"
+        );
+        let sender = self.assoc_root_account.as_ref().unwrap();
         let sender_address = sender.address;
-        let txn = self.create_txn_to_submit(
-            TransactionPayload::Script(program),
-            sender,
-            None,
-            None,
-            None,
-        )?;
-        let mut sender_mut = self.faucet_account.as_mut().unwrap();
+        let txn = self.create_txn_to_submit(payload, sender, None, None, None)?;
+        let mut sender_mut = self.assoc_root_account.as_mut().unwrap();
         let resp = self.client.submit_transaction(Some(&mut sender_mut), txn);
         if is_blocking {
             self.wait_for_transaction(
                 sender_address,
-                self.faucet_account.as_ref().unwrap().sequence_number,
+                self.assoc_root_account.as_ref().unwrap().sequence_number,
+            )?;
+        }
+        resp
+    }
+
+    fn association_transaction_with_local_testnet_dd_account(
+        &mut self,
+        payload: TransactionPayload,
+        is_blocking: bool,
+    ) -> Result<()> {
+        ensure!(
+            self.testnet_designated_dealer_account.is_some(),
+            "No testnet Designated Dealer account loaded"
+        );
+        let sender = self.testnet_designated_dealer_account.as_ref().unwrap();
+        let sender_address = sender.address;
+        let txn = self.create_txn_to_submit(payload, sender, None, None, None)?;
+        let mut sender_mut = self.testnet_designated_dealer_account.as_mut().unwrap();
+        let resp = self.client.submit_transaction(Some(&mut sender_mut), txn);
+        if is_blocking {
+            self.wait_for_transaction(
+                sender_address,
+                self.testnet_designated_dealer_account
+                    .as_ref()
+                    .unwrap()
+                    .sequence_number,
             )?;
         }
         resp
@@ -1395,7 +1480,7 @@ impl ClientProxy {
         }
         let sequence_number = body.parse::<u64>()?;
         if is_blocking {
-            self.wait_for_transaction(association_address(), sequence_number)?;
+            self.wait_for_transaction(testnet_dd_account_address(), sequence_number)?;
         }
 
         Ok(())
@@ -1576,6 +1661,7 @@ mod tests {
         // generate random accounts
         let mut client_proxy = ClientProxy::new(
             "http://localhost:8080",
+            &"",
             &"",
             false,
             None,

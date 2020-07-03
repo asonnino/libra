@@ -2,24 +2,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    account::AccountData, assert_prologue_disparity, assert_prologue_parity, assert_status_eq,
-    compile::compile_module_with_address, executor::FakeExecutor, transaction_status_eq,
+    account::{Account, AccountData},
+    assert_prologue_disparity, assert_prologue_parity, assert_status_eq,
+    compile::compile_module_with_address,
+    executor::FakeExecutor,
+    transaction_status_eq,
 };
-use bytecode_verifier::VerifiedModule;
+use compiled_stdlib::transaction_scripts::StdlibScript;
 use compiler::Compiler;
 use libra_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
 use libra_types::{
-    account_config::{lbr_type_tag, CORE_CODE_ADDRESS, LBR_NAME},
+    account_config::{self, lbr_type_tag, LBR_NAME},
     on_chain_config::VMPublishingOption,
     test_helpers::transaction_test_helpers,
     transaction::{
         Script, TransactionArgument, TransactionPayload, TransactionStatus,
         MAX_TRANSACTION_SIZE_IN_BYTES,
     },
-    vm_error::{StatusCode, StatusType, VMStatus},
+    vm_status::{StatusCode, StatusType, VMStatus},
 };
 use move_core_types::gas_schedule::{GasAlgebra, GasConstants};
-use stdlib::transaction_scripts::StdlibScript;
 use transaction_builder::encode_transfer_with_metadata_script;
 
 #[test]
@@ -66,7 +68,7 @@ fn verify_reserved_sender() {
         vec![],
     );
     let signed_txn = transaction_test_helpers::get_test_signed_txn(
-        CORE_CODE_ADDRESS,
+        account_config::reserved_vm_address(),
         0,
         &private_key,
         private_key.public_key(),
@@ -321,7 +323,7 @@ fn verify_simple_payment() {
         executor.execute_transaction(txn).status(),
         &TransactionStatus::Keep(
             VMStatus::new(StatusCode::TYPE_MISMATCH)
-                .with_message("argument length mismatch: expected 4 got 2".to_string())
+                .with_message("argument length mismatch: expected 5 got 3".to_string())
         )
     );
 
@@ -340,7 +342,7 @@ fn verify_simple_payment() {
         executor.execute_transaction(txn).status(),
         &TransactionStatus::Keep(
             VMStatus::new(StatusCode::TYPE_MISMATCH)
-                .with_message("argument length mismatch: expected 4 got 0".to_string())
+                .with_message("argument length mismatch: expected 5 got 1".to_string())
         )
     );
 }
@@ -404,7 +406,7 @@ pub fn test_arbitrary_script_execution() {
 }
 
 #[test]
-pub fn test_no_publishing() {
+pub fn test_publish_from_assoc() {
     // create a FakeExecutor with a genesis from file
     let mut executor = FakeExecutor::from_genesis_with_options(VMPublishingOption::CustomScripts);
 
@@ -440,7 +442,46 @@ pub fn test_no_publishing() {
     assert_prologue_parity!(
         executor.verify_transaction(txn.clone()).status(),
         executor.execute_transaction(txn).status(),
-        VMStatus::new(StatusCode::UNKNOWN_MODULE)
+        VMStatus::new(StatusCode::INVALID_MODULE_PUBLISHER)
+    );
+}
+
+#[test]
+pub fn test_no_publishing_assoc_sender() {
+    // create a FakeExecutor with a genesis from file
+    let executor = FakeExecutor::from_genesis_with_options(VMPublishingOption::CustomScripts);
+
+    // create a transaction trying to publish a new module.
+    let sender = Account::new_association();
+
+    let module = String::from(
+        "
+        module M {
+            public max(a: u64, b: u64): u64 {
+                if (copy(a) > copy(b)) {
+                    return copy(a);
+                } else {
+                    return copy(b);
+                }
+                return 0;
+            }
+
+            public sum(a: u64, b: u64): u64 {
+                let c: u64;
+                c = copy(a) + copy(b);
+                return copy(c);
+            }
+        }
+        ",
+    );
+
+    let random_module =
+        compile_module_with_address(&account_config::CORE_CODE_ADDRESS, "file_name", &module);
+    let txn = sender.create_user_txn(random_module, 1, 100_000, 0, LBR_NAME.to_owned());
+    assert_eq!(executor.verify_transaction(txn.clone()).status(), None);
+    assert_eq!(
+        executor.execute_transaction(txn).status(),
+        &TransactionStatus::Keep(VMStatus::new(StatusCode::EXECUTED))
     );
 }
 
@@ -570,7 +611,7 @@ fn test_dependency_fails_verification() {
     executor.add_account_data(&sender);
 
     let code = "
-    import 0x0.Test;
+    import 0x1.Test;
 
     main() {
         let x: Test.S1;
@@ -582,9 +623,7 @@ fn test_dependency_fails_verification() {
     let compiler = Compiler {
         address: *sender.address(),
         // This is OK because we *know* the module is unverified.
-        extra_deps: vec![VerifiedModule::bypass_verifier_DANGEROUS_FOR_TESTING_ONLY(
-            module,
-        )],
+        extra_deps: vec![module],
         ..Compiler::default()
     };
     let script = compiler

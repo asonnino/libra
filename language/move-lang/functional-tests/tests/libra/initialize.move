@@ -1,19 +1,10 @@
 //! new-transaction
 //! sender: association
 script {
-use 0x0::Association;
-// init the association
+use 0x1::Libra;
+use 0x1::LibraTimestamp;
 fun main(account: &signer) {
-    Association::initialize(account);
-}
-}
-// check: CANNOT_WRITE_EXISTING_RESOURCE
-
-//! new-transaction
-//! sender: config
-script {
-use 0x0::Libra;
-fun main(account: &signer) {
+    LibraTimestamp::reset_time_has_started_for_test();
     Libra::initialize(account);
 }
 }

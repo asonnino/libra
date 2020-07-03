@@ -6,11 +6,15 @@ use crate::{
     peer_manager::{
         self, conn_notifs_channel, ConnectionRequest, PeerManagerNotification, PeerManagerRequest,
     },
-    protocols::rpc::InboundRpcRequest,
+    protocols::{
+        network::{NewNetworkEvents, NewNetworkSender},
+        rpc::InboundRpcRequest,
+    },
     ProtocolId,
 };
 use channel::{libra_channel, message_queues::QueueStyle};
 use futures::sink::SinkExt;
+use libra_config::{config::RoleType, network_id::NetworkId};
 use libra_network_address::NetworkAddress;
 use std::{num::NonZeroUsize, str::FromStr};
 use tokio::runtime::Runtime;
@@ -42,8 +46,10 @@ fn setup_permissive_health_checker(
         ConnectionRequestSender::new(connection_reqs_tx),
     );
     let hc_network_rx = HealthCheckerNetworkEvents::new(network_notifs_rx, connection_notifs_rx);
-
+    let network_context =
+        NetworkContext::new(NetworkId::Validator, RoleType::Validator, PeerId::ZERO);
     let health_checker = HealthChecker::new(
+        Arc::new(network_context),
         ticker_rx,
         hc_network_tx,
         hc_network_rx,
@@ -177,6 +183,7 @@ async fn send_new_peer_notification(
             peer_manager::ConnectionNotification::NewPeer(
                 peer_id,
                 NetworkAddress::from_str("/ip6/::1/tcp/8081").unwrap(),
+                NetworkContext::mock(),
             ),
             Some(delivered_tx),
         )

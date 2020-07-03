@@ -1,4 +1,4 @@
-address 0x0 {
+address 0x1 {
 module Signer {
     // Borrows the address of the signer
     // Conceptually, you can think of the `signer` as being a resource struct wrapper arround an
@@ -15,7 +15,8 @@ module Signer {
     }
 
     spec module {
-        native define get_address(account: signer): address;
+        /// Specification version of `Self::address_of`.
+        native define spec_address_of(account: signer): address;
     }
 }
 }

@@ -4,39 +4,62 @@
 //! Protobuf based interface between OnchainDiscovery and Network layers.
 use crate::types::{OnchainDiscoveryMsg, QueryDiscoverySetRequest, QueryDiscoverySetResponse};
 use channel::{libra_channel, message_queues::QueueStyle};
-use futures::{channel::mpsc, sink::SinkExt};
+use libra_metrics::IntCounterVec;
 use libra_types::PeerId;
 use network::{
-    connectivity_manager::ConnectivityRequest,
+    constants::NETWORK_CHANNEL_SIZE,
     peer_manager::{
-        conn_notifs_channel, ConnectionRequestSender, PeerManagerNotification,
+        ConnectionNotification, ConnectionRequestSender, PeerManagerNotification,
         PeerManagerRequestSender,
     },
-    protocols::{network::NetworkSender, rpc::error::RpcError},
-    validator_network::network_builder::{NetworkBuilder, NETWORK_CHANNEL_SIZE},
+    protocols::{
+        network::{NetworkSender, NewNetworkEvents, NewNetworkSender},
+        rpc::error::RpcError,
+    },
     ProtocolId,
 };
 use std::time::Duration;
 
+/// The interface from Network to OnchainDiscovery layer.
+///
+/// `OnchainDiscoveryNetworkEvents` is a wrapper around streams of `PeerManagerNotification` and
+/// `ConnectionNotification` events. Unlike other *NetworkEvents, it is not itself a `Stream` and
+/// serves only as a transient holder of the underlying Streams during setup and initialization.
+pub struct OnchainDiscoveryNetworkEvents {
+    pub peer_mgr_notifs_rx: libra_channel::Receiver<(PeerId, ProtocolId), PeerManagerNotification>,
+    pub connection_notifs_rx: libra_channel::Receiver<PeerId, ConnectionNotification>,
+}
+
+impl NewNetworkEvents for OnchainDiscoveryNetworkEvents {
+    fn new(
+        peer_mgr_notifs_rx: libra_channel::Receiver<(PeerId, ProtocolId), PeerManagerNotification>,
+        connection_notifs_rx: libra_channel::Receiver<PeerId, ConnectionNotification>,
+    ) -> Self {
+        Self {
+            peer_mgr_notifs_rx,
+            connection_notifs_rx,
+        }
+    }
+}
+
 /// The interface from OnchainDiscovery to Networking layer.
 #[derive(Clone)]
 pub struct OnchainDiscoveryNetworkSender {
-    network_sender: NetworkSender<OnchainDiscoveryMsg>,
-    conn_mgr_reqs_tx: channel::Sender<ConnectivityRequest>,
+    inner: NetworkSender<OnchainDiscoveryMsg>,
+}
+
+impl NewNetworkSender for OnchainDiscoveryNetworkSender {
+    fn new(
+        peer_mgr_reqs_tx: PeerManagerRequestSender,
+        conn_reqs_tx: ConnectionRequestSender,
+    ) -> Self {
+        Self {
+            inner: NetworkSender::new(peer_mgr_reqs_tx, conn_reqs_tx),
+        }
+    }
 }
 
 impl OnchainDiscoveryNetworkSender {
-    pub fn new(
-        peer_mgr_reqs_tx: PeerManagerRequestSender,
-        conn_reqs_tx: ConnectionRequestSender,
-        conn_mgr_reqs_tx: channel::Sender<ConnectivityRequest>,
-    ) -> Self {
-        Self {
-            network_sender: NetworkSender::new(peer_mgr_reqs_tx, conn_reqs_tx),
-            conn_mgr_reqs_tx,
-        }
-    }
-
     pub async fn query_discovery_set(
         &mut self,
         recipient: PeerId,
@@ -47,7 +70,7 @@ impl OnchainDiscoveryNetworkSender {
         let req_msg_enum = OnchainDiscoveryMsg::QueryDiscoverySetRequest(req_msg);
 
         let res_msg_enum = self
-            .network_sender
+            .inner
             .send_rpc(recipient, protocol, req_msg_enum, timeout)
             .await?;
 
@@ -59,43 +82,23 @@ impl OnchainDiscoveryNetworkSender {
         };
         Ok(res_msg)
     }
-
-    pub async fn send_connectivity_request(
-        &mut self,
-        req: ConnectivityRequest,
-    ) -> Result<(), mpsc::SendError> {
-        self.conn_mgr_reqs_tx.send(req).await
-    }
 }
 
-/// Construct OnchainDiscoveryNetworkSender/Events and register them with the
-/// given network builder.
-pub fn add_to_network(
-    network: &mut NetworkBuilder,
-) -> (
-    OnchainDiscoveryNetworkSender,
-    libra_channel::Receiver<(PeerId, ProtocolId), PeerManagerNotification>,
-    conn_notifs_channel::Receiver,
+/// Provides the configuration parameters for the network endpoint.
+pub fn network_endpoint_config() -> (
+    Vec<ProtocolId>,
+    Vec<ProtocolId>,
+    QueueStyle,
+    usize,
+    Option<&'static IntCounterVec>,
 ) {
-    let (network_sender, network_receiver, conn_reqs_tx, conn_notifs_rx) = network
-        .add_protocol_handler(
-            vec![ProtocolId::OnchainDiscoveryRpc],
-            vec![],
-            QueueStyle::LIFO,
-            NETWORK_CHANNEL_SIZE,
-            // Some(&counters::PENDING_CONSENSUS_NETWORK_EVENTS),
-            // TODO(philiphayes): add a counter for onchain discovery
-            None,
-        );
     (
-        OnchainDiscoveryNetworkSender::new(
-            network_sender,
-            conn_reqs_tx,
-            network
-                .conn_mgr_reqs_tx()
-                .expect("ConnecitivtyManager not enabled"),
-        ),
-        network_receiver,
-        conn_notifs_rx,
+        vec![ProtocolId::OnchainDiscoveryRpc],
+        vec![],
+        QueueStyle::LIFO,
+        NETWORK_CHANNEL_SIZE,
+        // Some(&counters::PENDING_CONSENSUS_NETWORK_EVENTS),
+        // TODO(philiphayes): add a counter for onchain discovery
+        None,
     )
 }

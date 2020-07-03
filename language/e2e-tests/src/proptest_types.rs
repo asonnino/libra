@@ -1,7 +1,7 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::account::{lbr_currency_code, Account, AccountData, AccountTypeSpecifier};
+use crate::account::{lbr_currency_code, Account, AccountData, AccountRoleSpecifier};
 use proptest::prelude::*;
 
 impl Arbitrary for Account {
@@ -40,9 +40,7 @@ impl AccountData {
                         sequence_number,
                         sent_events_count,
                         received_events_count,
-                        false, // TODO: vary withdrawal capability param?
-                        false, // TODO: vary rotation capability param?
-                        AccountTypeSpecifier::default(), // TODO: Vary account type?
+                        AccountRoleSpecifier::default(), // TODO: Vary account type?
                         false,
                     )
                 },

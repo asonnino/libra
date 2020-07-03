@@ -1,4 +1,6 @@
 ---
+ChainId:
+  NEWTYPESTRUCT: STR
 DirectSendMsg:
   STRUCT:
     - protocol_id:
@@ -28,6 +30,8 @@ HandshakeMsg:
             TYPENAME: MessagingProtocolVersion
           VALUE:
             TYPENAME: SupportedProtocols
+    - chain_id:
+        TYPENAME: ChainId
     - network_id:
         TYPENAME: NetworkId
 MessagingProtocolVersion:
@@ -41,16 +45,12 @@ NetworkAddress:
 NetworkId:
   ENUM:
     0:
-      Validator: UNIT
+      validator: UNIT
     1:
-      Public: UNIT
+      public: UNIT
     2:
-      Private:
-        NEWTYPE:
-          TYPENAME: NetworkInfo
-NetworkInfo:
-  STRUCT:
-    - name: STR
+      private:
+        NEWTYPE: STR
 NetworkMessage:
   ENUM:
     0:
@@ -118,8 +118,6 @@ Protocol:
     8:
       Handshake:
         NEWTYPE: U8
-    9:
-      PeerIdExchange: UNIT
 ProtocolId:
   ENUM:
     0:
@@ -155,5 +153,4 @@ RpcResponse:
     - priority: U8
     - raw_response: BYTES
 SupportedProtocols:
-  NEWTYPESTRUCT:
-    SEQ: U8
+  NEWTYPESTRUCT: BYTES

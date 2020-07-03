@@ -30,14 +30,12 @@ use crate::{
     access::ModuleAccess, check_bounds::BoundsChecker, errors::VMResult, internals::ModuleIndex,
     IndexKind, SignatureTokenKind,
 };
-use libra_types::{
-    account_address::AccountAddress,
-    vm_error::{StatusCode, VMStatus},
-};
 use mirai_annotations::*;
 use move_core_types::{
+    account_address::AccountAddress,
     identifier::{IdentStr, Identifier},
     language_storage::ModuleId,
+    vm_status::{StatusCode, VMStatus},
 };
 use num_variants::NumVariants;
 #[cfg(any(test, feature = "fuzzing"))]
@@ -1706,7 +1704,7 @@ impl CompiledModuleMut {
     /// Converts this instance into `CompiledModule` after verifying it for basic internal
     /// consistency. This includes bounds checks but no others.
     pub fn freeze(self) -> VMResult<CompiledModule> {
-        BoundsChecker::new(&self).verify()?;
+        BoundsChecker::verify(&self)?;
         Ok(CompiledModule(self))
     }
 }
@@ -1803,7 +1801,7 @@ pub fn empty_module() -> CompiledModuleMut {
         }],
         self_module_handle_idx: ModuleHandleIndex(0),
         identifiers: vec![self_module_name().to_owned()],
-        address_identifiers: vec![AccountAddress::default()],
+        address_identifiers: vec![AccountAddress::ZERO],
         constant_pool: vec![],
         function_defs: vec![],
         struct_defs: vec![],

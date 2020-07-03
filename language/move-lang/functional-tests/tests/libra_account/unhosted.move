@@ -2,29 +2,21 @@
 //! account: alice, 0Coin1, 0, unhosted
 
 //! new-transaction
-//! sender: blessed
-script {
-    use 0x0::Coin1;
-    use 0x0::LibraAccount;
-    fun main(account: &signer) {
-        LibraAccount::mint_to_address<Coin1::T>(account, {{bob}}, 10001);
-    }
-}
-// TODO: fix account limits
-// chec: ABORTED
-// chec: 9
-
-//! new-transaction
 //! sender: bob
 //! gas-currency: Coin1
 script {
-    use 0x0::LibraAccount;
-    use 0x0::Coin1;
-    fun main() {
-        LibraAccount::deposit(
+    use 0x1::LibraAccount;
+    use 0x1::Coin1::Coin1;
+    fun main(account: &signer) {
+        let with_cap = LibraAccount::extract_withdraw_capability(account);
+        LibraAccount::pay_from<Coin1>(
+            &with_cap,
             {{bob}},
-            LibraAccount::withdraw_from_sender<Coin1::T>(10001)
+            10001,
+            x"",
+            x""
         );
+        LibraAccount::restore_withdraw_capability(with_cap);
     }
 }
 // TODO: fix account limits

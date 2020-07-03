@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use bytecode_verifier::verifier::VerifiedModule;
+use compiled_stdlib::{stdlib_modules, StdLibOptions};
 use functional_tests::{
     compiler::{Compiler, ScriptOrModule},
     testsuite,
@@ -14,17 +15,19 @@ use ir_to_bytecode::{
 use libra_types::account_address::AccountAddress;
 use move_ir_types::ast;
 use std::path::Path;
-use stdlib::{stdlib_modules, StdLibOptions};
+use vm::CompiledModule;
 
 struct IRCompiler {
-    deps: Vec<VerifiedModule>,
+    deps: Vec<CompiledModule>,
 }
 
 impl IRCompiler {
     fn new(stdlib_modules: Vec<VerifiedModule>) -> Self {
-        IRCompiler {
-            deps: stdlib_modules,
-        }
+        let deps = stdlib_modules
+            .into_iter()
+            .map(|verified_module| verified_module.into_inner())
+            .collect();
+        IRCompiler { deps }
     }
 }
 
@@ -44,22 +47,20 @@ impl Compiler for IRCompiler {
             ast::ScriptOrModule::Module(parsed_module) => {
                 log(format!("{}", &parsed_module));
                 let module = compile_module(address, parsed_module, &self.deps)?.0;
-                let verified =
-                    VerifiedModule::bypass_verifier_DANGEROUS_FOR_TESTING_ONLY(module.clone());
-                self.deps.push(verified);
+                self.deps.push(module.clone());
                 ScriptOrModule::Module(module)
             }
         })
     }
 
-    fn use_staged_genesis(&self) -> bool {
+    fn use_compiled_genesis(&self) -> bool {
         true
     }
 }
 
 fn run_test(path: &Path) -> datatest_stable::Result<()> {
     testsuite::functional_tests(
-        IRCompiler::new(stdlib_modules(StdLibOptions::Fresh).to_vec()),
+        IRCompiler::new(stdlib_modules(StdLibOptions::Compiled).to_vec()),
         path,
     )
 }

@@ -4,7 +4,7 @@
 
 //! new-transaction
 script {
-use 0x0::LibraSystem;
+use 0x1::LibraSystem;
 fun main(account: &signer) {
     LibraSystem::initialize_validator_set(account);
 }
@@ -14,10 +14,10 @@ fun main(account: &signer) {
 
 //! new-transaction
 script {
-use 0x0::LibraSystem;
-fun main() {
-    LibraSystem::update_and_reconfigure();
-}
+    use 0x1::LibraSystem;
+    fun main(account: &signer) {
+        LibraSystem::update_and_reconfigure(account);
+    }
 }
 // check: ABORTED
 // check: 22
@@ -25,43 +25,45 @@ fun main() {
 //! new-transaction
 //! sender: bob
 script {
-use 0x0::ValidatorConfig;
-fun main() {
-    ValidatorConfig::set_operator(0x0);
-}
-}
-// check: EXECUTED
-
-//! new-transaction
-//! sender: bob
-script {
-use 0x0::ValidatorConfig;
-use 0x0::Transaction;
-fun main() {
-    ValidatorConfig::set_operator(Transaction::sender());
-}
+    use 0x1::ValidatorConfig;
+    fun main(account: &signer) {
+        ValidatorConfig::set_operator(account, 0x0);
+    }
 }
 // check: EXECUTED
 
 //! new-transaction
 //! sender: bob
 script {
-use 0x0::ValidatorConfig;
-// delegate to alice
-fun main() {
-    ValidatorConfig::set_operator({{alice}});
-    ValidatorConfig::remove_operator();
-}
+    use 0x1::Signer;
+    use 0x1::ValidatorConfig;
+    fun main(account: &signer) {
+        ValidatorConfig::set_operator(account, Signer::address_of(account))
+    }
 }
 // check: EXECUTED
 
 //! new-transaction
 //! sender: bob
 script {
-use 0x0::ValidatorConfig;
-fun main() {
-    ValidatorConfig::set_consensus_pubkey({{vivian}}, x"");
+    use 0x1::ValidatorConfig;
+    // delegate to alice
+    fun main(account: &signer) {
+        ValidatorConfig::set_operator(account, {{alice}});
+        ValidatorConfig::remove_operator(account);
+    }
 }
+// check: EXECUTED
+
+//! new-transaction
+//! sender: bob
+script {
+    use 0x1::ValidatorConfig;
+    fun main(account: &signer) {
+        ValidatorConfig::set_config(account, {{vivian}},
+                                    x"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+                                    x"", x"", x"", x"");
+    }
 }
 // check: ABORTED
 // check: 1101
@@ -69,10 +71,10 @@ fun main() {
 //! new-transaction
 //! sender: bob
 script {
-use 0x0::ValidatorConfig;
-fun main(account: &signer) {
-    ValidatorConfig::set_config(account, {{vivian}}, x"", x"", x"", x"", x"");
-}
+    use 0x1::ValidatorConfig;
+    fun main(account: &signer) {
+        ValidatorConfig::set_config(account, {{vivian}}, x"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", x"", x"", x"", x"");
+    }
 }
 // check: ABORTED
 // check: 1101

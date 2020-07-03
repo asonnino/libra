@@ -14,22 +14,43 @@ use libra_temppath::TempPath;
 #[allow(unused_imports)]
 use libra_types::{
     account_config::AccountResource, contract_event::ContractEvent, ledger_info::LedgerInfo,
-    proof::SparseMerkleLeafNode, vm_error::StatusCode,
+    proof::SparseMerkleLeafNode, vm_status::StatusCode,
 };
 use proptest::prelude::*;
-use std::{collections::HashMap, convert::TryFrom};
+use std::collections::HashMap;
 
 fn verify_epochs(db: &LibraDB, ledger_infos_with_sigs: &[LedgerInfoWithSignatures]) {
-    let (_, _, actual_epoch_change_lis, _) = db.update_to_latest_ledger(0, Vec::new()).unwrap();
+    const LIMIT: usize = 2;
+    let mut actual_epoch_change_lis = Vec::new();
+    let latest_epoch = ledger_infos_with_sigs
+        .last()
+        .unwrap()
+        .ledger_info()
+        .next_block_epoch();
+
+    let mut cursor = 0;
+    loop {
+        let (chunk, more) = db
+            .get_epoch_ending_ledger_infos_impl(cursor, latest_epoch, LIMIT)
+            .unwrap();
+        actual_epoch_change_lis.extend(chunk);
+        if more {
+            cursor = actual_epoch_change_lis
+                .last()
+                .unwrap()
+                .ledger_info()
+                .next_block_epoch();
+        } else {
+            break;
+        }
+    }
+
     let expected_epoch_change_lis: Vec<_> = ledger_infos_with_sigs
         .iter()
-        .filter(|info| info.ledger_info().next_epoch_state().is_some())
+        .filter(|info| info.ledger_info().ends_epoch())
         .cloned()
         .collect();
-    assert_eq!(
-        actual_epoch_change_lis.ledger_info_with_sigs,
-        expected_epoch_change_lis,
-    );
+    assert_eq!(actual_epoch_change_lis, expected_epoch_change_lis);
 }
 
 pub fn test_save_blocks_impl(input: Vec<(Vec<TransactionToCommit>, LedgerInfoWithSignatures)>) {
@@ -119,10 +140,10 @@ fn test_sync_transactions_impl(input: Vec<(Vec<TransactionToCommit>, LedgerInfoW
     }
 }
 
-fn get_events_by_query_path(
+fn get_events_by_event_key(
     db: &LibraDB,
     ledger_info: &LedgerInfo,
-    query_path: &AccessPath,
+    event_key: &EventKey,
     first_seq_num: u64,
     last_seq_num: u64,
     ascending: bool,
@@ -141,21 +162,10 @@ fn get_events_by_query_path(
 
     let mut ret = Vec::new();
     loop {
-        let (events_with_proof, proof_of_latest_event) = db.get_events_by_query_path(
-            query_path,
-            cursor,
-            ascending,
-            LIMIT,
-            ledger_info.version(),
-        )?;
-
-        let (expected_event_key_opt, _count) = proof_of_latest_event
-            .get_event_key_and_count_by_query_path(&query_path.path)
-            .unwrap();
+        let events_with_proof =
+            db.get_events_by_event_key(event_key, cursor, ascending, LIMIT, ledger_info.version())?;
 
         let num_events = events_with_proof.len() as u64;
-        proof_of_latest_event.verify(ledger_info, ledger_info.version(), query_path.address)?;
-
         if cursor == u64::max_value() {
             cursor = last_seq_num;
         }
@@ -169,8 +179,7 @@ fn get_events_by_query_path(
             .map(|(e, seq_num)| {
                 e.verify(
                     ledger_info,
-                    &expected_event_key_opt
-                        .expect("Event stream is nonempty, but event key doesn't exist"),
+                    &event_key,
                     seq_num,
                     e.transaction_version,
                     e.event_index,
@@ -221,9 +230,9 @@ fn get_events_by_query_path(
     Ok(ret)
 }
 
-fn verify_events_by_query_path(
+fn verify_events_by_event_key(
     db: &LibraDB,
-    events: Vec<(AccessPath, Vec<ContractEvent>)>,
+    events: Vec<(EventKey, Vec<ContractEvent>)>,
     ledger_info: &LedgerInfo,
     is_latest: bool,
 ) {
@@ -236,7 +245,7 @@ fn verify_events_by_query_path(
                 .sequence_number();
             let last_seq = events.last().expect("Shouldn't be empty").sequence_number();
 
-            let traversed = get_events_by_query_path(
+            let traversed = get_events_by_event_key(
                 db,
                 ledger_info,
                 &access_path,
@@ -248,7 +257,7 @@ fn verify_events_by_query_path(
             .unwrap();
             assert_eq!(events, traversed);
 
-            let rev_traversed = get_events_by_query_path(
+            let rev_traversed = get_events_by_event_key(
                 db,
                 ledger_info,
                 &access_path,
@@ -265,37 +274,19 @@ fn verify_events_by_query_path(
         .unwrap();
 }
 
-fn group_events_by_query_path(
+fn group_events_by_event_key(
     txns_to_commit: &[TransactionToCommit],
-) -> Vec<(AccessPath, Vec<ContractEvent>)> {
-    let mut event_key_to_query_path = HashMap::new();
-    for txn in txns_to_commit {
-        for (address, account_blob) in txn.account_states().iter() {
-            let account = AccountResource::try_from(account_blob).unwrap();
-            event_key_to_query_path.insert(
-                *account.sent_events().key(),
-                AccessPath::new_for_sent_event(*address),
-            );
-            event_key_to_query_path.insert(
-                *account.received_events().key(),
-                AccessPath::new_for_received_event(*address),
-            );
-        }
-    }
-    let mut query_path_to_events: HashMap<AccessPath, Vec<ContractEvent>> = HashMap::new();
+) -> Vec<(EventKey, Vec<ContractEvent>)> {
+    let mut event_key_to_events: HashMap<EventKey, Vec<ContractEvent>> = HashMap::new();
     for txn in txns_to_commit {
         for event in txn.events() {
-            let query_path = event_key_to_query_path
-                .get(event.key())
-                .expect("Unknown Event Key")
-                .clone();
-            query_path_to_events
-                .entry(query_path)
+            event_key_to_events
+                .entry(*event.key())
                 .or_default()
                 .push(event.clone());
         }
     }
-    query_path_to_events.into_iter().collect()
+    event_key_to_events.into_iter().collect()
 }
 
 fn verify_committed_transactions(
@@ -358,9 +349,9 @@ fn verify_committed_transactions(
 
     // Fetch and verify events.
     // TODO: verify events are saved to correct transaction version.
-    verify_events_by_query_path(
+    verify_events_by_event_key(
         db,
-        group_events_by_query_path(txns_to_commit),
+        group_events_by_event_key(txns_to_commit),
         ledger_info,
         is_latest,
     );
@@ -400,63 +391,7 @@ fn test_too_many_requested() {
     let tmp_dir = TempPath::new();
     let db = LibraDB::new_for_test(&tmp_dir);
 
-    assert!(db
-        .update_to_latest_ledger(
-            0,
-            vec![
-                RequestItem::GetTransactions {
-                    start_version: 0,
-                    limit: 100,
-                    fetch_events: false,
-                };
-                101
-            ]
-        )
-        .is_err());
     assert!(db.get_transactions(0, 1001 /* limit */, 0, true).is_err());
-    assert!(db
-        .get_events_by_query_path(
-            &AccessPath::new_for_sent_event(AccountAddress::random()),
-            0,
-            true,
-            1001, /* limit */
-            0
-        )
-        .is_err());
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1))]
-
-    #[test]
-    fn test_get_events_from_non_existent_account(
-        (genesis_txn_to_commit, ledger_info_with_sigs) in arb_mock_genesis(),
-        non_existent_address in any::<AccountAddress>(),
-    ) {
-        let tmp_dir = TempPath::new();
-        let db = LibraDB::new_for_test(&tmp_dir);
-
-        db.save_transactions(&[genesis_txn_to_commit], 0, Some(&ledger_info_with_sigs)).unwrap();
-        prop_assume!(
-            db.get_account_state_with_proof(non_existent_address, 0, 0).unwrap().blob.is_none()
-        );
-
-        let (events, account_state_with_proof) = db
-            .get_events_by_query_path(
-                &AccessPath::new_for_sent_event(non_existent_address),
-                0,
-                true,
-                100,
-                0,
-            )
-            .unwrap();
-
-        account_state_with_proof
-            .verify(ledger_info_with_sigs.ledger_info(), 0, non_existent_address)
-            .unwrap();
-        assert!(account_state_with_proof.blob.is_none());
-        assert!(events.is_empty());
-    }
 }
 
 #[test]
@@ -472,7 +407,7 @@ fn test_get_latest_tree_state() {
     );
 
     // unbootstrapped db with pre-genesis state
-    let address = AccountAddress::default();
+    let address = AccountAddress::ZERO;
     let blob = AccountStateBlob::from(vec![1]);
     db.db
         .put::<JellyfishMerkleNodeSchema>(

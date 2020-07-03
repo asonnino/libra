@@ -1,34 +1,36 @@
-address 0x0 {
+address 0x1 {
 
 module LibraVersion {
-    use 0x0::LibraConfig;
-    use 0x0::Signer;
-    use 0x0::Transaction;
+    use 0x1::CoreAddresses;
+    use 0x1::LibraConfig;
+    use 0x1::Signer;
 
-    struct T {
+    struct LibraVersion {
         major: u64,
     }
 
-    public fun initialize(account: &signer) {
-        Transaction::assert(Signer::address_of(account) == LibraConfig::default_config_address(), 1);
+    public fun initialize(
+        lr_account: &signer,
+    ) {
+        assert(Signer::address_of(lr_account) == CoreAddresses::LIBRA_ROOT_ADDRESS(), 1);
 
-        LibraConfig::publish_new_config<Self::T>(
-            account,
-            T { major: 1 },
+        LibraConfig::publish_new_config<LibraVersion>(
+            lr_account,
+            LibraVersion { major: 1 },
         );
     }
 
     public fun set(account: &signer, major: u64) {
-        let old_config = LibraConfig::get<Self::T>();
+        let old_config = LibraConfig::get<LibraVersion>();
 
-        Transaction::assert(
+        assert(
             old_config.major < major,
             25
         );
 
-        LibraConfig::set<Self::T>(
+        LibraConfig::set<LibraVersion>(
             account,
-            T { major }
+            LibraVersion { major }
         );
     }
 }

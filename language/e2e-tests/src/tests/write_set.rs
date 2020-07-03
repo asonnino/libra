@@ -3,23 +3,25 @@
 
 use crate::{
     account::{self, Account, AccountData},
-    common_transactions::peer_to_peer_txn,
+    common_transactions::rotate_key_txn,
     executor::FakeExecutor,
 };
+use libra_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
 use libra_types::{
     access_path::AccessPath,
     account_config::{lbr_type_tag, CORE_CODE_ADDRESS, LBR_NAME},
     contract_event::ContractEvent,
     on_chain_config::new_epoch_event_key,
-    transaction::{ChangeSet, TransactionPayload, TransactionStatus},
-    vm_error::{StatusCode, VMStatus},
+    transaction::{
+        authenticator::AuthenticationKey, ChangeSet, TransactionPayload, TransactionStatus,
+    },
+    vm_status::{StatusCode, VMStatus},
     write_set::{WriteOp, WriteSetMut},
 };
 use move_core_types::{
     identifier::Identifier,
     language_storage::{ResourceKey, StructTag},
 };
-use transaction_builder::encode_mint_lbr_to_address_script;
 
 #[test]
 fn invalid_write_set_sender() {
@@ -58,12 +60,8 @@ fn verify_and_execute_writeset() {
     let genesis_account = Account::new_association();
     executor.new_block();
 
-    let old_association_balance = executor
-        .read_balance_resource(&genesis_account, account::lbr_currency_code())
-        .expect("sender balance must exist");
-
     // (1) Create a WriteSet that adds an account on a new address
-    let new_account_data = AccountData::new(1000, 10);
+    let new_account_data = AccountData::new(0, 10);
     let write_set = new_account_data.to_writeset();
 
     let writeset_txn = genesis_account.create_signed_txn_impl(
@@ -71,7 +69,7 @@ fn verify_and_execute_writeset() {
         TransactionPayload::WriteSet(ChangeSet::new(write_set.clone(), vec![])),
         1,
         100_000,
-        1,
+        0,
         LBR_NAME.to_owned(),
     );
 
@@ -90,9 +88,6 @@ fn verify_and_execute_writeset() {
     let updated_association_account = executor
         .read_account_resource(&genesis_account)
         .expect("sender must exist");
-    let updated_association_balance = executor
-        .read_balance_resource(&genesis_account, account::lbr_currency_code())
-        .expect("sender balance must exist");
     let updated_sender = executor
         .read_account_resource(new_account_data.account())
         .expect("sender must exist");
@@ -100,12 +95,8 @@ fn verify_and_execute_writeset() {
         .read_balance_resource(new_account_data.account(), account::lbr_currency_code())
         .expect("sender balance must exist");
 
-    assert_eq!(
-        old_association_balance.coin(),
-        updated_association_balance.coin()
-    );
     assert_eq!(2, updated_association_account.sequence_number());
-    assert_eq!(1000, updated_sender_balance.coin());
+    assert_eq!(0, updated_sender_balance.coin());
     assert_eq!(10, updated_sender.sequence_number());
 
     // (2) Cannot reapply the same writeset.
@@ -189,7 +180,7 @@ fn bad_writesets() {
         StructTag {
             address: CORE_CODE_ADDRESS,
             module: Identifier::new("LibraWriteSetManager").unwrap(),
-            name: Identifier::new("T").unwrap(),
+            name: Identifier::new("LibraWriteSetManager").unwrap(),
             type_params: vec![],
         },
     );
@@ -219,7 +210,7 @@ fn bad_writesets() {
         StructTag {
             address: CORE_CODE_ADDRESS,
             module: Identifier::new("LibraAccount").unwrap(),
-            name: Identifier::new("T").unwrap(),
+            name: Identifier::new("LibraAccount").unwrap(),
             type_params: vec![],
         },
     );
@@ -249,29 +240,29 @@ fn transfer_and_execute_writeset() {
     // create a FakeExecutor with a genesis from file
     let mut executor = FakeExecutor::from_genesis_file();
     let genesis_account = Account::new_association();
+    let blessed_account = Account::new_blessed_tc();
     executor.new_block();
 
     let receiver = AccountData::new(100_000, 10);
     executor.add_account_data(&receiver);
 
     // (1) Association mint some coin
-    let mint_amount = 1_000_000;
+    let privkey = Ed25519PrivateKey::generate_for_testing();
+    let pubkey = privkey.public_key();
+    let new_key_hash = AuthenticationKey::ed25519(&pubkey).to_vec();
 
-    executor.execute_and_apply(genesis_account.signed_script_txn(
-        encode_mint_lbr_to_address_script(genesis_account.address(), vec![], mint_amount),
-        1,
-    ));
+    executor.execute_and_apply(rotate_key_txn(&blessed_account, new_key_hash, 0));
 
     // (2) Create a WriteSet that adds an account on a new address
-    let new_account_data = AccountData::new(1000, 10);
+    let new_account_data = AccountData::new(0, 10);
     let write_set = new_account_data.to_writeset();
 
     let writeset_txn = genesis_account.create_signed_txn_impl(
         *genesis_account.address(),
         TransactionPayload::WriteSet(ChangeSet::new(write_set, vec![])),
-        2,
+        1, // sequence number
         100_000,
-        1,
+        0, // gas unit price
         LBR_NAME.to_owned(),
     );
 
@@ -294,13 +285,15 @@ fn transfer_and_execute_writeset() {
         .read_balance_resource(new_account_data.account(), account::lbr_currency_code())
         .expect("sender balance must exist");
 
-    assert_eq!(3, updated_association_account.sequence_number());
-    assert_eq!(1000, updated_sender_balance.coin());
+    assert_eq!(2, updated_association_account.sequence_number());
+    assert_eq!(0, updated_sender_balance.coin());
     assert_eq!(10, updated_sender.sequence_number());
 
-    // (3) Create another transfer
-    let transfer_amount = 1_000;
-    let txn = peer_to_peer_txn(&genesis_account, receiver.account(), 3, transfer_amount);
+    // (3) Rotate the accounts key
+    let privkey = Ed25519PrivateKey::generate_for_testing();
+    let pubkey = privkey.public_key();
+    let new_key_hash = AuthenticationKey::ed25519(&pubkey).to_vec();
+    let txn = rotate_key_txn(new_account_data.account(), new_key_hash, 10);
 
     // execute transaction
     let output = executor.execute_transaction(txn);

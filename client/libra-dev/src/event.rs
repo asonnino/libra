@@ -177,7 +177,7 @@ fn test_libra_LibraEvent_from() {
     use libra_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
     use libra_types::{
         account_address::{self, AccountAddress},
-        account_config::{from_currency_code_string, SentPaymentEvent, LBR_NAME},
+        account_config::{self, from_currency_code_string, SentPaymentEvent, LBR_NAME},
         contract_event::ContractEvent,
         event::{EventHandle, EventKey},
     };
@@ -196,7 +196,7 @@ fn test_libra_LibraEvent_from() {
     let name = "SentPaymentEvent";
 
     let type_tag = Struct(StructTag {
-        address: AccountAddress::new([0; AccountAddress::LENGTH]),
+        address: account_config::CORE_CODE_ADDRESS,
         module: Identifier::new(module).unwrap(),
         name: Identifier::new(name).unwrap(),
         type_params: [].to_vec(),
@@ -213,17 +213,19 @@ fn test_libra_LibraEvent_from() {
 
     let event = ContractEvent::new(*event_key, sequence_number, type_tag, event_data_bytes);
 
-    let proto_txn = grpc_types::proto::types::Event::from(event);
+    let key = event.key().to_vec();
+    let type_tag = lcs::to_bytes(&event.type_tag()).expect("Failed to serialize.");
+    let event_data = event.event_data().to_vec();
 
     let mut libra_event: *mut LibraEvent = std::ptr::null_mut();
     let result = unsafe {
         libra_LibraEvent_from(
-            proto_txn.key.as_ptr(),
-            proto_txn.key.len(),
-            proto_txn.event_data.as_ptr(),
-            proto_txn.event_data.len(),
-            proto_txn.type_tag.as_ptr(),
-            proto_txn.type_tag.len(),
+            key.as_ptr(),
+            key.len(),
+            event_data.as_ptr(),
+            event_data.len(),
+            type_tag.as_ptr(),
+            type_tag.len(),
             &mut libra_event,
         )
     };

@@ -6,11 +6,10 @@ use anyhow::{ensure, format_err, Result};
 use executor::db_bootstrapper;
 use libra_config::{
     config::{
-        NodeConfig, OnDiskStorageConfig, RemoteService, SafetyRulesService, SecureBackend, Token,
-        VaultConfig, WaypointConfig,
+        DiscoveryMethod, NodeConfig, OnDiskStorageConfig, RemoteService, SafetyRulesService,
+        SecureBackend, Token, VaultConfig, WaypointConfig,
     },
     generator,
-    network_id::NetworkId,
 };
 use libra_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
 use libra_network_address::NetworkAddress;
@@ -78,7 +77,7 @@ impl ValidatorConfig {
             .validator_network
             .as_ref()
             .ok_or(Error::MissingValidatorNetwork)?;
-        let seed_peers = generator::build_seed_peers(&seed_config, self.bootstrap.clone());
+        let seed_addrs = generator::build_seed_addrs(&seed_config, self.bootstrap.clone());
 
         // Pull out this specific node from the generated validator configs.
         let mut config = configs.swap_remove(self.node_index);
@@ -87,10 +86,10 @@ impl ValidatorConfig {
             .validator_network
             .as_mut()
             .ok_or(Error::MissingValidatorNetwork)?;
-        validator_network.network_id = NetworkId::Validator;
         validator_network.listen_address = self.listen_address.clone();
-        validator_network.advertised_address = self.advertised_address.clone();
-        validator_network.seed_peers = seed_peers;
+        validator_network.discovery_method =
+            DiscoveryMethod::gossip(self.advertised_address.clone());
+        validator_network.seed_addrs = seed_addrs;
 
         self.build_safety_rules(&mut config)?;
 
@@ -155,7 +154,7 @@ impl ValidatorConfig {
                 .and_then(|config| config.publishing_option.clone()),
         );
 
-        let waypoint = if self.build_waypoint {
+        let (waypoint, maybe_waypoint) = if self.build_waypoint {
             let path = TempPath::new();
             let db_rw = DbReaderWriter::new(LibraDB::open(
                 &path, false, /* readonly */
@@ -163,14 +162,18 @@ impl ValidatorConfig {
             )?);
             let waypoint = db_bootstrapper::bootstrap_db_if_empty::<LibraVM>(&db_rw, &genesis)?
                 .ok_or_else(|| format_err!("Failed to bootstrap empty DB."))?;
-            WaypointConfig::FromConfig { waypoint }
+            (WaypointConfig::FromConfig(waypoint), Some(waypoint))
         } else {
-            WaypointConfig::None
+            (WaypointConfig::None, None)
         };
 
         let genesis = Some(genesis);
 
         for node in &mut nodes {
+            if let Some(test_config) = node.consensus.safety_rules.test.as_mut() {
+                test_config.waypoint = maybe_waypoint;
+            }
+
             node.base.waypoint = waypoint.clone();
             node.execution.genesis = genesis.clone();
         }
@@ -187,9 +190,11 @@ impl ValidatorConfig {
 
     fn build_safety_rules(&self, config: &mut NodeConfig) -> Result<()> {
         let safety_rules_config = &mut config.consensus.safety_rules;
+
         if let Some(server_address) = self.safety_rules_addr {
-            safety_rules_config.service =
-                SafetyRulesService::Process(RemoteService { server_address })
+            safety_rules_config.service = SafetyRulesService::Process(RemoteService {
+                server_address: server_address.into(),
+            })
         }
 
         if let Some(backend) = &self.safety_rules_backend {
@@ -204,7 +209,7 @@ impl ValidatorConfig {
                         .ok_or_else(|| Error::MissingSafetyRulesHost)?
                         .clone(),
                     ca_certificate: None,
-                    token: Token::new_config(
+                    token: Token::FromConfig(
                         self.safety_rules_token
                             .as_ref()
                             .ok_or_else(|| Error::MissingSafetyRulesToken)?
@@ -244,14 +249,17 @@ mod test {
         let config = validator_config.build().unwrap();
         let network = config.validator_network.as_ref().unwrap();
 
-        network.seed_peers.verify_libranet_addrs().unwrap();
-        let (seed_peer_id, seed_addrs) = network.seed_peers.seed_peers.iter().next().unwrap();
+        network.verify_seed_addrs().unwrap();
+        let (seed_peer_id, seed_addrs) = network.seed_addrs.iter().next().unwrap();
         assert_eq!(seed_addrs.len(), 1);
         assert_ne!(&network.peer_id(), seed_peer_id);
-        assert_ne!(&network.advertised_address, &seed_addrs[0]);
+        assert_ne!(
+            &network.discovery_method.advertised_address(),
+            &seed_addrs[0]
+        );
 
         assert_eq!(
-            network.advertised_address,
+            network.discovery_method.advertised_address(),
             NetworkAddress::from_str(DEFAULT_ADVERTISED_ADDRESS).unwrap()
         );
         assert_eq!(

@@ -17,7 +17,7 @@ use consensus_types::{
 };
 use futures::{channel::oneshot, stream::select, SinkExt, Stream, StreamExt, TryStreamExt};
 use libra_logger::prelude::*;
-use libra_security_logger::{security_log, SecurityEvent};
+use libra_metrics::monitor;
 use libra_types::{
     account_address::AccountAddress, epoch_change::EpochChangeProof,
     validator_verifier::ValidatorVerifier,
@@ -26,7 +26,7 @@ use network::protocols::{network::Event, rpc::error::RpcError};
 use std::{
     mem::{discriminant, Discriminant},
     num::NonZeroUsize,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 /// The block retrieval request is used internally for implementing RPC: the callback is executed
@@ -84,11 +84,11 @@ impl NetworkSender {
         timeout: Duration,
     ) -> anyhow::Result<BlockRetrievalResponse> {
         ensure!(from != self.author, "Retrieve block from self");
-        counters::BLOCK_RETRIEVAL_COUNT.inc_by(retrieval_request.num_blocks() as i64);
-        let pre_retrieval_instant = Instant::now();
         let msg = ConsensusMsg::BlockRetrievalRequest(Box::new(retrieval_request.clone()));
-        let response_msg = self.network_sender.send_rpc(from, msg, timeout).await?;
-        counters::BLOCK_RETRIEVAL_DURATION_S.observe_duration(pre_retrieval_instant.elapsed());
+        let response_msg = monitor!(
+            "block_retrieval",
+            self.network_sender.send_rpc(from, msg, timeout).await?
+        );
         let response = match response_msg {
             ConsensusMsg::BlockRetrievalResponse(resp) => *resp,
             _ => return Err(anyhow!("Invalid response to request")),
@@ -100,10 +100,9 @@ impl NetworkSender {
                 &self.validators,
             )
             .map_err(|e| {
-                security_log(SecurityEvent::InvalidRetrievedBlock)
-                    .error(&e)
-                    .data(&response)
-                    .log();
+                send_struct_log!(security_log(security_events::INVALID_RETRIEVED_BLOCK)
+                    .data("request_block_reponse", &response)
+                    .data("error", format!("{}", e)));
                 e
             })?;
 

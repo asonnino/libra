@@ -8,23 +8,33 @@ use crate::{
     data_store::{FakeDataStore, GENESIS_CHANGE_SET, GENESIS_CHANGE_SET_FRESH},
 };
 use bytecode_verifier::VerifiedModule;
+use compiled_stdlib::{stdlib_modules, transaction_scripts::StdlibScript, StdLibOptions};
 use libra_config::generator;
 use libra_crypto::HashValue;
 use libra_state_view::StateView;
 use libra_types::{
     access_path::AccessPath,
-    account_config::{AccountResource, BalanceResource},
+    account_config::{AccountResource, BalanceResource, CORE_CODE_ADDRESS},
     block_metadata::{new_block_event_key, BlockMetadata, NewBlockEvent},
     on_chain_config::{OnChainConfig, VMPublishingOption, ValidatorSet},
     transaction::{
         SignedTransaction, Transaction, TransactionOutput, TransactionStatus, VMValidatorResult,
     },
-    vm_error::{StatusCode, VMStatus},
+    vm_status::{StatusCode, VMStatus},
     write_set::WriteSet,
 };
-use libra_vm::{LibraVM, VMExecutor, VMValidator};
-use move_core_types::{identifier::Identifier, language_storage::ModuleId};
-use stdlib::{stdlib_modules, transaction_scripts::StdlibScript, StdLibOptions};
+use libra_vm::{data_cache::RemoteStorage, LibraVM, VMExecutor, VMValidator};
+use move_core_types::{
+    account_address::AccountAddress,
+    gas_schedule::{GasAlgebra, GasUnits},
+    identifier::Identifier,
+    language_storage::{ModuleId, TypeTag},
+};
+use move_vm_runtime::{data_cache::TransactionDataCache, move_vm::MoveVM};
+use move_vm_types::{
+    gas_schedule::{zero_cost_schedule, CostStrategy},
+    values::Value,
+};
 use vm::CompiledModule;
 use vm_genesis::GENESIS_KEYPAIR;
 
@@ -60,7 +70,7 @@ impl FakeExecutor {
 
     pub fn whitelist_genesis() -> Self {
         Self::custom_genesis(
-            stdlib_modules(StdLibOptions::Staged).to_vec(),
+            stdlib_modules(StdLibOptions::Compiled).to_vec(),
             None,
             VMPublishingOption::Locked(StdlibScript::whitelist()),
         )
@@ -75,7 +85,7 @@ impl FakeExecutor {
         }
 
         Self::custom_genesis(
-            stdlib_modules(StdLibOptions::Staged).to_vec(),
+            stdlib_modules(StdLibOptions::Compiled).to_vec(),
             None,
             publishing_options,
         )
@@ -144,7 +154,7 @@ impl FakeExecutor {
         let ap = account.make_account_access_path();
         let data_blob = StateView::get(&self.data_store, &ap)
             .expect("account must exist in data store")
-            .expect("data must exist in data store");
+            .unwrap_or_else(|| panic!("Can't fetch account resource for {}", account.address()));
         lcs::from_bytes(data_blob.as_slice()).ok()
     }
 
@@ -252,8 +262,53 @@ impl FakeExecutor {
             .expect("Failed to get the execution result for Block Prologue");
         // check if we emit the expected event, there might be more events for transaction fees
         let event = output.events()[0].clone();
-        assert!(event.key() == &new_block_event_key());
+        assert_eq!(event.key(), &new_block_event_key());
         assert!(lcs::from_bytes::<NewBlockEvent>(event.event_data()).is_ok());
         self.apply_write_set(output.write_set());
+    }
+
+    fn module(name: &str) -> ModuleId {
+        ModuleId::new(CORE_CODE_ADDRESS, Identifier::new(name).unwrap())
+    }
+
+    fn name(name: &str) -> Identifier {
+        Identifier::new(name).unwrap()
+    }
+
+    pub fn set_block_time(&mut self, new_block_time: u64) {
+        self.block_time = new_block_time;
+    }
+
+    pub fn get_block_time(&mut self) -> u64 {
+        self.block_time
+    }
+
+    pub fn exec(
+        &mut self,
+        module_name: &str,
+        function_name: &str,
+        type_params: Vec<TypeTag>,
+        args: Vec<Value>,
+        sender: &AccountAddress,
+    ) {
+        let write_set = {
+            let cost_table = zero_cost_schedule();
+            let mut cost_strategy = CostStrategy::system(&cost_table, GasUnits::new(100_000_000));
+            let vm = MoveVM::new();
+            let remote_view = RemoteStorage::new(&self.data_store);
+            let mut cache = TransactionDataCache::new(&remote_view);
+            vm.execute_function(
+                &Self::module(module_name),
+                &Self::name(function_name),
+                type_params,
+                args,
+                *sender,
+                &mut cache,
+                &mut cost_strategy,
+            )
+            .unwrap_or_else(|e| panic!("Error calling {}.{}: {}", module_name, function_name, e));
+            cache.make_write_set().expect("Failed to generate writeset")
+        };
+        self.data_store.add_write_set(&write_set);
     }
 }

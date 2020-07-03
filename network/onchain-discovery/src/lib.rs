@@ -58,6 +58,7 @@ use tokio::task;
 #[cfg(test)]
 mod test;
 
+pub mod builder;
 pub mod client;
 pub mod network_interface;
 pub mod service;

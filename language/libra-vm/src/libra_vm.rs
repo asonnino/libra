@@ -15,7 +15,7 @@ use libra_state_view::StateView;
 use libra_types::{
     access_path::AccessPath,
     account_address::AccountAddress,
-    account_config,
+    account_config::{self, RoleId},
     block_metadata::BlockMetadata,
     on_chain_config::{LibraVersion, OnChainConfig, VMConfig},
     transaction::{
@@ -23,14 +23,16 @@ use libra_types::{
         TransactionArgument, TransactionOutput, TransactionPayload, TransactionStatus,
         VMValidatorResult,
     },
-    vm_error::{sub_status, StatusCode, VMStatus},
+    vm_status::{sub_status, StatusCode, VMStatus},
     write_set::{WriteSet, WriteSetMut},
 };
 use move_core_types::{
     gas_schedule::{AbstractMemorySize, CostTable, GasAlgebra, GasCarrier, GasUnits},
     identifier::IdentStr,
     language_storage::{ResourceKey, StructTag, TypeTag},
+    move_resource::MoveResource,
 };
+
 use move_vm_runtime::{
     data_cache::{RemoteCache, TransactionDataCache},
     move_vm::MoveVM,
@@ -42,6 +44,10 @@ use move_vm_types::{
 use rayon::prelude::*;
 use std::{collections::HashSet, convert::TryFrom, sync::Arc};
 use vm::errors::{convert_prologue_runtime_error, VMResult};
+
+/// Any transation sent from an account with a role id below this cutoff will be priorited over
+/// other transactions.
+const PRIORITIZED_TRANSACTION_ROLE_CUTOFF: u64 = 5;
 
 #[derive(Clone)]
 /// A wrapper to make VMRuntime standalone and thread safe.
@@ -252,9 +258,11 @@ impl LibraVM {
     ) -> VMResult<VerifiedTransactionPayload> {
         let mut cost_strategy = CostStrategy::system(self.get_gas_schedule()?, GasUnits::new(0));
         let mut data_store = TransactionDataCache::new(remote_cache);
-        if !&self.on_chain_config()?.publishing_option.is_open() {
+        if !&self.on_chain_config()?.publishing_option.is_open()
+            && !can_publish_modules(txn_data.sender(), remote_cache)
+        {
             warn!("[VM] Custom modules not allowed");
-            return Err(VMStatus::new(StatusCode::UNKNOWN_MODULE));
+            return Err(VMStatus::new(StatusCode::INVALID_MODULE_PUBLISHER));
         };
         self.run_prologue(
             &mut data_store,
@@ -285,7 +293,6 @@ impl LibraVM {
         self.check_gas(transaction)?;
         let txn_data = TransactionMetadata::new(transaction);
         match transaction.payload() {
-            TransactionPayload::Program => Err(VMStatus::new(StatusCode::UNKNOWN_SCRIPT)),
             TransactionPayload::Script(script) => {
                 self.verify_script(remote_cache, script, txn_data, account_currency_symbol)
             }
@@ -304,7 +311,6 @@ impl LibraVM {
     ) -> VMResult<()> {
         let txn_data = TransactionMetadata::new(transaction);
         match transaction.payload() {
-            TransactionPayload::Program => Err(VMStatus::new(StatusCode::UNKNOWN_SCRIPT)),
             TransactionPayload::Script(script) => {
                 self.check_gas(transaction)?;
                 self.verify_script(remote_cache, script, txn_data, account_currency_symbol)?;
@@ -338,8 +344,22 @@ impl LibraVM {
             VerifiedTransactionPayload::Module(m) => cost_strategy
                 .charge_intrinsic_gas(txn_data.transaction_size())
                 .and_then(|_| {
-                    self.move_vm
-                        .publish_module(m, txn_data.sender(), &mut data_store)
+                    // Module publishing is currently restricted to the Association, so we choose to
+                    // publish all modules under the address 0x0...1 for convenience.
+                    // This will change to the sender's address once module publishing becomes open.
+                    // REVIEW: should we check that the address of the Module is in fact
+                    // `CORE_CODE_ADDRESS`?
+                    let module_address = if self.on_chain_config()?.publishing_option.is_open() {
+                        txn_data.sender()
+                    } else {
+                        account_config::CORE_CODE_ADDRESS
+                    };
+                    self.move_vm.publish_module(
+                        m,
+                        module_address,
+                        &mut data_store,
+                        &mut cost_strategy,
+                    )
                 }),
             VerifiedTransactionPayload::Script(s, ty_args, args) => {
                 let ret = cost_strategy
@@ -369,7 +389,7 @@ impl LibraVM {
         .and_then(|_| {
             failed_gas_left = cost_strategy.remaining_gas();
             let mut cost_strategy = CostStrategy::system(gas_schedule, failed_gas_left);
-            self.run_epilogue(
+            self.run_success_epilogue(
                 &mut data_store,
                 &mut cost_strategy,
                 txn_data,
@@ -411,7 +431,7 @@ impl LibraVM {
         let mut data_store = TransactionDataCache::new(remote_cache);
         match TransactionStatus::from(error_code) {
             TransactionStatus::Keep(status) => self
-                .run_epilogue(
+                .run_failure_epilogue(
                     &mut data_store,
                     &mut cost_strategy,
                     txn_data,
@@ -501,7 +521,7 @@ impl LibraVM {
         //    might be useful here.
         // 3. We set the max gas to a big number just to get rid of the potential out of gas error.
         let mut txn_data = TransactionMetadata::default();
-        txn_data.sender = account_config::CORE_CODE_ADDRESS;
+        txn_data.sender = account_config::reserved_vm_address();
         txn_data.max_gas_amount = GasUnits::new(std::u64::MAX);
 
         let gas_schedule = zero_cost_schedule();
@@ -522,7 +542,7 @@ impl LibraVM {
                 &BLOCK_PROLOGUE,
                 vec![],
                 args,
-                txn_data.sender(),
+                txn_data.sender,
                 &mut data_store,
                 &mut cost_strategy,
             )?
@@ -678,13 +698,14 @@ impl LibraVM {
                 &PROLOGUE_NAME,
                 vec![gas_currency_ty],
                 vec![
+                    Value::transaction_argument_signer_reference(txn_data.sender),
                     Value::u64(txn_sequence_number),
                     Value::vector_u8(txn_public_key),
                     Value::u64(txn_gas_price),
                     Value::u64(txn_max_gas_units),
                     Value::u64(txn_expiration_time),
                 ],
-                txn_data.sender(),
+                txn_data.sender,
                 data_store,
                 cost_strategy,
             )
@@ -693,7 +714,7 @@ impl LibraVM {
 
     /// Run the epilogue of a transaction by calling into `EPILOGUE_NAME` function stored
     /// in the `ACCOUNT_MODULE` on chain.
-    fn run_epilogue(
+    fn run_success_epilogue(
         &self,
         data_store: &mut TransactionDataCache,
         cost_strategy: &mut CostStrategy,
@@ -709,15 +730,49 @@ impl LibraVM {
         let _timer = TXN_EPILOGUE_SECONDS.start_timer();
         self.move_vm.execute_function(
             &account_config::ACCOUNT_MODULE,
-            &EPILOGUE_NAME,
+            &SUCCESS_EPILOGUE_NAME,
             vec![gas_currency_ty],
             vec![
+                Value::transaction_argument_signer_reference(txn_data.sender),
                 Value::u64(txn_sequence_number),
                 Value::u64(txn_gas_price),
                 Value::u64(txn_max_gas_units),
                 Value::u64(gas_remaining),
             ],
-            txn_data.sender(),
+            txn_data.sender,
+            data_store,
+            cost_strategy,
+        )
+    }
+
+    /// Run the failure epilogue of a transaction by calling into `FAILURE_EPILOGUE_NAME` function
+    /// stored in the `ACCOUNT_MODULE` on chain.
+    fn run_failure_epilogue(
+        &self,
+        data_store: &mut TransactionDataCache,
+        cost_strategy: &mut CostStrategy,
+        txn_data: &TransactionMetadata,
+        account_currency_symbol: &IdentStr,
+    ) -> VMResult<()> {
+        let gas_currency_ty =
+            account_config::type_tag_for_currency_code(account_currency_symbol.to_owned());
+        let txn_sequence_number = txn_data.sequence_number();
+        let txn_gas_price = txn_data.gas_unit_price().get();
+        let txn_max_gas_units = txn_data.max_gas_amount().get();
+        let gas_remaining = cost_strategy.remaining_gas().get();
+        let _timer = TXN_EPILOGUE_SECONDS.start_timer();
+        self.move_vm.execute_function(
+            &account_config::ACCOUNT_MODULE,
+            &FAILURE_EPILOGUE_NAME,
+            vec![gas_currency_ty],
+            vec![
+                Value::transaction_argument_signer_reference(txn_data.sender),
+                Value::u64(txn_sequence_number),
+                Value::u64(txn_gas_price),
+                Value::u64(txn_max_gas_units),
+                Value::u64(gas_remaining),
+            ],
+            txn_data.sender,
             data_store,
             cost_strategy,
         )
@@ -745,14 +800,14 @@ impl LibraVM {
                     Value::u64(txn_sequence_number),
                     Value::vector_u8(txn_public_key),
                 ],
-                txn_data.sender(),
+                txn_data.sender,
                 data_store,
                 &mut cost_strategy,
             )
             .map_err(|err| convert_prologue_runtime_error(&err, &txn_data.sender))
     }
 
-    /// Run the epilogue of a transaction by calling into `EPILOGUE_NAME` function stored
+    /// Run the epilogue of a transaction by calling into `WRITESET_EPILOGUE_NAME` function stored
     /// in the `WRITESET_MODULE` on chain.
     fn run_writeset_epilogue(
         &self,
@@ -768,10 +823,13 @@ impl LibraVM {
         let _timer = TXN_EPILOGUE_SECONDS.start_timer();
         self.move_vm.execute_function(
             &LIBRA_WRITESET_MANAGER_MODULE,
-            &EPILOGUE_NAME,
+            &WRITESET_EPILOGUE_NAME,
             vec![],
-            vec![Value::vector_u8(change_set_bytes)],
-            txn_data.sender(),
+            vec![
+                Value::transaction_argument_signer_reference(txn_data.sender),
+                Value::vector_u8(change_set_bytes),
+            ],
+            txn_data.sender,
             data_store,
             &mut cost_strategy,
         )
@@ -927,7 +985,7 @@ impl VMValidator for LibraVM {
             );
         };
 
-        let is_governance_txn = is_governance_txn(txn_sender, &data_cache);
+        let is_prioritized_txn = is_prioritized_txn(txn_sender, &data_cache);
         let normalized_gas_price = match normalize_gas_price(gas_price, &currency_code, &data_cache)
         {
             Ok(price) => price,
@@ -961,7 +1019,7 @@ impl VMValidator for LibraVM {
             .with_label_values(&[counter_label])
             .inc();
 
-        VMValidatorResult::new(res, normalized_gas_price, is_governance_txn)
+        VMValidatorResult::new(res, normalized_gas_price, is_prioritized_txn)
     }
 }
 
@@ -1017,15 +1075,23 @@ impl<'a> LibraVMInternals<'a> {
     }
 }
 
-fn is_governance_txn(sender: AccountAddress, remote_cache: &dyn RemoteCache) -> bool {
-    let association_capability_path =
-        create_access_path(sender, association_capability_struct_tag());
-    if let Ok(Some(blob)) = remote_cache.get(&association_capability_path) {
-        return lcs::from_bytes::<account_config::AssociationCapabilityResource>(&blob)
-            .map(|x| x.is_certified())
+fn is_prioritized_txn(sender: AccountAddress, remote_cache: &dyn RemoteCache) -> bool {
+    let role_access_path = create_access_path(sender, RoleId::struct_tag());
+    if let Ok(Some(blob)) = remote_cache.get(&role_access_path) {
+        return lcs::from_bytes::<account_config::RoleId>(&blob)
+            .map(|role_id| role_id.role_id() < PRIORITIZED_TRANSACTION_ROLE_CUTOFF)
             .unwrap_or(false);
     }
     false
+}
+
+fn can_publish_modules(sender: AccountAddress, remote_cache: &dyn RemoteCache) -> bool {
+    let module_publishing_priv_path =
+        create_access_path(sender, module_publishing_capability_struct_tag());
+    match remote_cache.get(&module_publishing_priv_path) {
+        Ok(Some(_)) => true,
+        _ => false,
+    }
 }
 
 fn normalize_gas_price(

@@ -8,13 +8,13 @@
 // check: EXECUTED
 
 //! new-transaction
-//! sender: alice
+//! sender: association
 script{
-    use 0x0::LibraSystem;
-    fun main() {
-        LibraSystem::remove_validator({{alice}});
-        0x0::Transaction::assert(!LibraSystem::is_validator({{alice}}), 77);
-        0x0::Transaction::assert(LibraSystem::is_validator({{bob}}), 78);
+    use 0x1::LibraSystem;
+    fun main(account: &signer) {
+        LibraSystem::remove_validator(account, {{alice}});
+        assert(!LibraSystem::is_validator({{alice}}), 77);
+        assert(LibraSystem::is_validator({{bob}}), 78);
     }
 }
 // check: NewEpochEvent
@@ -27,11 +27,12 @@ script{
 // check: EXECUTED
 
 //! new-transaction
-//! sender: alice
+//! sender: bob
+// bob cannot remove itself, only the association can remove validators from the set
 script{
-    use 0x0::LibraSystem;
-    fun main() {
-        LibraSystem::remove_validator({{bob}});
+    use 0x1::LibraSystem;
+    fun main(account: &signer) {
+        LibraSystem::remove_validator(account, {{bob}});
     }
 }
 // check: ABORTED
@@ -43,14 +44,14 @@ script{
 // check: EXECUTED
 
 //! new-transaction
-//! sender: alice
+//! sender: association
 script{
-    use 0x0::LibraSystem;
-    fun main() {
-        LibraSystem::add_validator({{alice}});
+    use 0x1::LibraSystem;
+    fun main(account: &signer) {
+        LibraSystem::add_validator(account, {{alice}});
 
-        0x0::Transaction::assert(LibraSystem::is_validator({{alice}}), 77);
-        0x0::Transaction::assert(LibraSystem::is_validator({{bob}}), 78);
+        assert(LibraSystem::is_validator({{alice}}), 77);
+        assert(LibraSystem::is_validator({{bob}}), 78);
     }
 }
 // check: NewEpochEvent

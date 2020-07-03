@@ -23,9 +23,8 @@ use futures::{
     stream::{select_all, FuturesUnordered},
     StreamExt,
 };
-use libra_config::config::{NodeConfig, PeerNetworkId, UpstreamNetworkId};
+use libra_config::{config::PeerNetworkId, network_id::NetworkId};
 use libra_logger::prelude::*;
-use libra_security_logger::{security_log, SecurityEvent};
 use libra_types::{on_chain_config::OnChainConfigPayload, transaction::SignedTransaction};
 use std::{
     ops::Deref,
@@ -39,7 +38,7 @@ use vm_validator::vm_validator::TransactionValidation;
 pub(crate) async fn coordinator<V>(
     mut smp: SharedMempool<V>,
     executor: Handle,
-    network_events: Vec<(UpstreamNetworkId, MempoolNetworkEvents)>,
+    network_events: Vec<(NetworkId, MempoolNetworkEvents)>,
     mut client_events: mpsc::Receiver<(
         SignedTransaction,
         oneshot::Sender<Result<SubmissionStatus>>,
@@ -47,16 +46,14 @@ pub(crate) async fn coordinator<V>(
     mut consensus_requests: mpsc::Receiver<ConsensusRequest>,
     mut state_sync_requests: mpsc::Receiver<CommitNotification>,
     mut mempool_reconfig_events: libra_channel::Receiver<(), OnChainConfigPayload>,
-    node_config: NodeConfig,
 ) where
     V: TransactionValidation,
 {
     let smp_events: Vec<_> = network_events
         .into_iter()
-        .map(|(network_id, events)| events.map(move |e| (network_id, e)))
+        .map(|(network_id, events)| events.map(move |e| (network_id.clone(), e)))
         .collect();
     let mut events = select_all(smp_events).fuse();
-    let is_validator = node_config.base.role.is_validator();
     let mempool = smp.mempool.clone();
     let peer_manager = smp.peer_manager.clone();
     let subscribers = &mut smp.subscribers.clone();
@@ -90,8 +87,8 @@ pub(crate) async fn coordinator<V>(
                 .spawn(tasks::process_config_update(config_update, smp.validator.clone()))
                 .await;
             },
-            peer = scheduled_broadcasts.select_next_some() => {
-                tasks::execute_broadcast(peer, &mut smp, &mut scheduled_broadcasts, executor.clone());
+            (peer, backoff) = scheduled_broadcasts.select_next_some() => {
+                tasks::execute_broadcast(peer, backoff, &mut smp, &mut scheduled_broadcasts, executor.clone());
             },
             (network_id, event) = events.select_next_some() => {
                 match event {
@@ -102,10 +99,10 @@ pub(crate) async fn coordinator<V>(
                                     .with_label_values(&["new_peer".to_string().deref()])
                                     .inc();
                                 let peer = PeerNetworkId(network_id, peer_id);
-                                let is_new_peer = peer_manager.add_peer(peer);
+                                let is_new_peer = peer_manager.add_peer(peer.clone());
                                 notify_subscribers(SharedMempoolNotification::PeerStateChange, &subscribers);
-                                if is_new_peer && peer_manager.is_upstream_peer(peer) {
-                                    tasks::execute_broadcast(peer, &mut smp, &mut scheduled_broadcasts, executor.clone());
+                                if is_new_peer && peer_manager.is_upstream_peer(&peer) {
+                                    tasks::execute_broadcast(peer, false, &mut smp, &mut scheduled_broadcasts, executor.clone());
                                 }
                             }
                             Event::LostPeer(peer_id) => {
@@ -127,7 +124,7 @@ pub(crate) async fn coordinator<V>(
                                         let smp_clone = smp.clone();
                                         let peer = PeerNetworkId(network_id, peer_id);
                                         let timeline_state = match peer_manager
-                                            .is_upstream_peer(peer)
+                                            .is_upstream_peer(&peer)
                                         {
                                             true => TimelineState::NonQualified,
                                             false => TimelineState::NotReady,
@@ -142,25 +139,31 @@ pub(crate) async fn coordinator<V>(
                                             ))
                                             .await;
                                     }
-                                    MempoolSyncMsg::BroadcastTransactionsResponse{request_id} => {
-                                        tasks::process_broadcast_ack(&mempool, request_id, is_validator);
+                                    MempoolSyncMsg::BroadcastTransactionsResponse{request_id, retry_txns, backoff} => {
+                                        peer_manager.process_broadcast_ack(PeerNetworkId(network_id.clone(), peer_id), request_id, retry_txns, backoff);
                                         notify_subscribers(SharedMempoolNotification::ACK, &smp.subscribers);
                                     }
                                 };
                             }
-                            _ => {
-                                security_log(SecurityEvent::InvalidNetworkEventMP)
-                                    .error("UnexpectedNetworkEvent")
-                                    .data(&network_event)
-                                    .log();
-                                debug_assert!(false, "Unexpected network event");
+                            Event::RpcRequest((peer_id, msg, res_tx)) => {
+                                send_struct_log!(security_log(security_events::INVALID_NETWORK_EVENT_MP)
+                                    .data("message", &msg)
+                                    .data("peer_id", &peer_id)
+                                );
+                                debug_assert!(false, "Unexpected network event rpc request");
+                            }
+                            Event::Message(message) => {
+                                send_struct_log!(security_log(security_events::INVALID_NETWORK_EVENT_MP)
+                                    .data("event_msg", &message)
+                            );
+                                debug_assert!(false, "Unexpected network event message");
                             }
                         }
                     },
                     Err(e) => {
-                        security_log(SecurityEvent::InvalidNetworkEventMP)
-                            .error(&e)
-                            .log();
+                        send_struct_log!(security_log(security_events::INVALID_NETWORK_EVENT_MP)
+                            .data("error", format!("{}", e))
+                    );
                     }
                 };
             },

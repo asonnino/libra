@@ -26,7 +26,10 @@ use spec_lang::{
     ast::{Condition, ConditionKind, Exp, LocalVarDecl, Operation, Value},
     code_writer::CodeWriter,
     emit, emitln,
-    env::{GlobalEnv, SpecVarId},
+    env::{
+        ConditionInfo, GlobalEnv, SpecVarId, ABORTS_IF_IS_PARTIAL_PRAGMA,
+        ABORTS_IF_IS_STRICT_PRAGMA, REQUIRES_IF_ABORTS,
+    },
     symbol::Symbol,
     ty::TypeDisplayContext,
 };
@@ -34,6 +37,12 @@ use stackless_bytecode_generator::{
     function_target::FunctionTarget, stackless_bytecode::SpecBlockId,
 };
 use std::collections::BTreeSet;
+
+const REQUIRES_FAILS_MESSAGE: &str = "precondition does not hold at this call";
+const ENSURES_FAILS_MESSAGE: &str = "post-condition does not hold";
+const ABORTS_IF_FAILS_MESSAGE: &str = "function does not abort under this condition";
+const SUCCEEDS_IF_FAILS_MESSAGE: &str = "function does not succeed under this condition";
+const INVARIANT_FAILS_MESSAGE: &str = "data invariant does not hold";
 
 pub enum SpecEnv<'env> {
     Module(ModuleEnv<'env>),
@@ -346,7 +355,7 @@ impl<'env> SpecTranslator<'env> {
     }
 
     /// Generates boogie for pre/post conditions.
-    pub fn translate_conditions(&self) {
+    pub fn translate_conditions(&self, free_ensures: bool) {
         // Generate pre-conditions
         // For this transaction to be executed, it MUST have had
         // a valid signature for the sender's account. Therefore,
@@ -355,7 +364,11 @@ impl<'env> SpecTranslator<'env> {
         // exists in pre-condition.
         let func_target = self.function_target();
         let spec = func_target.get_spec();
+        let ensures_mod = if free_ensures { "free " } else { "" };
         emitln!(self.writer, "requires $ExistsTxnSenderAccount($m, $txn);");
+
+        // Get all aborts_if conditions.
+        let aborts_if = spec.filter_kind(ConditionKind::AbortsIf).collect_vec();
 
         // Generate requires.
         let requires = spec
@@ -367,42 +380,80 @@ impl<'env> SpecTranslator<'env> {
             })
             .collect_vec();
         if !requires.is_empty() {
+            // Each requires condition is or-ed with the aborts condition (unless pragma
+            // `requires_if_aborts` is true). That is, the requires only needs to hold if the
+            // function does not abort.
             self.translate_seq(requires.iter(), "\n", |cond| {
                 self.writer.set_location(&cond.loc);
+                self.set_condition_info(&cond.loc, REQUIRES_FAILS_MESSAGE, true);
                 emit!(self.writer, "requires b#$Boolean(");
                 self.translate_exp(&cond.exp);
-                emit!(self.writer, ");")
+                emit!(self.writer, ")");
+                if !func_target.is_pragma_true(REQUIRES_IF_ABORTS, || false) {
+                    for aborts in &aborts_if {
+                        emit!(self.writer, "\n    || b#$Boolean(");
+                        self.translate_exp(&aborts.exp);
+                        emit!(self.writer, ")")
+                    }
+                }
+                emit!(self.writer, ";")
             });
             emitln!(self.writer);
         }
 
         // Generate aborts_if. Logically, if we have abort conditions P1..Pn, we have
         // (P1 || .. || Pn) <==> abort_flag. However, we generate different code to get
-        // better error positions.
-        let aborts_if = spec.filter_kind(ConditionKind::AbortsIf).collect_vec();
-        if !aborts_if.is_empty() {
+        // better error positions. We also need to respect the pragma `aborts_if_is_partial`
+        // which changes the iff above into an implies.
+        let aborts_if_is_partial =
+            func_target.is_pragma_true(ABORTS_IF_IS_PARTIAL_PRAGMA, || false);
+        if aborts_if.is_empty() {
+            if !aborts_if_is_partial
+                && func_target.is_pragma_true(ABORTS_IF_IS_STRICT_PRAGMA, || false)
+            {
+                // No user provided aborts_if and pragma is set for handling this
+                // as s.t. the function must never abort.
+                self.writer.set_location(&func_target.get_loc());
+                emitln!(self.writer, "{}ensures !$abort_flag;", ensures_mod);
+            }
+        } else {
             // Emit `ensures P1 ==> abort_flag; ... ensures PN ==> abort_flag;`. This gives us
             // good error positions which Pi is expected to cause failure but doesn't. (Boogie
             // reports positions only back per entire ensures, not individual sub-expression.)
             for c in &aborts_if {
                 self.writer.set_location(&c.loc);
-                emit!(self.writer, "ensures b#$Boolean(old(");
+                self.set_condition_info(&c.loc, ABORTS_IF_FAILS_MESSAGE, false);
+                emit!(self.writer, "{}ensures b#$Boolean(old(", ensures_mod);
                 self.translate_exp(&c.exp);
                 emitln!(self.writer, ")) ==> $abort_flag;")
             }
 
-            // Emit `ensures abort_flag => (P1 || .. || Pn)`. If the error
+            // If aborts_if is configured to be total,
+            // emit `ensures abort_flag => (P1 || .. || Pn)`. If the error
             // is reported on this condition, we catch the case where the function aborts but no
             // conditions covers it. We use as a position for the ensures the function itself,
             // because reporting on (non-covering) aborts_if conditions is misleading.
-            self.writer.set_location(&func_target.get_loc());
-            emit!(self.writer, "ensures $abort_flag ==> (");
-            self.translate_seq(aborts_if.iter(), "\n    || ", |c| {
-                emit!(self.writer, "b#$Boolean(old(");
-                self.translate_exp_parenthesised(&c.exp);
-                emit!(self.writer, "))")
-            });
-            emitln!(self.writer, ");");
+            if !aborts_if_is_partial {
+                self.writer.set_location(&func_target.get_loc());
+                emit!(self.writer, "{}ensures $abort_flag ==> (", ensures_mod);
+                self.translate_seq(aborts_if.iter(), "\n    || ", |c| {
+                    emit!(self.writer, "b#$Boolean(old(");
+                    self.translate_exp_parenthesised(&c.exp);
+                    emit!(self.writer, "))")
+                });
+                emitln!(self.writer, ");");
+            }
+        }
+
+        // Generate succeeds_if.
+        // Emits `ensures S1 ==> !abort_flag; ... ensures Sn ==> !abort_flag;`.
+        let succeeds_if = spec.filter_kind(ConditionKind::SucceedsIf).collect_vec();
+        for c in succeeds_if {
+            self.writer.set_location(&c.loc);
+            self.set_condition_info(&c.loc, SUCCEEDS_IF_FAILS_MESSAGE, false);
+            emit!(self.writer, "{}ensures b#$Boolean(old(", ensures_mod);
+            self.translate_exp(&c.exp);
+            emitln!(self.writer, ")) ==> !$abort_flag;")
         }
 
         // Generate ensures
@@ -411,13 +462,44 @@ impl<'env> SpecTranslator<'env> {
             *self.in_ensures.borrow_mut() = true;
             self.translate_seq(ensures.iter(), "\n", |cond| {
                 self.writer.set_location(&cond.loc);
-                emit!(self.writer, "ensures !$abort_flag ==> (b#$Boolean(");
+                self.set_condition_info(&cond.loc, ENSURES_FAILS_MESSAGE, false);
+                emit!(
+                    self.writer,
+                    "{}ensures !$abort_flag ==> (b#$Boolean(",
+                    ensures_mod
+                );
                 self.translate_exp(&cond.exp);
                 emit!(self.writer, "));")
             });
             *self.in_ensures.borrow_mut() = false;
             emitln!(self.writer);
         }
+    }
+
+    /// Sets info for verification condition so it can be later retrieved by the boogie wrapper.
+    /// If info is already set, it will not be overridden.
+    fn set_condition_info(&self, loc: &Loc, message: &str, is_requires: bool) {
+        let env = self.module_env().env;
+        let mut info = if let Some(info) = env.get_condition_info(loc) {
+            if is_requires {
+                if info.message_if_requires.is_some() {
+                    // already set
+                    return;
+                }
+            } else if !info.message.is_empty() {
+                // already set
+                return;
+            }
+            info
+        } else {
+            ConditionInfo::default()
+        };
+        if is_requires {
+            info.message_if_requires = Some(message.to_string());
+        } else {
+            info.message = message.to_string();
+        }
+        self.module_env().env.set_condition_info(loc.clone(), info);
     }
 
     /// Assumes preconditions for function. This is used for the top-level verification
@@ -790,6 +872,7 @@ impl<'env> SpecTranslator<'env> {
                 if assume {
                     emit!(self.writer, "assume b#$Boolean(");
                 } else {
+                    self.set_condition_info(&inv.loc, INVARIANT_FAILS_MESSAGE, false);
                     emit!(self.writer, "assert b#$Boolean(");
                 }
                 self.with_invariant_target(target, old_target, || self.translate_exp(&inv.exp));
@@ -982,22 +1065,31 @@ impl<'env> SpecTranslator<'env> {
             || {
                 let mut ty = &self.module_env().get_node_type(node_id);
                 let mut var_name = self.module_env().symbol_pool().string(name);
-                // overwrite ty if func_target provides a binding for name
                 if let SpecEnv::Function(func_target) = &self.spec_env {
+                    // overwrite ty and var_name if func_target provides a binding for name
                     if let Some(local_index) = func_target.get_local_index(name) {
-                        ty = func_target.get_local_type(*local_index);
-                        // The following sequence of if tests are mutually disjoint.
-                        if *self.in_ensures.borrow() && !*self.in_old.borrow() {
-                            if let Some(return_index) = func_target.get_return_index(*local_index) {
-                                var_name = Rc::new(format!("$ret{}", return_index));
-                            }
-                        }
                         if *self.in_assert_or_assume.borrow() {
-                            if let Some(proxy_index) = func_target.get_proxy_index(*local_index) {
+                            if let Some(proxy_index) = if ty.is_reference() {
+                                func_target.get_ref_proxy_index(*local_index)
+                            } else {
+                                func_target.get_proxy_index(*local_index)
+                            } {
                                 var_name = func_target
                                     .symbol_pool()
                                     .string(func_target.get_local_name(*proxy_index));
+                                ty = func_target.get_local_type(*proxy_index);
+                            } else {
+                                ty = func_target.get_local_type(*local_index);
                             }
+                        } else if *self.in_ensures.borrow() && !*self.in_old.borrow() {
+                            if let Some(return_index) = func_target.get_return_index(*local_index) {
+                                var_name = Rc::new(format!("$ret{}", return_index));
+                                ty = func_target.get_return_type(*return_index);
+                            } else {
+                                ty = func_target.get_local_type(*local_index);
+                            }
+                        } else {
+                            ty = func_target.get_local_type(*local_index);
                         }
                     }
                 };
@@ -1115,7 +1207,7 @@ impl<'env> SpecTranslator<'env> {
     fn translate_pack(&self, args: &[Exp]) {
         emit!(
             self.writer,
-            "$Vector({}$EmptyValueArray",
+            "$Vector({}$EmptyValueArray()",
             "$ExtendValueArray(".repeat(args.len())
         );
         for arg in args.iter() {

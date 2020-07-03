@@ -1,34 +1,44 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    account::{Account, AccountData},
-    executor::FakeExecutor,
-    gas_costs,
-};
+use crate::{account::Account, executor::FakeExecutor, gas_costs};
+use compiled_stdlib::transaction_scripts::StdlibScript;
 use libra_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
 use libra_types::{
-    account_config::{self, BurnEvent, LBR_NAME},
+    account_config::{self, BurnEvent, COIN1_NAME},
     transaction::{authenticator::AuthenticationKey, TransactionArgument},
-    vm_error::StatusCode,
+    vm_status::StatusCode,
 };
 use move_core_types::{
     identifier::Identifier,
     language_storage::{StructTag, TypeTag},
 };
 use std::convert::TryFrom;
-use stdlib::transaction_scripts::StdlibScript;
-use transaction_builder::{encode_burn_txn_fees_script, encode_mint_lbr_to_address_script};
+use transaction_builder::{
+    encode_burn_txn_fees_script, encode_create_testing_account_script, encode_testnet_mint_script,
+};
 
 #[test]
 fn burn_txn_fees() {
     let mut executor = FakeExecutor::from_genesis_file();
-    let sender = AccountData::new(0, 0);
+    let sender = Account::new();
+    let dd = Account::new_genesis_account(account_config::testnet_dd_account_address());
+    let tc = Account::new_blessed_tc();
     let association = Account::new_association();
-    executor.add_account_data(&sender);
+
     executor.execute_and_apply(association.signed_script_txn(
-        encode_mint_lbr_to_address_script(&sender.account().address(), vec![], 10_000_000),
+        encode_create_testing_account_script(
+            account_config::coin1_tag(),
+            *sender.address(),
+            sender.auth_key_prefix(),
+            false,
+        ),
         1,
+    ));
+
+    executor.execute_and_apply(dd.signed_script_txn(
+        encode_testnet_mint_script(account_config::coin1_tag(), *sender.address(), 10_000_000),
+        0,
     ));
 
     let gas_used = {
@@ -37,7 +47,7 @@ fn burn_txn_fees() {
         let new_key_hash = AuthenticationKey::ed25519(&pubkey).to_vec();
         let args = vec![TransactionArgument::U8Vector(new_key_hash)];
         let status = executor.execute_and_apply(
-            sender.account().create_signed_txn_with_args(
+            sender.create_signed_txn_with_args(
                 StdlibScript::RotateAuthenticationKey
                     .compiled_bytes()
                     .into_vec(),
@@ -46,7 +56,7 @@ fn burn_txn_fees() {
                 0,
                 gas_costs::TXN_RESERVED,
                 1,
-                LBR_NAME.to_owned(),
+                COIN1_NAME.to_owned(),
             ),
         );
         assert_eq!(
@@ -56,16 +66,15 @@ fn burn_txn_fees() {
         status.gas_used()
     };
 
-    let tc = Account::new_blessed_tc();
-    let lbr_ty = TypeTag::Struct(StructTag {
+    let coin1_ty = TypeTag::Struct(StructTag {
         address: account_config::CORE_CODE_ADDRESS,
-        module: Identifier::new("LBR").unwrap(),
-        name: Identifier::new("T").unwrap(),
+        module: Identifier::new("Coin1").unwrap(),
+        name: Identifier::new("Coin1").unwrap(),
         type_params: vec![],
     });
 
     let output =
-        executor.execute_and_apply(tc.signed_script_txn(encode_burn_txn_fees_script(lbr_ty), 0));
+        executor.execute_and_apply(tc.signed_script_txn(encode_burn_txn_fees_script(coin1_ty), 0));
 
     let burn_events: Vec<_> = output
         .events()
@@ -73,14 +82,11 @@ fn burn_txn_fees() {
         .filter_map(|event| BurnEvent::try_from(event).ok())
         .collect();
 
-    assert_eq!(burn_events.len(), 2);
+    assert_eq!(burn_events.len(), 1);
     assert!(burn_events
         .iter()
         .any(|event| event.currency_code().as_str() == "Coin1"));
-    assert!(burn_events
-        .iter()
-        .any(|event| event.currency_code().as_str() == "Coin2"));
     burn_events
         .iter()
-        .for_each(|event| assert_eq!(event.amount(), gas_used / 2));
+        .for_each(|event| assert_eq!(event.amount(), gas_used));
 }

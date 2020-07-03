@@ -12,35 +12,34 @@
 //! sender: association
 // remove_validator cannot be called on a non-validator
 script{
-    use 0x0::LibraSystem;
-    fun main() {
-        LibraSystem::remove_validator({{alice}});
+    use 0x1::LibraSystem;
+    fun main(account: &signer) {
+        LibraSystem::remove_validator(account, {{alice}});
     }
 }
 
 // check: ABORTED
-// check: 1106
+// check: 21
 
 // remove_validator can only be called by the Association
 //! new-transaction
 //! sender: alice
 script{
-    use 0x0::LibraSystem;
-    fun main() {
-        LibraSystem::remove_validator({{vivian}});
+    use 0x1::LibraSystem;
+    fun main(account: &signer) {
+        LibraSystem::remove_validator(account, {{vivian}});
     }
 }
 
 // check: ABORTED
-// check: 22
 
 //! new-transaction
-//! sender: vivian
+//! sender: association
 // should work because Vivian is a validator
 script{
-    use 0x0::LibraSystem;
-    fun main() {
-        LibraSystem::remove_validator({{vivian}});
+    use 0x1::LibraSystem;
+    fun main(account: &signer) {
+        LibraSystem::remove_validator(account, {{vivian}});
     }
 }
 
@@ -48,12 +47,12 @@ script{
 // check: EXECUTED
 
 //! new-transaction
-//! sender: vivian
+//! sender: association
 // double-removing Vivian should fail
 script{
-    use 0x0::LibraSystem;
-    fun main() {
-        LibraSystem::remove_validator({{vivian}});
+    use 0x1::LibraSystem;
+    fun main(account: &signer) {
+        LibraSystem::remove_validator(account, {{vivian}});
     }
 }
 

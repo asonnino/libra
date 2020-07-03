@@ -5,7 +5,7 @@ use crate::{
     file_format::{CompiledModule, CompiledScript},
     file_format_common::*,
 };
-use libra_types::vm_error::StatusCode;
+use move_core_types::vm_status::StatusCode;
 
 #[test]
 fn malformed_simple() {
@@ -67,8 +67,7 @@ fn malformed_simple() {
 }
 
 // Ensure that we can deserialize a script from disk
-static EMPTY_SCRIPT: &[u8] =
-    include_bytes!("../../../stdlib/staged/transaction_scripts/empty_script.mv");
+static EMPTY_SCRIPT: &[u8] = include_bytes!("../../../../types/src/test_helpers/empty_script.mv");
 
 #[test]
 fn deserialize_file() {

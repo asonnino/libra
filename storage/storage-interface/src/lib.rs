@@ -13,7 +13,6 @@ use libra_types::{
     epoch_change::EpochChangeProof,
     epoch_state::EpochState,
     event::EventKey,
-    get_with_proof::{RequestItem, ResponseItem},
     ledger_info::LedgerInfoWithSignatures,
     move_resource::MoveStorage,
     proof::{definition::LeafCount, AccumulatorConsistencyProof, SparseMerkleProof},
@@ -129,25 +128,11 @@ impl From<libra_secure_net::Error> for Error {
 /// Trait that is implemented by a DB that supports certain public (to client) read APIs
 /// expected of a Libra DB
 pub trait DbReader: Send + Sync {
-    // TODO: Remove this API after deprecating AC.
-    fn update_to_latest_ledger(
-        &self,
-        _client_known_version: Version,
-        _request_items: Vec<RequestItem>,
-    ) -> Result<(
-        Vec<ResponseItem>,
-        LedgerInfoWithSignatures,
-        EpochChangeProof,
-        AccumulatorConsistencyProof,
-    )> {
-        unimplemented!()
-    }
-
-    /// See [`LibraDB::get_epoch_change_ledger_infos`].
+    /// See [`LibraDB::get_epoch_ending_ledger_infos`].
     ///
-    /// [`LibraDB::get_epoch_change_ledger_infos`]:
-    /// ../libradb/struct.LibraDB.html#method.get_epoch_change_ledger_infos
-    fn get_epoch_change_ledger_infos(
+    /// [`LibraDB::get_epoch_ending_ledger_infos`]:
+    /// ../libradb/struct.LibraDB.html#method.get_epoch_ending_ledger_infos
+    fn get_epoch_ending_ledger_infos(
         &self,
         start_epoch: u64,
         end_epoch: u64,
@@ -172,6 +157,12 @@ pub trait DbReader: Send + Sync {
         ascending: bool,
         limit: u64,
     ) -> Result<Vec<(u64, ContractEvent)>>;
+
+    /// See [`LibraDB::get_block_timestamp`].
+    ///
+    /// [`LibraDB::get_block_timestamp`]:
+    /// ../libradb/struct.LibraDB.html#method.get_block_timestamp
+    fn get_block_timestamp(&self, version: u64) -> Result<u64>;
 
     /// See [`LibraDB::get_latest_account_state`].
     ///
@@ -262,7 +253,7 @@ pub trait DbReader: Send + Sync {
     fn get_latest_tree_state(&self) -> Result<TreeState>;
 
     /// Get the ledger info of the epoch that `known_version` belongs to.
-    fn get_ledger_info(&self, known_version: u64) -> Result<LedgerInfoWithSignatures>;
+    fn get_epoch_ending_ledger_info(&self, known_version: u64) -> Result<LedgerInfoWithSignatures>;
 }
 
 impl MoveStorage for &dyn DbReader {
@@ -278,7 +269,7 @@ impl MoveStorage for &dyn DbReader {
         let addresses: Vec<AccountAddress> = access_paths
             .iter()
             .collect::<HashSet<_>>()
-            .into_iter()
+            .iter()
             .map(|path| path.address)
             .collect();
 
@@ -289,7 +280,7 @@ impl MoveStorage for &dyn DbReader {
 
         // Account address --> AccountState
         let account_states = addresses
-            .into_iter()
+            .iter()
             .zip_eq(results)
             .map(|(addr, result)| {
                 let account_state = AccountState::try_from(&result.blob.ok_or_else(|| {
@@ -300,7 +291,7 @@ impl MoveStorage for &dyn DbReader {
             .collect::<Result<HashMap<_, AccountState>>>()?;
 
         access_paths
-            .into_iter()
+            .iter()
             .map(|path| {
                 Ok(account_states
                     .get(&path.address)

@@ -13,7 +13,10 @@ use super::{
 use channel::{libra_channel, message_queues::QueueStyle};
 use executor::{db_bootstrapper::bootstrap_db_if_empty, Executor};
 use futures::{channel::oneshot, sink::SinkExt, stream::StreamExt};
-use libra_config::config::{NodeConfig, RoleType};
+use libra_config::{
+    config::{NodeConfig, RoleType},
+    network_id::{NetworkContext, NetworkId},
+};
 use libra_network_address::NetworkAddress;
 use libra_types::{
     account_config,
@@ -31,7 +34,10 @@ use network::{
         ConnectionNotification, ConnectionRequestSender, PeerManagerNotification,
         PeerManagerRequest, PeerManagerRequestSender,
     },
-    protocols::rpc::{InboundRpcRequest, OutboundRpcRequest},
+    protocols::{
+        network::NewNetworkSender,
+        rpc::{InboundRpcRequest, OutboundRpcRequest},
+    },
     ProtocolId,
 };
 use std::{
@@ -96,7 +102,7 @@ impl MockOnchainDiscoveryNetworkSender {
 
     async fn new_peer(&mut self, peer_id: PeerId) {
         let addr = NetworkAddress::from_str("/ip4/127.0.0.1/tcp/1234").unwrap();
-        let notif = ConnectionNotification::NewPeer(peer_id, addr);
+        let notif = ConnectionNotification::NewPeer(peer_id, addr, NetworkContext::mock());
         self.send_connection_notif(peer_id, notif).await;
     }
 
@@ -207,20 +213,19 @@ fn setup_onchain_discovery(
     let (conn_reqs_tx, _) =
         libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
     let conn_reqs_tx = ConnectionRequestSender::new(conn_reqs_tx);
-    let network_reqs_tx =
-        OnchainDiscoveryNetworkSender::new(peer_mgr_reqs_tx, conn_reqs_tx, conn_mgr_reqs_tx);
+    let network_reqs_tx = OnchainDiscoveryNetworkSender::new(peer_mgr_reqs_tx, conn_reqs_tx);
     // let network_notifs_rx = OnchainDiscoveryNetworkEvents::new(peer_mgr_notifs_rx, conn_notifs_rx);
     let (peer_query_ticker_tx, peer_query_ticker_rx) = channel::new_test::<()>(1);
     let (storage_query_ticker_tx, storage_query_ticker_rx) = channel::new_test::<()>(1);
 
     let outbound_rpc_timeout = Duration::from_secs(30);
     let max_concurrent_inbound_rpcs = 8;
-
+    let network_context = NetworkContext::new(NetworkId::Validator, role, peer_id);
     let onchain_discovery = OnchainDiscovery::new(
-        peer_id,
-        role,
+        Arc::new(network_context),
         waypoint,
         network_reqs_tx,
+        conn_mgr_reqs_tx,
         conn_notifs_rx,
         Arc::clone(&libra_db),
         peer_query_ticker_rx,
@@ -261,7 +266,7 @@ fn service_handles_remote_query() {
 
     let (libra_db, _executor, waypoint) = setup_storage_service_and_executor(&config);
     let validator_set = read_validator_set(&libra_db);
-    let expected_validator_set = DiscoverySetInternal::from_validator_set(role, validator_set);
+    let expected_validator_set = DiscoverySetInternal::from_validator_set(role, &validator_set);
 
     let (
         f_onchain_discovery,
@@ -296,7 +301,7 @@ fn service_handles_remote_query() {
 
     // verify validator set is the same as genesis validator set
     let actual_validator_set =
-        DiscoverySetInternal::from_validator_set(role, opt_validator_set.unwrap());
+        DiscoverySetInternal::from_validator_set(role, &opt_validator_set.unwrap());
     assert_eq!(expected_validator_set, actual_validator_set);
 
     // shutdown
@@ -339,7 +344,7 @@ fn queries_storage_on_tick() {
     drop(storage_query_ticker_tx);
 
     // expect updates for all nodes
-    let validator_set = DiscoverySetInternal::from_validator_set(role, validator_set);
+    let validator_set = DiscoverySetInternal::from_validator_set(role, &validator_set);
     let expected_update_reqs = validator_set
         .0
         .into_iter()
@@ -439,7 +444,7 @@ fn queries_peers_on_tick() {
     drop(client_storage_query_ticker_tx);
 
     // expect updates for all other nodes except ourselves
-    let validator_set = DiscoverySetInternal::from_validator_set(client_role, validator_set);
+    let validator_set = DiscoverySetInternal::from_validator_set(client_role, &validator_set);
     let expected_update_reqs = validator_set
         .0
         .into_iter()
