@@ -1,12 +1,11 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use bytecode_verifier::{SignatureChecker, VerifiedModule};
+use bytecode_verifier::{verify_module, SignatureChecker};
 use invalid_mutations::signature::{FieldRefMutation, SignatureRefMutation};
-use libra_types::account_address::AccountAddress;
-use move_core_types::identifier::Identifier;
+use move_binary_format::file_format::{Bytecode::*, CompiledModule, SignatureToken::*, *};
+use move_core_types::{account_address::AccountAddress, identifier::Identifier};
 use proptest::{collection::vec, prelude::*, sample::Index as PropIndex};
-use vm::file_format::{Bytecode::*, CompiledModule, SignatureToken::*, *};
 
 #[test]
 fn test_reference_of_reference() {
@@ -14,42 +13,38 @@ fn test_reference_of_reference() {
     m.signatures[0] = Signature(vec![Reference(Box::new(Reference(Box::new(
         SignatureToken::Bool,
     ))))]);
-    let errors = SignatureChecker::verify(&m.freeze().unwrap());
+    let errors = SignatureChecker::verify_module(&m);
     assert!(errors.is_err());
 }
 
 proptest! {
     #[test]
     fn valid_signatures(module in CompiledModule::valid_strategy(20)) {
-        prop_assert!(SignatureChecker::verify(&module).is_ok())
+        prop_assert!(SignatureChecker::verify_module(&module).is_ok())
     }
 
     #[test]
     fn double_refs(
-        module in CompiledModule::valid_strategy(20),
+        mut module in CompiledModule::valid_strategy(20),
         mutations in vec((any::<PropIndex>(), any::<PropIndex>()), 0..20),
     ) {
-        let mut module = module.into_inner();
         let context = SignatureRefMutation::new(&mut module, mutations);
         let expected_violations = context.apply();
-        let module = module.freeze().expect("should satisfy bounds checker");
 
-        let result = SignatureChecker::verify(&module);
+        let result = SignatureChecker::verify_module(&module);
 
         prop_assert_eq!(expected_violations, result.is_err());
     }
 
     #[test]
     fn field_def_references(
-        module in CompiledModule::valid_strategy(20),
+        mut module in CompiledModule::valid_strategy(20),
         mutations in vec((any::<PropIndex>(), any::<PropIndex>()), 0..40),
     ) {
-        let mut module = module.into_inner();
         let context = FieldRefMutation::new(&mut module, mutations);
         let expected_violations = context.apply();
-        let module = module.freeze().expect("should satisfy bounds checker");
 
-        let result = SignatureChecker::verify(&module);
+        let result = SignatureChecker::verify_module(&module);
 
         prop_assert_eq!(expected_violations, result.is_err());
     }
@@ -57,7 +52,8 @@ proptest! {
 
 #[test]
 fn no_verify_locals_good() {
-    let compiled_module_good = CompiledModuleMut {
+    let compiled_module_good = CompiledModule {
+        version: move_binary_format::file_format_common::VERSION_MAX,
         module_handles: vec![ModuleHandle {
             address: AddressIdentifierIndex(0),
             name: IdentifierIndex(0),
@@ -86,6 +82,7 @@ fn no_verify_locals_good() {
             },
         ],
         field_handles: vec![],
+        friend_decls: vec![],
         struct_def_instantiations: vec![],
         function_instantiations: vec![],
         field_instantiations: vec![],
@@ -100,7 +97,7 @@ fn no_verify_locals_good() {
         function_defs: vec![
             FunctionDefinition {
                 function: FunctionHandleIndex(0),
-                is_public: true,
+                visibility: Visibility::Public,
                 acquires_global_resources: vec![],
                 code: Some(CodeUnit {
                     locals: SignatureIndex(0),
@@ -109,7 +106,7 @@ fn no_verify_locals_good() {
             },
             FunctionDefinition {
                 function: FunctionHandleIndex(1),
-                is_public: true,
+                visibility: Visibility::Public,
                 acquires_global_resources: vec![],
                 code: Some(CodeUnit {
                     locals: SignatureIndex(1),
@@ -118,5 +115,5 @@ fn no_verify_locals_good() {
             },
         ],
     };
-    assert!(VerifiedModule::new(compiled_module_good.freeze().unwrap()).is_ok());
+    assert!(verify_module(&compiled_module_good).is_ok());
 }

@@ -1,34 +1,60 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{bail, Result};
+use diem_framework::diem_framework_named_addresses;
 use functional_tests::{
     compiler::{Compiler, ScriptOrModule},
     testsuite,
 };
-use libra_types::account_address::AccountAddress as LibraAddress;
+use move_command_line_common::env::read_bool_env_var;
 use move_lang::{
-    compiled_unit::CompiledUnit,
-    move_compile_no_report,
-    shared::Address,
-    test_utils::{read_bool_var, stdlib_files},
+    self, compiled_unit::AnnotatedCompiledUnit, diagnostics, Compiler as MoveCompiler, Flags,
+    FullyCompiledProgram, PASS_COMPILATION,
 };
-use std::{convert::TryFrom, fmt, io::Write, path::Path};
+use once_cell::sync::Lazy;
+use std::{fmt, io::Write, path::Path};
 use tempfile::NamedTempFile;
 
-pub const STD_LIB_DIR: &str = "../../stdlib/modules";
+pub const STD_LIB_DIR: &str = "../../diem-framework/modules";
 pub const FUNCTIONAL_TEST_DIR: &str = "tests";
 
-struct MoveSourceCompiler {
+struct MoveSourceCompiler<'a> {
+    pre_compiled_deps: &'a FullyCompiledProgram,
     deps: Vec<String>,
     temp_files: Vec<NamedTempFile>,
 }
 
-impl MoveSourceCompiler {
-    fn new(stdlib_modules_file_names: Vec<String>) -> Self {
+impl<'a> MoveSourceCompiler<'a> {
+    fn new(pre_compiled_deps: &'a FullyCompiledProgram) -> Self {
         MoveSourceCompiler {
-            deps: stdlib_modules_file_names,
+            pre_compiled_deps,
+            deps: vec![],
             temp_files: vec![],
+        }
+    }
+
+    fn move_compile_with_stdlib(
+        &self,
+        targets: &[String],
+    ) -> anyhow::Result<(
+        diagnostics::FilesSourceText,
+        Result<Vec<AnnotatedCompiledUnit>, diagnostics::Diagnostics>,
+    )> {
+        let (files, comments_and_compiler_res) = MoveCompiler::new(targets, &self.deps)
+            .set_pre_compiled_lib(self.pre_compiled_deps)
+            .set_named_address_values(diem_framework_named_addresses())
+            .run::<PASS_COMPILATION>()?;
+        match comments_and_compiler_res {
+            Err(diags) => Ok((files, Err(diags))),
+            Ok((_comments, move_compiler)) => {
+                let (units, warnings) = move_compiler.into_compiled_units();
+                if !warnings.is_empty() {
+                    Ok((files, Err(warnings)))
+                } else {
+                    Ok((files, Ok(units)))
+                }
+            }
         }
     }
 }
@@ -44,31 +70,35 @@ impl fmt::Display for MoveSourceCompilerError {
 
 impl std::error::Error for MoveSourceCompilerError {}
 
-impl Compiler for MoveSourceCompiler {
+impl<'a> Compiler for MoveSourceCompiler<'a> {
     /// Compile a transaction script or module.
-    fn compile<Logger: FnMut(String) -> ()>(
+    fn compile<Logger: FnMut(String)>(
         &mut self,
         _log: Logger,
-        address: LibraAddress,
         input: &str,
     ) -> Result<ScriptOrModule> {
         let cur_file = NamedTempFile::new()?;
-        let sender_addr = Address::try_from(address.as_ref()).unwrap();
         cur_file.reopen()?.write_all(input.as_bytes())?;
         let cur_path = cur_file.path().to_str().unwrap().to_owned();
 
         let targets = &vec![cur_path.clone()];
-        let sender = Some(sender_addr);
-        let (files, units_or_errors) = move_compile_no_report(targets, &self.deps, sender)?;
-        let unit = match units_or_errors {
-            Err(errors) => {
-                let error_buffer = if read_bool_var(testsuite::PRETTY) {
-                    move_lang::errors::report_errors_to_color_buffer(files, errors)
+        let (mut files, units_or_diags) = self.move_compile_with_stdlib(targets)?;
+        let unit = match units_or_diags {
+            Err(diags) => {
+                for (file_name, text) in &self.pre_compiled_deps.files {
+                    // TODO This is bad. Rethink this when errors are redone
+                    if !files.contains_key(file_name) {
+                        files.insert(*file_name, text.clone());
+                    }
+                }
+
+                let diags_buffer = if read_bool_env_var(move_command_line_common::testing::PRETTY) {
+                    diagnostics::report_diagnostics_to_color_buffer(&files, diags)
                 } else {
-                    move_lang::errors::report_errors_to_buffer(files, errors)
+                    diagnostics::report_diagnostics_to_buffer(&files, diags)
                 };
                 return Err(
-                    MoveSourceCompilerError(String::from_utf8(error_buffer).unwrap()).into(),
+                    MoveSourceCompilerError(String::from_utf8(diags_buffer).unwrap()).into(),
                 );
             }
             Ok(mut units) => {
@@ -81,13 +111,14 @@ impl Compiler for MoveSourceCompiler {
         };
 
         Ok(match unit {
-            CompiledUnit::Script { script, .. } => ScriptOrModule::Script(script),
-            CompiledUnit::Module { module, .. } => {
-                let input = format!("address {} {{\n{}\n}}", sender_addr, input);
+            AnnotatedCompiledUnit::Script(annot_script) => {
+                ScriptOrModule::Script(None, annot_script.named_script.script)
+            }
+            AnnotatedCompiledUnit::Module(annot_module) => {
                 cur_file.reopen()?.write_all(input.as_bytes())?;
                 self.temp_files.push(cur_file);
                 self.deps.push(cur_path);
-                ScriptOrModule::Module(module)
+                ScriptOrModule::Module(annot_module.named_module.module)
             }
         })
     }
@@ -97,8 +128,25 @@ impl Compiler for MoveSourceCompiler {
     }
 }
 
+static DIEM_PRECOMPILED_STDLIB: Lazy<FullyCompiledProgram> = Lazy::new(|| {
+    let program_res = move_lang::construct_pre_compiled_lib(
+        &diem_framework::diem_stdlib_files(),
+        None,
+        Flags::empty().set_sources_shadow_deps(false),
+        diem_framework_named_addresses(),
+    )
+    .unwrap();
+    match program_res {
+        Ok(stdlib) => stdlib,
+        Err((files, diags)) => {
+            eprintln!("!!!Standard library failed to compile!!!");
+            diagnostics::report_diagnostics(&files, diags)
+        }
+    }
+});
+
 fn functional_testsuite(path: &Path) -> datatest_stable::Result<()> {
-    testsuite::functional_tests(MoveSourceCompiler::new(stdlib_files(STD_LIB_DIR)), path)
+    testsuite::functional_tests(MoveSourceCompiler::new(&*DIEM_PRECOMPILED_STDLIB), path)
 }
 
 datatest_stable::harness!(functional_testsuite, FUNCTIONAL_TEST_DIR, r".*\.move$");

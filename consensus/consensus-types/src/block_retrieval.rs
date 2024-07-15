@@ -1,12 +1,15 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::block::Block;
 use anyhow::ensure;
-use libra_crypto::hash::HashValue;
-use libra_types::validator_verifier::ValidatorVerifier;
+use diem_crypto::hash::HashValue;
+use diem_types::validator_verifier::ValidatorVerifier;
 use serde::{Deserialize, Serialize};
+use short_hex_str::AsShortHexStr;
 use std::fmt;
+
+pub const MAX_BLOCKS_PER_REQUEST: u64 = 10;
 
 /// RPC to get a chain of block of the given length starting from the given block id.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -104,20 +107,20 @@ impl fmt::Display for BlockRetrievalResponse {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.status() {
             BlockRetrievalStatus::Succeeded => {
-                let block_ids = self
-                    .blocks
-                    .iter()
-                    .map(|b| b.id().short_str())
-                    .collect::<Vec<String>>();
                 write!(
                     f,
-                    "[BlockRetrievalResponse: status: {:?}, num_blocks: {}, block_ids: {:?}]",
+                    "[BlockRetrievalResponse: status: {:?}, num_blocks: {}, block_ids: ",
                     self.status(),
                     self.blocks().len(),
-                    block_ids
-                )
+                )?;
+
+                f.debug_list()
+                    .entries(self.blocks.iter().map(|b| b.id().short_str()))
+                    .finish()?;
+
+                write!(f, "]")
             }
-            _ => write!(f, "[BlockRetrievalResponse: status: {:?}", self.status()),
+            _ => write!(f, "[BlockRetrievalResponse: status: {:?}]", self.status()),
         }
     }
 }

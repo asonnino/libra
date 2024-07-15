@@ -1,52 +1,47 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use bytecode_verifier::{VerifiedModule, VerifiedScript};
-use compiled_stdlib::{stdlib_modules, StdLibOptions};
+use bytecode_verifier::{verify_module, verify_script};
 use ir_to_bytecode::{
     compiler::{compile_module, compile_script},
     parser::{parse_module, parse_script},
 };
-use libra_types::{account_address::AccountAddress, vm_status::VMStatus};
-use vm::{
+use move_binary_format::{
     access::ScriptAccess,
+    errors::{Location, VMError},
     file_format::{CompiledModule, CompiledScript},
 };
+use move_symbol_pool::Symbol;
 
 #[allow(unused_macros)]
 macro_rules! instr_count {
     ($compiled: expr, $instr: pat) => {
         $compiled
-            .as_inner()
             .code
             .code
             .iter()
-            .filter(|ins| match ins {
-                $instr => true,
-                _ => false,
-            })
-            .count();
+            .filter(|ins| matches!(ins, $instr))
+            .count()
     };
 }
 
 fn compile_script_string_impl(
     code: &str,
     deps: Vec<CompiledModule>,
-) -> Result<(CompiledScript, Option<VMStatus>)> {
-    let parsed_script = parse_script("file_name", code).unwrap();
-    let compiled_script = compile_script(None, parsed_script, &deps)?.0;
+) -> Result<(CompiledScript, Option<VMError>)> {
+    let parsed_script = parse_script(Symbol::from("file_name"), code).unwrap();
+    let script = compile_script(parsed_script, &deps)?.0;
 
     let mut serialized_script = Vec::<u8>::new();
-    compiled_script.serialize(&mut serialized_script)?;
-    let deserialized_script = CompiledScript::deserialize(&serialized_script)?;
-    assert_eq!(compiled_script, deserialized_script);
+    script.serialize(&mut serialized_script)?;
+    let deserialized_script = CompiledScript::deserialize(&serialized_script)
+        .map_err(|e| e.finish(Location::Undefined).into_vm_status())?;
+    assert_eq!(script, deserialized_script);
 
-    // Always return a CompiledScript because some callers explicitly care about unverified
-    // modules.
-    Ok(match VerifiedScript::new(compiled_script) {
-        Ok(script) => (script.into_inner(), None),
-        Err((script, error)) => (script, Some(error)),
+    Ok(match verify_script(&script) {
+        Ok(_) => (script, None),
+        Err(error) => (script, Some(error)),
     })
 }
 
@@ -84,21 +79,21 @@ pub fn compile_script_string_and_assert_error(
 fn compile_module_string_impl(
     code: &str,
     deps: Vec<CompiledModule>,
-) -> Result<(CompiledModule, Option<VMStatus>)> {
-    let address = AccountAddress::ZERO;
-    let module = parse_module("file_name", code).unwrap();
-    let compiled_module = compile_module(address, module, &deps)?.0;
+) -> Result<(CompiledModule, Option<VMError>)> {
+    let module = parse_module(Symbol::from("file_name"), code).unwrap();
+    let compiled_module = compile_module(module, &deps)?.0;
 
     let mut serialized_module = Vec::<u8>::new();
     compiled_module.serialize(&mut serialized_module)?;
-    let deserialized_module = CompiledModule::deserialize(&serialized_module)?;
+    let deserialized_module = CompiledModule::deserialize(&serialized_module)
+        .map_err(|e| e.finish(Location::Undefined).into_vm_status())?;
     assert_eq!(compiled_module, deserialized_module);
 
     // Always return a CompiledModule because some callers explicitly care about unverified
     // modules.
-    Ok(match VerifiedModule::new(compiled_module) {
-        Ok(module) => (module.into_inner(), None),
-        Err((module, error)) => (module, Some(error)),
+    Ok(match verify_module(&compiled_module) {
+        Ok(_) => (compiled_module, None),
+        Err(error) => (compiled_module, Some(error)),
     })
 }
 
@@ -135,19 +130,4 @@ pub fn compile_module_string_and_assert_error(
 
 pub fn count_locals(script: &CompiledScript) -> usize {
     script.signature_at(script.code().locals).0.len()
-}
-
-pub fn compile_module_string_with_stdlib(code: &str) -> Result<CompiledModule> {
-    compile_module_string_and_assert_no_error(code, stdlib())
-}
-
-pub fn compile_script_string_with_stdlib(code: &str) -> Result<CompiledScript> {
-    compile_script_string_and_assert_no_error(code, stdlib())
-}
-
-fn stdlib() -> Vec<CompiledModule> {
-    stdlib_modules(StdLibOptions::Compiled)
-        .iter()
-        .map(|m| m.clone().into_inner())
-        .collect()
 }

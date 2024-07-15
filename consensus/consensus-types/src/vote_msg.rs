@@ -1,10 +1,10 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{sync_info::SyncInfo, vote::Vote};
 use anyhow::ensure;
-use libra_crypto::HashValue;
-use libra_types::validator_verifier::ValidatorVerifier;
+use diem_crypto::HashValue;
+use diem_types::validator_verifier::ValidatorVerifier;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
@@ -54,6 +54,12 @@ impl VoteMsg {
             self.vote().epoch() == self.sync_info.epoch(),
             "VoteMsg has different epoch"
         );
+        if let Some((timeout, _)) = self.vote().two_chain_timeout() {
+            ensure!(
+                timeout.hqc_round() <= self.sync_info.highest_certified_round(),
+                "2-chain Timeout hqc should be less or equal than the sync info hqc"
+            );
+        }
         // We're not verifying SyncInfo here yet: we are going to verify it only in case we need
         // it. This way we avoid verifying O(n) SyncInfo messages while aggregating the votes
         // (O(n^2) signature verifications).

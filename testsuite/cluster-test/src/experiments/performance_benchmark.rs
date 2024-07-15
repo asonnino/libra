@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -6,21 +6,23 @@ use crate::{
     experiments::{Context, Experiment, ExperimentParam},
     instance,
     instance::Instance,
-    stats,
-    tx_emitter::EmitJobRequest,
-    util::unix_timestamp_now,
+    stats::PrometheusRangeView,
+    tx_emitter::{EmitJobRequest, TxStats},
+    util::human_readable_bytes_per_sec,
 };
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use futures::{future::try_join_all, join};
-use libra_logger::{info, warn};
-use serde_json::Value;
+use diem_infallible::duration_since_epoch;
+use diem_logger::{info, warn};
+use futures::{future::try_join_all, FutureExt};
+use rand::{rngs::ThreadRng, seq::SliceRandom};
 use std::{
     collections::HashSet,
     fmt::{Display, Error, Formatter},
     time::Duration,
 };
 use structopt::StructOpt;
+use tokio::task::JoinHandle;
 
 #[derive(StructOpt, Debug)]
 pub struct PerformanceBenchmarkParams {
@@ -30,8 +32,6 @@ pub struct PerformanceBenchmarkParams {
         help = "Percent of nodes which should be down"
     )]
     pub percent_nodes_down: usize,
-    #[structopt(long, help = "Whether benchmark should perform trace")]
-    pub trace: bool,
     #[structopt(
     long,
     default_value = Box::leak(format!("{}", DEFAULT_BENCH_DURATION).into_boxed_str()),
@@ -40,6 +40,17 @@ pub struct PerformanceBenchmarkParams {
     pub duration: u64,
     #[structopt(long, help = "Set fixed tps during perf experiment")]
     pub tps: Option<u64>,
+    #[structopt(
+        long,
+        help = "Whether benchmark should pick one node to run DB backup."
+    )]
+    pub backup: bool,
+    #[structopt(long, default_value = "0", help = "Set gas price in tx")]
+    pub gas_price: u64,
+    #[structopt(long, help = "Set periodic stat aggregator step")]
+    pub periodic_stats: Option<u64>,
+    #[structopt(long, default_value = "0", help = "Set percentage of invalid tx")]
+    pub invalid_tx: u64,
 }
 
 pub struct PerformanceBenchmark {
@@ -48,8 +59,11 @@ pub struct PerformanceBenchmark {
     up_fullnodes: Vec<Instance>,
     percent_nodes_down: usize,
     duration: Duration,
-    trace: bool,
     tps: Option<u64>,
+    backup: bool,
+    gas_price: u64,
+    periodic_stats: Option<u64>,
+    invalid_tx: u64,
 }
 
 pub const DEFAULT_BENCH_DURATION: u64 = 120;
@@ -59,8 +73,11 @@ impl PerformanceBenchmarkParams {
         Self {
             percent_nodes_down,
             duration: DEFAULT_BENCH_DURATION,
-            trace: false,
             tps: None,
+            backup: false,
+            gas_price: 0,
+            periodic_stats: None,
+            invalid_tx: 0,
         }
     }
 
@@ -68,9 +85,41 @@ impl PerformanceBenchmarkParams {
         Self {
             percent_nodes_down,
             duration: DEFAULT_BENCH_DURATION,
-            trace: false,
             tps: Some(fixed_tps),
+            backup: false,
+            gas_price: 0,
+            periodic_stats: None,
+            invalid_tx: 0,
         }
+    }
+
+    pub fn non_zero_gas_price(percent_nodes_down: usize, gas_price: u64) -> Self {
+        Self {
+            percent_nodes_down,
+            duration: DEFAULT_BENCH_DURATION,
+            tps: None,
+            backup: false,
+            gas_price,
+            periodic_stats: None,
+            invalid_tx: 0,
+        }
+    }
+
+    pub fn mix_invalid_tx(percent_nodes_down: usize, invalid_tx: u64) -> Self {
+        Self {
+            percent_nodes_down,
+            duration: DEFAULT_BENCH_DURATION,
+            tps: None,
+            backup: false,
+            gas_price: 0,
+            periodic_stats: None,
+            invalid_tx,
+        }
+    }
+
+    pub fn enable_db_backup(mut self) -> Self {
+        self.backup = true;
+        self
     }
 }
 
@@ -97,8 +146,11 @@ impl ExperimentParam for PerformanceBenchmarkParams {
             up_fullnodes,
             percent_nodes_down: self.percent_nodes_down,
             duration: Duration::from_secs(self.duration),
-            trace: self.trace,
             tps: self.tps,
+            backup: self.backup,
+            gas_price: self.gas_price,
+            periodic_stats: self.periodic_stats,
+            invalid_tx: self.invalid_tx,
         }
     }
 }
@@ -112,6 +164,8 @@ impl Experiment for PerformanceBenchmark {
     async fn run(&mut self, context: &mut Context<'_>) -> Result<()> {
         let futures: Vec<_> = self.down_validators.iter().map(Instance::stop).collect();
         try_join_all(futures).await?;
+
+        let backup = self.maybe_start_backup()?;
         let buffer = Duration::from_secs(60);
         let window = self.duration + buffer * 2;
         let instances = if context.emit_to_validator {
@@ -120,112 +174,124 @@ impl Experiment for PerformanceBenchmark {
             self.up_fullnodes.clone()
         };
         let emit_job_request = match self.tps {
-            Some(tps) => EmitJobRequest::fixed_tps(instances, tps),
-            None => EmitJobRequest::for_instances(instances, context.global_emit_job_request),
+            Some(tps) => EmitJobRequest::fixed_tps(instances, tps, self.gas_price, self.invalid_tx),
+            None => EmitJobRequest::for_instances(
+                instances,
+                context.global_emit_job_request,
+                self.gas_price,
+                self.invalid_tx,
+            ),
         };
-        let emit_txn = context.tx_emitter.emit_txn_for(window, emit_job_request);
-        let trace_tail = &context.trace_tail;
-        let trace_delay = buffer;
-        let trace = self.trace;
-        let capture_trace = async move {
-            if trace {
-                tokio::time::delay_for(trace_delay).await;
-                Some(trace_tail.capture_trace(Duration::from_secs(5)).await)
-            } else {
-                None
-            }
+        let emit_txn = match self.periodic_stats {
+            Some(interval) => context
+                .tx_emitter
+                .emit_txn_for_with_stats(window, emit_job_request, interval)
+                .boxed(),
+            None => context
+                .tx_emitter
+                .emit_txn_for(window, emit_job_request)
+                .boxed(),
         };
-        let (stats, trace) = join!(emit_txn, capture_trace);
-        let stats = stats?;
-        if let Some(trace) = trace {
-            info!("Traced {} events", trace.len());
-            let mut events = vec![];
-            for (node, mut event) in trace {
-                // This could be done more elegantly, but for now this will do
-                event
-                    .json
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("peer".to_string(), Value::String(node));
-                events.push(event);
-            }
-            events.sort_by_key(|k| k.timestamp);
-            let node =
-                debug_interface::libra_trace::random_node(&events[..], "json-rpc::submit", "txn::")
-                    .expect("No trace node found");
-            info!("Tracing {}", node);
-            debug_interface::libra_trace::trace_node(&events[..], &node);
-        }
-        let end = unix_timestamp_now() - buffer;
-        let start = end - window + 2 * buffer;
-        let avg_txns_per_block = stats::avg_txns_per_block(&context.prometheus, start, end);
-        let avg_txns_per_block = avg_txns_per_block
-            .map_err(|e| warn!("Failed to query avg_txns_per_block: {}", e))
-            .ok();
-        let avg_latency_client = stats.latency / stats.committed;
-        let p99_latency = stats.latency_buckets.percentile(99, 100);
-        let avg_tps = stats.committed / window.as_secs();
-        info!(
-            "Link to dashboard : {}",
-            context.prometheus.link_to_dashboard(start, end)
-        );
-        info!(
-            "Tx status: txn {}, avg latency {}",
-            stats.committed as u64, avg_latency_client
-        );
-        let futures: Vec<_> = self
-            .down_validators
-            .iter()
-            .map(|ic| ic.start(false))
-            .collect();
+
+        let stats = emit_txn.await;
+
+        // Report
+        self.report(context, buffer, window, stats?).await?;
+
+        // Clean up
+        drop(backup);
+        let futures: Vec<_> = self.down_validators.iter().map(|ic| ic.start()).collect();
         try_join_all(futures).await?;
-        let submitted_txn = stats.submitted;
-        let expired_txn = stats.expired;
-        context
-            .report
-            .report_metric(&self, "submitted_txn", submitted_txn as f64);
-        context
-            .report
-            .report_metric(&self, "expired_txn", expired_txn as f64);
-        if let Some(avg_txns_per_block) = avg_txns_per_block {
-            context
-                .report
-                .report_metric(&self, "avg_txns_per_block", avg_txns_per_block);
-        }
-        context
-            .report
-            .report_metric(&self, "avg_tps", avg_tps as f64);
-        context
-            .report
-            .report_metric(&self, "avg_latency", avg_latency_client as f64);
-        context
-            .report
-            .report_metric(&self, "p99_latency", p99_latency as f64);
-        let expired_text = if expired_txn == 0 {
-            "no expired txns".to_string()
-        } else {
-            format!("(!) expired {} out of {} txns", expired_txn, submitted_txn)
-        };
-        context.report.report_text(format!(
-            "{} : {:.0} TPS, {:.1} ms latency, {:.1} ms p99 latency, {}",
-            self, avg_tps, avg_latency_client, p99_latency, expired_text
-        ));
+
         Ok(())
     }
 
     fn deadline(&self) -> Duration {
-        Duration::from_secs(600) + self.duration
+        Duration::from_secs(900) + self.duration
+    }
+}
+
+impl PerformanceBenchmark {
+    fn maybe_start_backup(&self) -> Result<Option<JoinHandle<()>>> {
+        if !self.backup {
+            return Ok(None);
+        }
+
+        let mut rng = ThreadRng::default();
+        let validator = self
+            .up_validators
+            .choose(&mut rng)
+            .ok_or_else(|| anyhow!("No up validator."))?
+            .clone();
+
+        const COMMAND: &str = "/opt/diem/bin/db-backup coordinator run \
+            --transaction-batch-size 20000 \
+            --state-snapshot-interval 1 \
+            local-fs --dir $(mktemp -d -t diem_backup_XXXXXXXX);";
+
+        Ok(Some(tokio::spawn(async move {
+            validator.exec(COMMAND, true).await.unwrap_or_else(|e| {
+                let err_msg = e.to_string();
+                if err_msg.ends_with("exit code Some(137)") {
+                    info!("db-backup killed.");
+                } else {
+                    warn!("db-backup failed: {}", err_msg);
+                }
+            })
+        })))
+    }
+
+    async fn report(
+        &mut self,
+        context: &mut Context<'_>,
+        buffer: Duration,
+        window: Duration,
+        stats: TxStats,
+    ) -> Result<()> {
+        let end = duration_since_epoch() - buffer;
+        let start = end - window + 2 * buffer;
+        info!(
+            "Link to dashboard : {}",
+            context.prometheus.link_to_dashboard(start, end)
+        );
+
+        let pv = PrometheusRangeView::new(context.prometheus, start, end);
+
+        // Transaction stats
+        if let Some(avg_txns_per_block) = pv.avg_txns_per_block() {
+            context
+                .report
+                .report_metric(&self, "avg_txns_per_block", avg_txns_per_block);
+        }
+        let additional = if self.backup {
+            // Backup throughput
+            let bytes_per_sec = pv.avg_backup_bytes_per_second().unwrap_or(-1.0);
+            context
+                .report
+                .report_metric(&self, "avg_backup_bytes_per_second", bytes_per_sec);
+            format!(" backup: {},", human_readable_bytes_per_sec(bytes_per_sec))
+        } else {
+            "".to_string()
+        };
+        context
+            .report
+            .report_txn_stats(self.to_string(), stats, window, &additional);
+        Ok(())
     }
 }
 
 impl Display for PerformanceBenchmark {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         if let Some(tps) = self.tps {
-            write!(f, "fixed tps {}", tps)
+            write!(f, "fixed tps {}", tps)?;
         } else if self.percent_nodes_down == 0 {
-            write!(f, "all up")
+            write!(f, "all up")?;
         } else {
-            write!(f, "{}% down", self.percent_nodes_down)
+            write!(f, "{}% down", self.percent_nodes_down)?;
         }
+        if self.gas_price != 0 {
+            write!(f, ", gas price {}", self.gas_price)?;
+        }
+        Ok(())
     }
 }

@@ -1,9 +1,11 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
-use bytecode_source_map::utils::{remap_owned_loc_to_loc, source_map_from_file, OwnedLoc};
+use bytecode_source_map::utils::source_map_from_file;
+use move_binary_format::file_format::CompiledModule;
+use move_command_line_common::files::SOURCE_MAP_EXTENSION;
 use move_coverage::{coverage_map::CoverageMap, source_coverage::SourceCoverageBuilder};
 use std::{
     fs,
@@ -12,7 +14,6 @@ use std::{
     path::Path,
 };
 use structopt::StructOpt;
-use vm::file_format::CompiledModule;
 
 #[derive(Debug, StructOpt)]
 #[structopt(
@@ -39,7 +40,7 @@ struct Args {
 
 fn main() {
     let args = Args::from_args();
-    let source_map_extension = "mvsm";
+    let source_map_extension = SOURCE_MAP_EXTENSION;
     let coverage_map = if args.is_raw_trace_file {
         CoverageMap::from_trace_file(&args.input_trace_path)
     } else {
@@ -50,10 +51,9 @@ fn main() {
     let compiled_module =
         CompiledModule::deserialize(&bytecode_bytes).expect("Module blob can't be deserialized");
 
-    let source_map = source_map_from_file::<OwnedLoc>(
+    let source_map = source_map_from_file(
         &Path::new(&args.module_binary_path).with_extension(source_map_extension),
     )
-    .map(remap_owned_loc_to_loc)
     .unwrap();
     let source_path = Path::new(&args.source_file_path);
     let source_cov = SourceCoverageBuilder::new(&compiled_module, &coverage_map, &source_map);
@@ -67,7 +67,7 @@ fn main() {
     };
 
     source_cov
-        .compute_source_coverage(&source_path)
+        .compute_source_coverage(source_path)
         .output_source_coverage(&mut coverage_writer)
         .unwrap();
 }

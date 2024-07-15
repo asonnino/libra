@@ -1,10 +1,9 @@
 ---
 id: bytecode-verifier
 title: Bytecode Verifier
-custom_edit_url: https://github.com/libra/libra/edit/master/language/bytecode-verifier/README.md
+custom_edit_url: https://github.com/diem/diem/edit/main/language/bytecode-verifier/README.md
 ---
 
-# Bytecode Verifier
 
 ## Overview
 
@@ -34,10 +33,10 @@ Resources represent the assets of the blockchain. As such, there are certain res
 
 As mentioned above, this last rule around `Ret` implies that the resource *must* have been either:
 
-* Moved to global storage via `MoveToSender`.
+* Moved to global storage via `MoveTo`.
 * Destroyed via `Unpack`.
 
-Both `MoveToSender` and `Unpack` are internal to the module in which the resource is declared.
+Both `MoveTo` and `Unpack` are internal to the module in which the resource is declared.
 
 ## Reference Safety
 

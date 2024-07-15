@@ -1,10 +1,16 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::block::Block;
-use libra_crypto::{ed25519::Ed25519Signature, hash::TransactionAccumulatorHasher};
-use libra_crypto_derive::{CryptoHasher, LCSCryptoHash};
-use libra_types::{epoch_state::EpochState, proof::AccumulatorExtensionProof};
+use crate::{block::Block, vote_data::VoteData};
+use diem_crypto::{
+    ed25519::Ed25519Signature,
+    hash::{TransactionAccumulatorHasher, ACCUMULATOR_PLACEHOLDER_HASH},
+};
+use diem_crypto_derive::{BCSCryptoHash, CryptoHasher};
+use diem_types::{
+    epoch_state::EpochState,
+    proof::{accumulator::InMemoryAccumulator, AccumulatorExtensionProof},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     fmt::{Display, Formatter},
@@ -13,7 +19,7 @@ use std::{
 
 /// This structure contains all the information needed by safety rules to
 /// evaluate a proposal / block for correctness / safety and to produce a Vote.
-#[derive(Clone, CryptoHasher, Deserialize, LCSCryptoHash, Serialize)]
+#[derive(Clone, Debug, CryptoHasher, Deserialize, BCSCryptoHash, Serialize)]
 pub struct VoteProposal {
     /// Contains the data necessary to construct the parent's execution output state
     /// and the childs in a verifiable way
@@ -51,6 +57,34 @@ impl VoteProposal {
     pub fn next_epoch_state(&self) -> Option<&EpochState> {
         self.next_epoch_state.as_ref()
     }
+
+    /// This function returns the vote data with a dummy executed_state_id and version
+    pub fn vote_data_ordering_only(&self) -> VoteData {
+        VoteData::new(
+            self.block().gen_block_info(
+                *ACCUMULATOR_PLACEHOLDER_HASH,
+                0,
+                self.next_epoch_state().cloned(),
+            ),
+            self.block().quorum_cert().certified_block().clone(),
+        )
+    }
+
+    /// This function returns the vote data with a extension proof.
+    /// Attention: this function itself does not verify the proof.
+    pub fn vote_data_with_extension_proof(
+        &self,
+        new_tree: &InMemoryAccumulator<TransactionAccumulatorHasher>,
+    ) -> VoteData {
+        VoteData::new(
+            self.block().gen_block_info(
+                new_tree.root_hash(),
+                new_tree.version(),
+                self.next_epoch_state().cloned(),
+            ),
+            self.block().quorum_cert().certified_block().clone(),
+        )
+    }
 }
 
 impl Display for VoteProposal {
@@ -60,12 +94,12 @@ impl Display for VoteProposal {
 }
 
 /// Wraps a vote_proposal and its signature.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MaybeSignedVoteProposal {
     /// The vote proposal to be signed.
     pub vote_proposal: VoteProposal,
 
-    /// The signature of this proposal's hash from Libra Execution Correctness service. It is
+    /// The signature of this proposal's hash from Diem Execution Correctness service. It is
     /// an `Option` because the LEC can be configured to not sign the vote hash.
     pub signature: Option<Ed25519Signature>,
 }

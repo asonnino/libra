@@ -1,4 +1,5 @@
-module TestUnusedSchema {
+// flag: --severity=note
+module 0x42::TestUnusedSchema {
 
     spec module {
         pragma verify = true;
@@ -34,7 +35,7 @@ module TestUnusedSchema {
         if (i > 10) { i + 2 } else { i + 1 }
     }
 
-    spec fun foo {
+    spec foo {
         include i > 10 ==> AddsTwo;
     }
 }

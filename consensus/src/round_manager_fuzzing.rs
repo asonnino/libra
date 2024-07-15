@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -16,25 +16,26 @@ use crate::{
     test_utils::{EmptyStateComputer, MockStorage, MockTransactionManager},
     util::{mock_time_service::SimulatedTimeService, time_service::TimeService},
 };
-use channel::{self, libra_channel, message_queues::QueueStyle};
+use channel::{self, diem_channel, message_queues::QueueStyle};
 use consensus_types::proposal_msg::ProposalMsg;
-use futures::{channel::mpsc, executor::block_on};
-use libra_types::{
+use diem_infallible::Mutex;
+use diem_types::{
     epoch_change::EpochChangeProof,
     epoch_state::EpochState,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
-    on_chain_config::ValidatorSet,
+    on_chain_config::{OnChainConsensusConfig, ValidatorSet},
     validator_info::ValidatorInfo,
     validator_signer::ValidatorSigner,
     validator_verifier::ValidatorVerifier,
 };
+use futures::{channel::mpsc, executor::block_on};
 use network::{
     peer_manager::{ConnectionRequestSender, PeerManagerRequestSender},
     protocols::network::NewNetworkSender,
 };
 use once_cell::sync::Lazy;
 use safety_rules::{test_utils, SafetyRules, TSafetyRules};
-use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::runtime::Runtime;
 
 // This generates a proposal for round 1
@@ -49,7 +50,7 @@ pub fn generate_corpus_proposal() -> Vec<u8> {
             })
             .await;
         // serialize and return proposal
-        lcs::to_bytes(&proposal.unwrap()).unwrap()
+        serde_json::to_vec(&proposal.unwrap()).unwrap()
     })
 }
 
@@ -106,14 +107,12 @@ fn create_node_for_fuzzing() -> RoundManager {
 
     // TODO: remove
     let proof = make_initial_epoch_change_proof(&signer);
-    let mut safety_rules = SafetyRules::new(test_utils::test_storage(&signer), false);
+    let mut safety_rules = SafetyRules::new(test_utils::test_storage(&signer), false, false, false);
     safety_rules.initialize(&proof).unwrap();
 
     // TODO: mock channels
-    let (network_reqs_tx, _network_reqs_rx) =
-        libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
-    let (connection_reqs_tx, _) =
-        libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+    let (network_reqs_tx, _network_reqs_rx) = diem_channel::new(QueueStyle::FIFO, 8, None);
+    let (connection_reqs_tx, _) = diem_channel::new(QueueStyle::FIFO, 8, None);
     let network_sender = ConsensusNetworkSender::new(
         PeerManagerRequestSender::new(network_reqs_tx),
         ConnectionRequestSender::new(connection_reqs_tx),
@@ -160,10 +159,15 @@ fn create_node_for_fuzzing() -> RoundManager {
         round_state,
         proposer_election,
         proposal_generator,
-        MetricsSafetyRules::new(Box::new(safety_rules)),
+        Arc::new(Mutex::new(MetricsSafetyRules::new(
+            Box::new(safety_rules),
+            storage.clone(),
+        ))),
         network,
         Arc::new(MockTransactionManager::new(None)),
         storage,
+        false,
+        OnChainConsensusConfig::default(),
     )
 }
 
@@ -172,7 +176,7 @@ pub fn fuzz_proposal(data: &[u8]) {
     // create node
     let mut round_manager = create_node_for_fuzzing();
 
-    let proposal: ProposalMsg = match lcs::from_bytes(data) {
+    let proposal: ProposalMsg = match serde_json::from_slice(data) {
         Ok(xx) => xx,
         Err(_) => {
             if cfg!(test) {

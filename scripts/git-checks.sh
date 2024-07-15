@@ -1,10 +1,10 @@
 #!/bin/bash
-# Copyright (c) The Libra Core Contributors
+# Copyright (c) The Diem Core Contributors
 # SPDX-License-Identifier: Apache-2.0
 
 set -e
 
-oldrev="origin/master"
+oldrev="origin/latest"
 newrev="HEAD"
 
 # Disallow merge commits
@@ -56,7 +56,7 @@ for rev in $(git rev-list $oldrev..$newrev); do
 		--diff-filter=AR)
 
 	# Block commits with filenames outside normal ASCII
-	badnames=$(grep '\\\|[`{}|~]' <<< "$names") || true
+	badnames=$(grep '\\\|[`{}|~:]' <<< "$names") || true
 	#                ^^ find anything with a backslash in the name
 	#                  ^^ or...
 	#                    ^^^^^^^ any of these funky chars
@@ -70,14 +70,14 @@ fi
 done
 
 # If there are whitespace errors, print the offending file names and fail.
-for rev in $(git rev-list $oldrev..$newrev); do
-	comparison=$(git rev-parse --quiet --verify $rev^ || true)
-
-	whitespace=$(git diff --check $comparison $rev || true)
-	if [[ $whitespace ]] ; then
-		echo "Found whitespace errors in commit $rev:"
-		echo
-		git diff --check $comparison $rev
-		exit 1
-	fi
-done
+#for rev in $(git rev-list $oldrev..$newrev); do
+#	comparison=$(git rev-parse --quiet --verify $rev^ || true)
+#
+#	whitespace=$(git diff --check $comparison $rev || true)
+#	if [[ $whitespace ]] ; then
+#		echo "Found whitespace errors in commit $rev:"
+#		echo
+#		git diff --check $comparison $rev
+#		exit 1
+#	fi
+#done

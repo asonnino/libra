@@ -1,45 +1,40 @@
-error: 
+error[E05001]: ability constraint not satisfied
+  ┌─ tests/move_check/typing/constraints_not_satisfied_type_arguments_internal_pack.move:8:9
+  │
+8 │         Box<CupD<R>>{ f: abort 0 };
+  │         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  │         │   │
+  │         │   The type '0x8675309::M::Box<0x8675309::M::CupD<0x8675309::M::R>>' can have the ability 'drop' but the type argument '0x8675309::M::CupD<0x8675309::M::R>' does not have the required ability 'drop'
+  │         Cannot ignore values without the 'drop' ability. The value must be used
+  │         The type '0x8675309::M::Box<0x8675309::M::CupD<0x8675309::M::R>>' does not have the ability 'drop'
 
-   ┌── tests/move_check/typing/constraints_not_satisfied_type_arguments_internal_pack.move:8:9 ───
-   │
- 8 │         Box<CupC<R>>{};
-   │         ^^^^^^^^^^^^^^ Cannot ignore resource values. The value must be used
-   ·
- 8 │         Box<CupC<R>>{};
-   │         -------------- The type: '0x8675309::M::Box<0x8675309::M::CupC<0x8675309::M::R>>'
-   ·
- 3 │     resource struct R {}
-   │     -------- Is found to be a non-copyable type here
-   │
+error[E05001]: ability constraint not satisfied
+  ┌─ tests/move_check/typing/constraints_not_satisfied_type_arguments_internal_pack.move:8:13
+  │
+2 │     struct CupD<T: drop> has drop { f: T }
+  │                    ---- 'drop' constraint declared here
+3 │     struct R {}
+  │            - To satisfy the constraint, the 'drop' ability would need to be added here
+  ·
+8 │         Box<CupD<R>>{ f: abort 0 };
+  │             ^^^^^^^
+  │             │    │
+  │             │    The type '0x8675309::M::R' does not have the ability 'drop'
+  │             'drop' constraint not satisifed
 
-error: 
+warning[W09005]: dead or unreachable code
+  ┌─ tests/move_check/typing/constraints_not_satisfied_type_arguments_internal_pack.move:8:26
+  │
+8 │         Box<CupD<R>>{ f: abort 0 };
+  │                          ^^^^^^^ Invalid use of a divergent expression. The code following the evaluation of this expression will be dead and should be removed.
 
-   ┌── tests/move_check/typing/constraints_not_satisfied_type_arguments_internal_pack.move:8:13 ───
-   │
- 8 │         Box<CupC<R>>{};
-   │             ^^^^^^^ Constraint not satisfied.
-   ·
- 8 │         Box<CupC<R>>{};
-   │                  - The resource type '0x8675309::M::R' does not satisfy the constraint 'copyable'
-   ·
- 3 │     resource struct R {}
-   │     -------- The type's constraint information was determined here
-   ·
- 2 │     struct CupC<T: copyable> {}
-   │                    -------- 'copyable' constraint declared here
-   │
-
-error: 
-
-   ┌── tests/move_check/typing/constraints_not_satisfied_type_arguments_internal_pack.move:9:9 ───
-   │
- 9 │         Box<R>{};
-   │         ^^^^^^^^ Cannot ignore resource values. The value must be used
-   ·
- 9 │         Box<R>{};
-   │         -------- The type: '0x8675309::M::Box<0x8675309::M::R>'
-   ·
- 3 │     resource struct R {}
-   │     -------- Is found to be a non-copyable type here
-   │
+error[E05001]: ability constraint not satisfied
+  ┌─ tests/move_check/typing/constraints_not_satisfied_type_arguments_internal_pack.move:9:9
+  │
+9 │         Box<R>{ f: R{} };
+  │         ^^^^^^^^^^^^^^^^
+  │         │   │
+  │         │   The type '0x8675309::M::Box<0x8675309::M::R>' can have the ability 'drop' but the type argument '0x8675309::M::R' does not have the required ability 'drop'
+  │         Cannot ignore values without the 'drop' ability. The value must be used
+  │         The type '0x8675309::M::Box<0x8675309::M::R>' does not have the ability 'drop'
 

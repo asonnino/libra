@@ -1,0 +1,23 @@
+[package]
+name = "diem-validator-interface"
+version = "0.1.0"
+authors = ["Diem Association <opensource@diem.com>"]
+description = "Defines interfaces between the diem nodes and local move infrastructure"
+repository = "https://github.com/diem/diem"
+homepage = "https://diem.com"
+license = "Apache-2.0"
+publish = false
+edition = "2018"
+
+[dependencies]
+anyhow = "1.0.38"
+diem-config = { path = "../../../config" }
+diem-client = { path = "../../../crates/diem-client" }
+diem-types = { path = "../../../types" }
+diemdb = { path = "../../../storage/diemdb" }
+diem-workspace-hack = { path = "../../../crates/diem-workspace-hack" }
+storage-interface = { path = "../../../storage/storage-interface" }
+diem-scratchpad = { path = "../../../storage/diem-scratchpad" }
+diem-state-view = { path = "../../../storage/state-view" }
+move-binary-format = { path = "../../move-binary-format" }
+bcs = { git = "https://github.com/diem/bcs", rev = "30ce9f4ac51342d2fb4c04c4f5b40683d9652dc6" }

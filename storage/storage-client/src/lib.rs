@@ -1,26 +1,32 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
 use anyhow::Result;
-use libra_crypto::HashValue;
-use libra_secure_net::NetworkClient;
-use libra_types::{
+use diem_crypto::HashValue;
+use diem_infallible::Mutex;
+use diem_logger::warn;
+use diem_secure_net::NetworkClient;
+use diem_types::{
     account_address::AccountAddress,
     account_state_blob::{AccountStateBlob, AccountStateWithProof},
-    contract_event::ContractEvent,
+    contract_event::{ContractEvent, EventByVersionWithProof, EventWithProof},
     epoch_change::EpochChangeProof,
     event::EventKey,
     ledger_info::LedgerInfoWithSignatures,
-    proof::{AccumulatorConsistencyProof, SparseMerkleProof},
-    transaction::{TransactionListWithProof, TransactionToCommit, TransactionWithProof, Version},
+    proof::SparseMerkleProof,
+    state_proof::StateProof,
+    transaction::{
+        AccountTransactionsWithProof, TransactionListWithProof, TransactionToCommit,
+        TransactionWithProof, Version,
+    },
 };
 use serde::de::DeserializeOwned;
-use std::{net::SocketAddr, sync::Mutex};
+use std::net::SocketAddr;
 use storage_interface::{
-    DbReader, DbWriter, Error, GetAccountStateWithProofByVersionRequest, SaveTransactionsRequest,
-    StartupInfo, StorageRequest, TreeState,
+    DbReader, DbWriter, Error, GetAccountStateWithProofByVersionRequest, Order,
+    SaveTransactionsRequest, StartupInfo, StorageRequest, TreeState,
 };
 
 pub struct StorageClient {
@@ -28,25 +34,44 @@ pub struct StorageClient {
 }
 
 impl StorageClient {
-    pub fn new(server_address: &SocketAddr) -> Self {
+    pub fn new(server_address: &SocketAddr, timeout: u64) -> Self {
         Self {
-            network_client: Mutex::new(NetworkClient::new(*server_address)),
+            network_client: Mutex::new(NetworkClient::new("storage", *server_address, timeout)),
         }
     }
 
+    fn process_one_message(&self, input: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut client = self.network_client.lock();
+        client.write(input)?;
+        client.read().map_err(|e| e.into())
+    }
+
     fn request<T: DeserializeOwned>(&self, input: StorageRequest) -> std::result::Result<T, Error> {
-        let input_message = lcs::to_bytes(&input)?;
-        let mut client = self.network_client.lock().unwrap();
-        client.write(&input_message)?;
-        let result = client.read()?;
-        lcs::from_bytes(&result)?
+        let input_message = bcs::to_bytes(&input)?;
+        let result = loop {
+            match self.process_one_message(&input_message) {
+                Err(err) => warn!(
+                    error = ?err,
+                    request = ?input,
+                    "Failed to communicate with storage service.",
+                ),
+                Ok(value) => break value,
+            }
+        };
+        bcs::from_bytes(&result)?
     }
 
     pub fn get_account_state_with_proof_by_version(
         &self,
         address: AccountAddress,
         version: Version,
-    ) -> std::result::Result<(Option<AccountStateBlob>, SparseMerkleProof), Error> {
+    ) -> std::result::Result<
+        (
+            Option<AccountStateBlob>,
+            SparseMerkleProof<AccountStateBlob>,
+        ),
+        Error,
+    > {
         self.request(StorageRequest::GetAccountStateWithProofByVersionRequest(
             Box::new(GetAccountStateWithProofByVersionRequest::new(
                 address, version,
@@ -75,7 +100,10 @@ impl DbReader for StorageClient {
         &self,
         address: AccountAddress,
         version: u64,
-    ) -> Result<(Option<AccountStateBlob>, SparseMerkleProof)> {
+    ) -> Result<(
+        Option<AccountStateBlob>,
+        SparseMerkleProof<AccountStateBlob>,
+    )> {
         Ok(Self::get_account_state_with_proof_by_version(
             self, address, version,
         )?)
@@ -96,13 +124,24 @@ impl DbReader for StorageClient {
         unimplemented!()
     }
 
-    fn get_txn_by_account(
+    fn get_account_transaction(
         &self,
         _address: AccountAddress,
         _seq_num: u64,
-        _ledger_version: u64,
-        _fetch_events: bool,
+        _include_events: bool,
+        _ledger_version: Version,
     ) -> Result<Option<TransactionWithProof>> {
+        unimplemented!()
+    }
+
+    fn get_account_transactions(
+        &self,
+        _address: AccountAddress,
+        _start_seq_num: u64,
+        _limit: u64,
+        _include_events: bool,
+        _ledger_version: Version,
+    ) -> Result<AccountTransactionsWithProof> {
         unimplemented!()
     }
 
@@ -120,20 +159,33 @@ impl DbReader for StorageClient {
         &self,
         _key: &EventKey,
         _start: u64,
-        _ascending: bool,
+        _order: Order,
         _limit: u64,
     ) -> Result<Vec<(u64, ContractEvent)>> {
         unimplemented!()
     }
 
-    fn get_state_proof(
+    fn get_events_with_proofs(
         &self,
-        _known_version: u64,
-    ) -> Result<(
-        LedgerInfoWithSignatures,
-        EpochChangeProof,
-        AccumulatorConsistencyProof,
-    )> {
+        _event_key: &EventKey,
+        _start: u64,
+        _order: Order,
+        _limit: u64,
+        _known_version: Option<u64>,
+    ) -> Result<Vec<EventWithProof>> {
+        unimplemented!();
+    }
+
+    fn get_event_by_version_with_proof(
+        &self,
+        _event_key: &EventKey,
+        _version: u64,
+        _proof_version: u64,
+    ) -> Result<EventByVersionWithProof> {
+        unimplemented!()
+    }
+
+    fn get_state_proof(&self, _known_version: u64) -> Result<StateProof> {
         unimplemented!()
     }
 
@@ -141,7 +193,7 @@ impl DbReader for StorageClient {
         &self,
         _known_version: u64,
         _ledger_info: LedgerInfoWithSignatures,
-    ) -> Result<(EpochChangeProof, AccumulatorConsistencyProof)> {
+    ) -> Result<StateProof> {
         unimplemented!()
     }
 

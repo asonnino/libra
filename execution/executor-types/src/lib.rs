@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
@@ -7,29 +7,37 @@ mod error;
 pub use error::Error;
 
 use anyhow::Result;
-use libra_crypto::{
+use diem_crypto::{
     ed25519::Ed25519Signature,
-    hash::{TransactionAccumulatorHasher, SPARSE_MERKLE_PLACEHOLDER_HASH},
+    hash::{
+        TransactionAccumulatorHasher, ACCUMULATOR_PLACEHOLDER_HASH, SPARSE_MERKLE_PLACEHOLDER_HASH,
+    },
     HashValue,
 };
-use libra_types::{
+use diem_scratchpad::ProofRead;
+use diem_types::{
+    account_state_blob::AccountStateBlob,
     contract_event::ContractEvent,
     epoch_state::EpochState,
     ledger_info::LedgerInfoWithSignatures,
-    proof::{accumulator::InMemoryAccumulator, AccumulatorExtensionProof, SparseMerkleProof},
-    transaction::{Transaction, TransactionListWithProof, TransactionStatus, Version},
+    proof::{accumulator::InMemoryAccumulator, AccumulatorExtensionProof},
+    transaction::{
+        Transaction, TransactionInfo, TransactionListWithProof, TransactionStatus, Version,
+    },
 };
-use scratchpad::{ProofRead, SparseMerkleTree};
 use serde::{Deserialize, Serialize};
 use std::{cmp::max, collections::HashMap, sync::Arc};
 use storage_interface::TreeState;
 
-pub trait ChunkExecutor: Send {
+type SparseMerkleProof = diem_types::proof::SparseMerkleProof<AccountStateBlob>;
+type SparseMerkleTree = diem_scratchpad::SparseMerkleTree<AccountStateBlob>;
+
+pub trait ChunkExecutor: Send + Sync {
     /// Verifies the transactions based on the provided proofs and ledger info. If the transactions
     /// are valid, executes them and commits immediately if execution results match the proofs.
     /// Returns a vector of reconfiguration events in the chunk
     fn execute_and_commit_chunk(
-        &mut self,
+        &self,
         txn_list_with_proof: TransactionListWithProof,
         // Target LI that has been verified independently: the proofs are relative to this version.
         verified_target_li: LedgerInfoWithSignatures,
@@ -39,16 +47,16 @@ pub trait ChunkExecutor: Send {
     ) -> Result<Vec<ContractEvent>>;
 }
 
-pub trait BlockExecutor: Send {
+pub trait BlockExecutor: Send + Sync {
     /// Get the latest committed block id
-    fn committed_block_id(&mut self) -> Result<HashValue, Error>;
+    fn committed_block_id(&self) -> Result<HashValue, Error>;
 
     /// Reset the internal state including cache with newly fetched latest committed block from storage.
-    fn reset(&mut self) -> Result<(), Error>;
+    fn reset(&self) -> Result<(), Error>;
 
     /// Executes a block.
     fn execute_block(
-        &mut self,
+        &self,
         block: (HashValue, Vec<Transaction>),
         parent_block_id: HashValue,
     ) -> Result<StateComputeResult, Error>;
@@ -62,15 +70,22 @@ pub trait BlockExecutor: Send {
     /// and only `C` and `E` have signatures, we will send `A`, `B` and `C` in the first batch,
     /// then `D` and `E` later in the another batch.
     /// Commits a block and all its ancestors in a batch manner.
-    ///
-    /// Returns `Ok(Result<Vec<Transaction>, Vec<ContractEvents>)` if successful,
-    /// where Vec<Transaction> is a vector of transactions that were kept from the submitted blocks, and
-    /// Vec<ContractEvents> is a vector of reconfiguration events in the submitted blocks
     fn commit_blocks(
-        &mut self,
+        &self,
         block_ids: Vec<HashValue>,
         ledger_info_with_sigs: LedgerInfoWithSignatures,
-    ) -> Result<(Vec<Transaction>, Vec<ContractEvent>), Error>;
+    ) -> Result<(), Error>;
+}
+
+pub trait TransactionReplayer: Send {
+    fn replay_chunk(
+        &self,
+        first_version: Version,
+        txns: Vec<Transaction>,
+        txn_infos: Vec<TransactionInfo>,
+    ) -> Result<()>;
+
+    fn expecting_version(&self) -> Version;
 }
 
 /// A structure that summarizes the result of the execution needed for consensus to agree on.
@@ -111,6 +126,8 @@ pub struct StateComputeResult {
 
     /// The signature of the VoteProposal corresponding to this block.
     signature: Option<Ed25519Signature>,
+
+    reconfig_events: Vec<ContractEvent>,
 }
 
 impl StateComputeResult {
@@ -123,6 +140,7 @@ impl StateComputeResult {
         epoch_state: Option<EpochState>,
         compute_status: Vec<TransactionStatus>,
         transaction_info_hashes: Vec<HashValue>,
+        reconfig_events: Vec<ContractEvent>,
     ) -> Self {
         Self {
             root_hash,
@@ -133,14 +151,43 @@ impl StateComputeResult {
             epoch_state,
             compute_status,
             transaction_info_hashes,
+            reconfig_events,
             signature: None,
         }
+    }
+
+    /// generate a new dummy state compute result with a given root hash.
+    /// this function is used in RandomComputeResultStateComputer to assert that the compute
+    /// function is really called.
+    pub fn new_dummy_with_root_hash(root_hash: HashValue) -> Self {
+        Self {
+            root_hash,
+            frozen_subtree_roots: vec![],
+            num_leaves: 0,
+            parent_frozen_subtree_roots: vec![],
+            parent_num_leaves: 0,
+            epoch_state: None,
+            compute_status: vec![],
+            transaction_info_hashes: vec![],
+            reconfig_events: vec![],
+            signature: None,
+        }
+    }
+
+    /// generate a new dummy state compute result with ACCUMULATOR_PLACEHOLDER_HASH as the root hash.
+    /// this function is used in ordering_state_computer as a dummy state compute result,
+    /// where the real compute result is generated after ordering_state_computer.commit pushes
+    /// the blocks and the finality proof to the execution phase.
+    pub fn new_dummy() -> Self {
+        StateComputeResult::new_dummy_with_root_hash(*ACCUMULATOR_PLACEHOLDER_HASH)
     }
 }
 
 impl StateComputeResult {
     pub fn version(&self) -> Version {
-        max(self.num_leaves, 1) - 1
+        max(self.num_leaves, 1)
+            .checked_sub(1)
+            .expect("Integer overflow occurred")
     }
 
     pub fn root_hash(&self) -> HashValue {
@@ -185,6 +232,10 @@ impl StateComputeResult {
 
     pub fn has_reconfiguration(&self) -> bool {
         self.epoch_state.is_some()
+    }
+
+    pub fn reconfig_events(&self) -> &[ContractEvent] {
+        &self.reconfig_events
     }
 
     pub fn signature(&self) -> &Option<Ed25519Signature> {
@@ -242,11 +293,7 @@ impl ExecutedTrees {
 
     pub fn version(&self) -> Option<Version> {
         let num_elements = self.txn_accumulator().num_leaves() as u64;
-        if num_elements > 0 {
-            Some(num_elements - 1)
-        } else {
-            None
-        }
+        num_elements.checked_sub(1)
     }
 
     pub fn state_id(&self) -> HashValue {
@@ -286,7 +333,7 @@ impl ProofReader {
     }
 }
 
-impl ProofRead for ProofReader {
+impl ProofRead<AccountStateBlob> for ProofReader {
     fn get_proof(&self, key: HashValue) -> Option<&SparseMerkleProof> {
         self.account_to_proof.get(&key)
     }

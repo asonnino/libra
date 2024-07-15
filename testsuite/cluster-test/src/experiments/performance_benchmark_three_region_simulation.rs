@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -9,7 +9,6 @@ use crate::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
-use libra_logger::info;
 use std::{
     fmt::{Display, Error, Formatter},
     time::Duration,
@@ -60,52 +59,25 @@ impl Experiment for PerformanceBenchmarkThreeRegionSimulation {
             EmitJobRequest::for_instances(
                 context.cluster.validator_instances().to_vec(),
                 context.global_emit_job_request,
+                0,
+                0,
             )
         } else {
             EmitJobRequest::for_instances(
                 context.cluster.fullnode_instances().to_vec(),
                 context.global_emit_job_request,
+                0,
+                0,
             )
         };
         let stats = context
             .tx_emitter
             .emit_txn_for(window, emit_job_request)
             .await?;
-        let avg_tps = stats.committed / window.as_secs();
-        let avg_latency_client = stats.latency / stats.committed;
-        let p99_latency = stats.latency_buckets.percentile(99, 100);
-        let submitted_txn = stats.submitted;
-        let expired_txn = stats.expired;
-        info!(
-            "Tx status from client side: txn {}, avg latency {}",
-            stats.committed as u64, avg_latency_client
-        );
-
         effects::deactivate_all(&mut effects).await?;
         context
             .report
-            .report_metric(&self, "submitted_txn", submitted_txn as f64);
-        context
-            .report
-            .report_metric(&self, "expired_txn", expired_txn as f64);
-        context
-            .report
-            .report_metric(&self, "avg_tps", avg_tps as f64);
-        context
-            .report
-            .report_metric(&self, "avg_latency", avg_latency_client as f64);
-        context
-            .report
-            .report_metric(&self, "p99_latency", p99_latency as f64);
-        let expired_text = if expired_txn == 0 {
-            "no expired txns".to_string()
-        } else {
-            format!("(!) expired {} out of {} txns", expired_txn, submitted_txn)
-        };
-        context.report.report_text(format!(
-            "{} : {:.0} TPS, {:.1} ms latency, {:.1} ms p99 latency, {}",
-            self, avg_tps, avg_latency_client, p99_latency, expired_text
-        ));
+            .report_txn_stats(self.to_string(), stats, window, "");
         Ok(())
     }
 

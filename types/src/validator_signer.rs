@@ -1,13 +1,15 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::account_address::AccountAddress;
-use libra_crypto::{
+use diem_crypto::{
     ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature},
+    hash::CryptoHash,
     test_utils::TEST_SEED,
-    HashValue, PrivateKey, SigningKey, Uniform,
+    PrivateKey, SigningKey, Uniform,
 };
 use rand::{rngs::StdRng, SeedableRng};
+use serde::ser::Serialize;
 use std::convert::TryFrom;
 
 /// ValidatorSigner associates an author with public and private keys with helpers for signing and
@@ -29,8 +31,8 @@ impl ValidatorSigner {
     }
 
     /// Constructs a signature for `message` using `private_key`.
-    pub fn sign_message(&self, message: HashValue) -> Ed25519Signature {
-        self.private_key.sign_message(&message)
+    pub fn sign<T: Serialize + CryptoHash>(&self, message: &T) -> Ed25519Signature {
+        self.private_key.sign(message)
     }
 
     /// Returns the author associated with this signer.
@@ -76,7 +78,7 @@ impl ValidatorSigner {
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod proptests {
     use super::*;
-    use libra_crypto::Genesis;
+    use diem_crypto::Genesis;
     use proptest::{prelude::*, sample, strategy::LazyJust};
 
     #[allow(clippy::redundant_closure)]

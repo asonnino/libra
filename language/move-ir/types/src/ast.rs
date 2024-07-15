@@ -1,17 +1,19 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     location::*,
     spec_language_ast::{Condition, Invariant, SyntheticDefinition},
 };
-use anyhow::Result;
-use libra_types::account_address::AccountAddress;
-use move_core_types::{identifier::Identifier, language_storage::ModuleId, value::MoveValue};
+use move_core_types::{
+    account_address::AccountAddress, identifier::Identifier, language_storage::ModuleId,
+    value::MoveValue,
+};
+use move_symbol_pool::Symbol;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{BTreeSet, HashSet, VecDeque},
     fmt,
 };
 
@@ -20,7 +22,7 @@ use std::{
 //**************************************************************************************************
 
 #[derive(Debug, Clone)]
-/// A set of move modules and a Move transaction script
+/// A set of Move modules and a Move transaction script
 pub struct Program {
     /// The modules to publish
     pub modules: Vec<ModuleDefinition>,
@@ -46,7 +48,7 @@ pub enum ScriptOrModule {
 //**************************************************************************************************
 
 #[derive(Debug, Clone)]
-/// The move transaction script to be executed
+/// The Move transaction script to be executed
 pub struct Script {
     /// The dependencies of `main`, i.e. of the transaction script
     pub imports: Vec<ImportDefinition>,
@@ -65,13 +67,13 @@ pub struct Script {
 //**************************************************************************************************
 
 /// Newtype for a name of a module
-#[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
-pub struct ModuleName(String);
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
+pub struct ModuleName(pub Symbol);
 
 /// Newtype of the address + the module name
 /// `addr.m`
-#[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
-pub struct QualifiedModuleIdent {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
+pub struct ModuleIdent {
     /// Name for the module. Will be unique among modules published under the same address
     pub name: ModuleName,
     /// Address that this module is published under
@@ -81,8 +83,10 @@ pub struct QualifiedModuleIdent {
 /// A Move module
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModuleDefinition {
-    /// name of the module
-    pub name: ModuleName,
+    /// name and address of the module
+    pub identifier: ModuleIdent,
+    /// the module's friends
+    pub friends: Vec<ModuleIdent>,
     /// the module's dependencies
     pub imports: Vec<ImportDefinition>,
     /// Explicit declaration of dependencies. If not provided, will be inferred based on given
@@ -97,14 +101,6 @@ pub struct ModuleDefinition {
     pub functions: Vec<(FunctionName, Function)>,
     /// the synthetic, specification variables the module defines.
     pub synthetics: Vec<SyntheticDefinition>,
-}
-
-/// Either a qualified module name like `addr.m` or `Transaction.m`, which refers to a module in
-/// the same transaction.
-#[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
-pub enum ModuleIdent {
-    Transaction(ModuleName),
-    Qualified(QualifiedModuleIdent),
 }
 
 /// Explicitly given dependency
@@ -123,10 +119,10 @@ pub struct ModuleDependency {
 //**************************************************************************************************
 
 /// A dependency/import declaration
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportDefinition {
     /// the dependency
-    /// `addr.m` or `Transaction.m`
+    /// `addr.m`
     pub ident: ModuleIdent,
     /// the alias for that dependency
     /// `m`
@@ -139,35 +135,34 @@ pub struct ImportDefinition {
 
 /// Newtype for a variable/local
 #[derive(Debug, PartialEq, Hash, Eq, Clone, Ord, PartialOrd)]
-pub struct Var_(String);
+pub struct Var_(pub Symbol);
 
 /// The type of a variable with a location
 pub type Var = Spanned<Var_>;
 
 /// New type that represents a type variable. Used to declare type formals & reference them.
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
-pub struct TypeVar_(String);
+pub struct TypeVar_(pub Symbol);
 
 /// The type of a type variable with a location.
 pub type TypeVar = Spanned<TypeVar_>;
 
 //**************************************************************************************************
-// Kinds
+// Abilities
 //**************************************************************************************************
 
-// TODO: This enum is completely equivalent to vm::file_format::Kind.
-//       Should we just use vm::file_format::Kind or replace both with a common one?
-/// The kind of a type. Analogous to `vm::file_format::Kind`.
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum Kind {
-    /// Represents the super set of all types.
-    All,
-    /// `Resource` types must follow move semantics and various resource safety rules.
-    Resource,
-    /// `Copyable` types do not need to follow the `Resource` rules.
-    Copyable,
+/// The abilities of a type. Analogous to `move_binary_format::file_format::Ability`.
+#[derive(Debug, Clone, Eq, Copy, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Ability {
+    /// Allows values of types with this ability to be copied
+    Copy,
+    /// Allows values of types with this ability to be dropped or if left in a local at return
+    Drop,
+    /// Allows values of types with this ability to exist inside a struct in global storage
+    Store,
+    /// Allows the type to serve as a key for global storage operations
+    Key,
 }
-
 //**************************************************************************************************
 // Types
 //**************************************************************************************************
@@ -214,28 +209,49 @@ pub struct QualifiedStructIdent {
 
 /// The field newtype
 #[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
-pub struct Field_(String);
+pub struct Field_(pub Symbol);
 
 /// A field coupled with source location information
 pub type Field = Spanned<Field_>;
+
+/// A fully-qualified field identifier.
+///
+/// Rather than simply referring to a field 'f' with a single identifier and
+/// relying on type inference to determine the type of the struct being
+/// accessed, this type refers to the field 'f' on the explicit struct type
+/// 'S<T>' -- that is, 'S<T>::f'.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FieldIdent_ {
+    /// The name of the struct type on which the field is declared.
+    pub struct_name: StructName,
+    /// For generic struct types, the type parameters used to instantiate the
+    /// struct type (this is an empty vector for non-generic struct types).
+    pub type_actuals: Vec<Type>,
+    /// The name of the field.
+    pub field: Field,
+}
+
+pub type FieldIdent = Spanned<FieldIdent_>;
 
 /// A field map
 pub type Fields<T> = Vec<(Field, T)>;
 
 /// Newtype for the name of a struct
 #[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
-pub struct StructName(String);
+pub struct StructName(pub Symbol);
+
+/// A struct type parameter with its constraints and whether it's declared as phantom.
+pub type StructTypeParameter = (bool, TypeVar, BTreeSet<Ability>);
 
 /// A Move struct
 #[derive(Clone, Debug, PartialEq)]
 pub struct StructDefinition_ {
-    /// The struct will have kind resource if `is_nominal_resource` is true
-    /// and will be dependent on it's type arguments otherwise
-    pub is_nominal_resource: bool,
+    /// The declared abilities for the struct
+    pub abilities: BTreeSet<Ability>,
     /// Human-readable name for the struct that also serves as a nominal type
     pub name: StructName,
-    /// Kind constraints of the type parameters
-    pub type_formals: Vec<(TypeVar, Kind)>,
+    /// The list of formal type arguments
+    pub type_formals: Vec<StructTypeParameter>,
     /// the fields each instance has
     pub fields: StructDefinitionFields,
     /// the invariants for this struct
@@ -245,15 +261,14 @@ pub struct StructDefinition_ {
 pub type StructDefinition = Spanned<StructDefinition_>;
 
 /// An explicit struct dependency
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StructDependency {
-    /// The struct will have kind resource if `is_nominal_resource` is true
-    /// and will be dependent on it's type arguments otherwise
-    pub is_nominal_resource: bool,
+    /// The declared abilities for the struct
+    pub abilities: BTreeSet<Ability>,
     /// Human-readable name for the struct that also serves as a nominal type
     pub name: StructName,
-    /// Kind constraints of the type parameters
-    pub type_formals: Vec<(TypeVar, Kind)>,
+    /// The list of formal type arguments
+    pub type_formals: Vec<StructTypeParameter>,
 }
 
 /// The fields of a Move struct definition
@@ -270,8 +285,8 @@ pub enum StructDefinitionFields {
 //**************************************************************************************************
 
 /// Newtype for the name of a constant
-#[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Clone)]
-pub struct ConstantName(String);
+#[derive(Debug, Serialize, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Clone)]
+pub struct ConstantName(pub Symbol);
 
 /// A constant declaration in a module or script
 #[derive(Clone, Debug, PartialEq)]
@@ -290,7 +305,7 @@ pub struct Constant {
 
 /// Newtype for the name of a function
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Clone)]
-pub struct FunctionName(String);
+pub struct FunctionName(pub Symbol);
 
 /// The signature of a function
 #[derive(PartialEq, Debug, Clone)]
@@ -299,8 +314,8 @@ pub struct FunctionSignature {
     pub formals: Vec<(Var, Type)>,
     /// Optional return types
     pub return_type: Vec<Type>,
-    /// Possibly-empty list of (TypeVar, Kind) pairs.s.
-    pub type_formals: Vec<(TypeVar, Kind)>,
+    /// Possibly-empty list of type parameters and their constraints
+    pub type_formals: Vec<(TypeVar, BTreeSet<Ability>)>,
 }
 
 /// An explicit function dependency
@@ -313,11 +328,17 @@ pub struct FunctionDependency {
 }
 
 /// Public or internal modifier for a procedure
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub enum FunctionVisibility {
     /// The procedure can be invoked anywhere
     /// `public`
     Public,
+    /// The procedure can only be invoked from a script context
+    /// `public(script)`
+    Script,
+    /// The procedure can be invoked internally as well as by modules in the friend list
+    /// `public(friend)`
+    Friend,
     /// The procedure can be invoked only internally
     /// `<no modifier>`
     Internal,
@@ -344,7 +365,7 @@ pub enum FunctionBody {
 /// A Move function/procedure
 #[derive(PartialEq, Debug, Clone)]
 pub struct Function_ {
-    /// The visibility (public or internal)
+    /// The visibility
     pub visibility: FunctionVisibility,
     /// The type signature
     pub signature: FunctionSignature,
@@ -381,6 +402,23 @@ pub enum Builtin {
     MoveFrom(StructName, Vec<Type>),
     /// Publish an instantiated struct object into signer's (signer is the first arg) account.
     MoveTo(StructName, Vec<Type>),
+
+    /// Pack a vector fix a fixed number of elements. Zero elements means an empty vector.
+    VecPack(Vec<Type>, u64),
+    /// Get the length of a vector
+    VecLen(Vec<Type>),
+    /// Acquire an immutable reference to the element at a given index of the vector
+    VecImmBorrow(Vec<Type>),
+    /// Acquire a mutable reference to the element at a given index of the vector
+    VecMutBorrow(Vec<Type>),
+    /// Push an element to the end of the vector
+    VecPushBack(Vec<Type>),
+    /// Pop and return an element from the end of the vector
+    VecPopBack(Vec<Type>),
+    /// Destroy a vector of a fixed length. Zero length means destroying an empty vector.
+    VecUnpack(Vec<Type>, u64),
+    /// Swap the elements at twi indices in the vector
+    VecSwap(Vec<Type>),
 
     /// Convert a mutable reference into an immutable one
     Freeze,
@@ -499,7 +537,7 @@ pub type Block = Spanned<Block_>;
 
 /// Bottom of the value hierarchy. These values can be trivially copyable and stored in statedb as a
 /// single entry.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum CopyableVal_ {
     /// An address in the global storage
     Address(AccountAddress),
@@ -522,14 +560,14 @@ pub type CopyableVal = Spanned<CopyableVal_>;
 pub type ExpFields = Fields<Exp>;
 
 /// Enum for unary operators
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnaryOp {
     /// Boolean negation
     Not,
 }
 
 /// Enum for binary operators
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BinOp {
     // u64 ops
     /// `+`
@@ -600,7 +638,7 @@ pub enum Exp_ {
         /// the expression containing the reference
         exp: Box<Exp>,
         /// the field being borrowed
-        field: Field_,
+        field: FieldIdent,
     },
     /// `move(x)`
     Move(Var),
@@ -625,10 +663,10 @@ pub type BytecodeBlocks = Vec<(BlockLabel, BytecodeBlock)>;
 pub type BytecodeBlock = Vec<Bytecode>;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct BlockLabel(pub String);
+pub struct BlockLabel(pub Symbol);
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct NopLabel(pub String);
+pub struct NopLabel(pub Symbol);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Bytecode_ {
@@ -697,10 +735,8 @@ pub type Bytecode = Spanned<Bytecode_>;
 fn get_external_deps(imports: &[ImportDefinition]) -> Vec<ModuleId> {
     let mut deps = HashSet::new();
     for dep in imports.iter() {
-        if let ModuleIdent::Qualified(id) = &dep.ident {
-            let identifier = Identifier::new(id.name.0.clone()).unwrap();
-            deps.insert(ModuleId::new(id.address, identifier));
-        }
+        let identifier = Identifier::new(dep.ident.name.0.as_str().to_owned()).unwrap();
+        deps.insert(ModuleId::new(dep.ident.address, identifier));
     }
     deps.into_iter().collect()
 }
@@ -731,7 +767,7 @@ impl Script {
     /// Accessor for the body of the 'main' procedure
     pub fn body(&self) -> &Block_ {
         match self.main.value.body {
-            FunctionBody::Move { ref code, .. } => &code,
+            FunctionBody::Move { ref code, .. } => code,
             FunctionBody::Bytecode { .. } => panic!("Invalid body access on bytecode main()"),
             FunctionBody::Native => panic!("main() cannot be native"),
         }
@@ -743,41 +779,25 @@ impl Script {
     }
 }
 
-static SELF_MODULE_NAME: Lazy<String> = Lazy::new(|| "Self".to_owned());
+static SELF_MODULE_NAME: Lazy<Symbol> = Lazy::new(|| Symbol::from("Self"));
 
 impl ModuleName {
-    /// Create a new `ModuleName` from a string
-    pub fn new(name: String) -> Self {
-        assert!(!name.is_empty());
-        ModuleName(name)
-    }
-
     /// Name for the current module handle
     pub fn self_name() -> &'static str {
-        &*SELF_MODULE_NAME
+        SELF_MODULE_NAME.as_str()
     }
 
     /// Create a new `ModuleName` from `self_name`.
     pub fn module_self() -> Self {
-        ModuleName::new(ModuleName::self_name().into())
-    }
-
-    /// Converts self into a string.
-    pub fn into_inner(self) -> String {
-        self.0
-    }
-
-    /// Accessor for the name of the module
-    pub fn as_inner(&self) -> &str {
-        &self.0
+        ModuleName(*SELF_MODULE_NAME)
     }
 }
 
-impl QualifiedModuleIdent {
+impl ModuleIdent {
     /// Creates a new fully qualified module identifier from the module name and the address at
     /// which it is published
     pub fn new(name: ModuleName, address: AccountAddress) -> Self {
-        QualifiedModuleIdent { address, name }
+        ModuleIdent { name, address }
     }
 
     /// Accessor for the name of the fully qualified module identifier
@@ -791,43 +811,43 @@ impl QualifiedModuleIdent {
     }
 }
 
-impl ModuleIdent {
-    pub fn name(&self) -> &ModuleName {
-        match self {
-            ModuleIdent::Transaction(name) => &name,
-            ModuleIdent::Qualified(id) => &id.name,
-        }
-    }
-}
-
 impl ModuleDefinition {
     /// Creates a new `ModuleDefinition` from its string name, dependencies, structs+resources,
     /// and procedures
     /// Does not verify the correctness of any internal properties of its elements
     pub fn new(
-        name: impl ToString,
+        identifier: ModuleIdent,
+        friends: Vec<ModuleIdent>,
         imports: Vec<ImportDefinition>,
         explicit_dependency_declarations: Vec<ModuleDependency>,
         structs: Vec<StructDefinition>,
         constants: Vec<Constant>,
         functions: Vec<(FunctionName, Function)>,
         synthetics: Vec<SyntheticDefinition>,
-    ) -> Result<Self> {
-        Ok(ModuleDefinition {
-            name: ModuleName::new(name.to_string()),
+    ) -> Self {
+        ModuleDefinition {
+            identifier,
+            friends,
             imports,
             explicit_dependency_declarations,
             structs,
             constants,
             functions,
             synthetics,
-        })
+        }
     }
 
     /// Return a vector of `ModuleId` for the external dependencies.
     pub fn get_external_deps(&self) -> Vec<ModuleId> {
         get_external_deps(self.imports.as_slice())
     }
+}
+
+impl Ability {
+    pub const COPY: &'static str = "copy";
+    pub const DROP: &'static str = "drop";
+    pub const STORE: &'static str = "store";
+    pub const KEY: &'static str = "key";
 }
 
 impl Type {
@@ -880,117 +900,47 @@ impl ImportDefinition {
     pub fn new(ident: ModuleIdent, alias_opt: Option<ModuleName>) -> Self {
         let alias = match alias_opt {
             Some(alias) => alias,
-            None => ident.name().clone(),
+            None => *ident.name(),
         };
         ImportDefinition { ident, alias }
     }
 }
 
-impl Field_ {
-    /// Create a new `Field_` from a string
-    pub fn new(name: String) -> Self {
-        Field_(name)
-    }
-
-    /// Converts self into a string.
-    pub fn into_inner(self) -> String {
-        self.0
-    }
-
-    /// Accessor for the name of the struct
-    pub fn as_inner(&self) -> &str {
-        &self.0
-    }
-}
-
-impl StructName {
-    /// Create a new `StructName` from a string
-    pub fn new(name: String) -> Self {
-        StructName(name)
-    }
-
-    /// Converts self into a string.
-    pub fn into_inner(self) -> String {
-        self.0
-    }
-
-    /// Accessor for the name of the struct
-    pub fn as_inner(&self) -> &str {
-        &self.0
-    }
-}
-
 impl StructDefinition_ {
-    /// Creates a new StructDefinition from the resource kind (true if resource), the string
-    /// representation of the name, and the user specified fields, a map from their names to their
-    /// types
+    /// Creates a new StructDefinition from the abilities, the string representation of the name,
+    /// and the user specified fields, a map from their names to their types
     /// Does not verify the correctness of any internal properties, e.g. doesn't check that the
     /// fields do not have reference types
     pub fn move_declared(
-        is_nominal_resource: bool,
-        name: impl ToString,
-        type_formals: Vec<(TypeVar, Kind)>,
+        abilities: BTreeSet<Ability>,
+        name: Symbol,
+        type_formals: Vec<StructTypeParameter>,
         fields: Fields<Type>,
         invariants: Vec<Invariant>,
-    ) -> Result<Self> {
-        Ok(StructDefinition_ {
-            is_nominal_resource,
-            name: StructName::new(name.to_string()),
+    ) -> Self {
+        StructDefinition_ {
+            abilities,
+            name: StructName(name),
             type_formals,
             fields: StructDefinitionFields::Move { fields },
             invariants,
-        })
+        }
     }
 
-    /// Creates a new StructDefinition from the resource kind (true if resource), the string
-    /// representation of the name, and the user specified fields, a map from their names to their
-    /// types
+    /// Creates a new StructDefinition from the abilities, the string representation of the name,
+    /// and the user specified fields, a map from their names to their types
     pub fn native(
-        is_nominal_resource: bool,
-        name: impl std::string::ToString,
-        type_formals: Vec<(TypeVar, Kind)>,
-    ) -> Result<Self> {
-        Ok(StructDefinition_ {
-            is_nominal_resource,
-            name: StructName::new(name.to_string()),
+        abilities: BTreeSet<Ability>,
+        name: Symbol,
+        type_formals: Vec<StructTypeParameter>,
+    ) -> Self {
+        StructDefinition_ {
+            abilities,
+            name: StructName(name),
             type_formals,
             fields: StructDefinitionFields::Native,
             invariants: vec![],
-        })
-    }
-}
-
-impl ConstantName {
-    /// Create a new `ConstantName` from a string
-    pub fn new(name: String) -> Self {
-        ConstantName(name)
-    }
-
-    /// Converts self into a string.
-    pub fn into_inner(self) -> String {
-        self.0
-    }
-
-    /// Accessor for the name of the function
-    pub fn as_inner(&self) -> &str {
-        &self.0
-    }
-}
-
-impl FunctionName {
-    /// Create a new `FunctionName` from a string
-    pub fn new(name: String) -> Self {
-        FunctionName(name)
-    }
-
-    /// Converts self into a string.
-    pub fn into_inner(self) -> String {
-        self.0
-    }
-
-    /// Accessor for the name of the function
-    pub fn as_inner(&self) -> &str {
-        &self.0
+        }
     }
 }
 
@@ -999,7 +949,7 @@ impl FunctionSignature {
     pub fn new(
         formals: Vec<(Var, Type)>,
         return_type: Vec<Type>,
-        type_parameters: Vec<(TypeVar, Kind)>,
+        type_parameters: Vec<(TypeVar, BTreeSet<Ability>)>,
     ) -> Self {
         FunctionSignature {
             formals,
@@ -1016,7 +966,7 @@ impl Function_ {
         visibility: FunctionVisibility,
         formals: Vec<(Var, Type)>,
         return_type: Vec<Type>,
-        type_parameters: Vec<(TypeVar, Kind)>,
+        type_parameters: Vec<(TypeVar, BTreeSet<Ability>)>,
         acquires: Vec<StructName>,
         specifications: Vec<Condition>,
         body: FunctionBody,
@@ -1029,40 +979,6 @@ impl Function_ {
             specifications,
             body,
         }
-    }
-}
-
-impl Var_ {
-    /// Creates a new `Var` from a string.
-    pub fn new(s: String) -> Self {
-        Var_(s)
-    }
-
-    /// Converts self into a string.
-    pub fn into_inner(self) -> String {
-        self.0
-    }
-
-    /// Accessor for the name of the var
-    pub fn name(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TypeVar_ {
-    /// Creates a new `TypeVar` from an String.
-    pub fn new(s: String) -> Self {
-        TypeVar_(s)
-    }
-
-    /// Converts self into a string.
-    pub fn into_inner(self) -> String {
-        self.0
-    }
-
-    /// Accessor for the name of the var.
-    pub fn name(&self) -> &str {
-        &self.0
     }
 }
 
@@ -1103,7 +1019,7 @@ impl IfElse {
             else_block: None,
         }
     }
-
+    #[allow(clippy::self_named_constructors)]
     /// Creates an if-statement with an else branch
     pub fn if_else(cond: Exp, if_block: Block, else_block: Block) -> Self {
         IfElse {
@@ -1201,7 +1117,7 @@ impl Exp_ {
     }
 
     /// Creates a new borrow field `Exp` with no location information
-    pub fn borrow(is_mutable: bool, exp: Box<Exp>, field: Field_) -> Exp {
+    pub fn borrow(is_mutable: bool, exp: Box<Exp>, field: FieldIdent) -> Exp {
         Spanned::unsafe_no_loc(Exp_::Borrow {
             is_mutable,
             exp,
@@ -1269,18 +1185,26 @@ impl fmt::Display for TypeVar_ {
     }
 }
 
-impl fmt::Display for Kind {
+impl fmt::Display for Ability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "{}",
             match self {
-                Kind::All => "all",
-                Kind::Resource => "resource",
-                Kind::Copyable => "copyable",
+                Ability::Copy => Ability::COPY,
+                Ability::Drop => Ability::DROP,
+                Ability::Store => Ability::STORE,
+                Ability::Key => Ability::KEY,
             }
         )
     }
+}
+
+fn format_constraints(set: &BTreeSet<Ability>) -> String {
+    set.iter()
+        .map(|a| format!("{}", a))
+        .collect::<Vec<_>>()
+        .join(" + ")
 }
 
 impl fmt::Display for ScriptOrModule {
@@ -1320,23 +1244,13 @@ impl fmt::Display for Script {
     }
 }
 
-impl fmt::Display for ModuleIdent {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use ModuleIdent::*;
-        match self {
-            Transaction(module_name) => write!(f, "{}", module_name),
-            Qualified(qual_module_ident) => write!(f, "{}", qual_module_ident),
-        }
-    }
-}
-
 impl fmt::Display for ModuleName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-impl fmt::Display for QualifiedModuleIdent {
+impl fmt::Display for ModuleIdent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}.{}", self.address, self.name)
     }
@@ -1344,7 +1258,7 @@ impl fmt::Display for QualifiedModuleIdent {
 
 impl fmt::Display for ModuleDefinition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Module({}, ", self.name)?;
+        writeln!(f, "Module({}, ", self.identifier)?;
 
         writeln!(f, "Imports(")?;
         for import in &self.imports {
@@ -1404,13 +1318,13 @@ impl fmt::Display for StructDependency {
         write!(
             f,
             "StructDep({} {}{}",
-            if self.is_nominal_resource {
-                "resource"
-            } else {
-                ""
-            },
+            self.abilities
+                .iter()
+                .map(|a| format!("{}", a))
+                .collect::<Vec<_>>()
+                .join(" "),
             &self.name,
-            format_type_formals(&self.type_formals)
+            format_struct_type_formals(&self.type_formals)
         )
     }
 }
@@ -1427,7 +1341,7 @@ impl fmt::Display for StructDefinition_ {
             f,
             "Struct({}{}, ",
             self.name,
-            format_type_formals(&self.type_formals)
+            format_struct_type_formals(&self.type_formals)
         )?;
         match &self.fields {
             StructDefinitionFields::Move { fields } => writeln!(f, "{}", format_fields(fields))?,
@@ -1456,6 +1370,12 @@ impl fmt::Display for Function_ {
 impl fmt::Display for Field_ {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Display for FieldIdent_ {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}::{}", self.struct_name, self.field)
     }
 }
 
@@ -1524,7 +1444,7 @@ fn format_fields<T: fmt::Display>(fields: &[(Field, T)]) -> String {
 
 impl fmt::Display for FunctionSignature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", format_type_formals(&self.type_formals))?;
+        write!(f, "{}", format_fun_type_formals(&self.type_formals))?;
         write!(f, "(")?;
         for (v, ty) in self.formals.iter() {
             write!(f, "{}: {}, ", v, ty)?;
@@ -1548,13 +1468,32 @@ fn format_type_actuals(tys: &[Type]) -> String {
     }
 }
 
-fn format_type_formals(formals: &[(TypeVar, Kind)]) -> String {
+fn format_fun_type_formals(formals: &[(TypeVar, BTreeSet<Ability>)]) -> String {
     if formals.is_empty() {
         "".to_string()
     } else {
         let formatted = formals
             .iter()
-            .map(|(tv, k)| format!("{}: {}", tv.value, k))
+            .map(|(tv, abilities)| format!("{}: {}", tv.value, format_constraints(abilities)))
+            .collect::<Vec<_>>();
+        format!("<{}>", intersperse(&formatted, ", "))
+    }
+}
+
+fn format_struct_type_formals(formals: &[StructTypeParameter]) -> String {
+    if formals.is_empty() {
+        "".to_string()
+    } else {
+        let formatted = formals
+            .iter()
+            .map(|(is_phantom, tv, abilities)| {
+                format!(
+                    "{}{}: {}",
+                    if *is_phantom { "phantom " } else { "" },
+                    tv.value,
+                    format_constraints(abilities)
+                )
+            })
             .collect::<Vec<_>>();
         format!("<{}>", intersperse(&formatted, ", "))
     }
@@ -1601,6 +1540,16 @@ impl fmt::Display for Builtin {
             }
             Builtin::MoveFrom(t, tys) => write!(f, "move_from<{}{}>", t, format_type_actuals(tys)),
             Builtin::MoveTo(t, tys) => write!(f, "move_to<{}{}>", t, format_type_actuals(tys)),
+            Builtin::VecPack(tys, num) => write!(f, "vec_pack_{}{}", num, format_type_actuals(tys)),
+            Builtin::VecLen(tys) => write!(f, "vec_len{}", format_type_actuals(tys)),
+            Builtin::VecImmBorrow(tys) => write!(f, "vec_imm_borrow{}", format_type_actuals(tys)),
+            Builtin::VecMutBorrow(tys) => write!(f, "vec_mut_borrow{}", format_type_actuals(tys)),
+            Builtin::VecPushBack(tys) => write!(f, "vec_push_back{}", format_type_actuals(tys)),
+            Builtin::VecPopBack(tys) => write!(f, "vec_pop_back{}", format_type_actuals(tys)),
+            Builtin::VecUnpack(tys, num) => {
+                write!(f, "vec_unpack_{}{}", num, format_type_actuals(tys))
+            }
+            Builtin::VecSwap(tys) => write!(f, "vec_swap{}", format_type_actuals(tys)),
             Builtin::Freeze => write!(f, "freeze"),
             Builtin::ToU8 => write!(f, "to_u8"),
             Builtin::ToU64 => write!(f, "to_u64"),

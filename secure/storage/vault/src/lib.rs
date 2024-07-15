@@ -1,36 +1,57 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
-use libra_crypto::{
-    ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature},
+pub mod dev;
+
+use diem_crypto::{
+    ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature, ED25519_PRIVATE_KEY_LENGTH},
     PrivateKey,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     convert::{TryFrom, TryInto},
     sync::Arc,
+    time::Duration,
 };
 use thiserror::Error;
+use ureq::Response;
 
-/// Request timeout for vault operations
-const TIMEOUT: u64 = 10_000;
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod fuzzing;
 
-#[derive(Debug, Error, PartialEq)]
+/// The max number of key versions held in vault at any one time.
+/// Keys are trimmed in FIFO order.
+const MAX_NUM_KEY_VERSIONS: u32 = 4;
+
+/// Default request timeouts for vault operations.
+/// Note: there is a bug in ureq v 1.5.4 where it's not currently possible to set
+/// different timeouts for connections and operations. The connection timeout
+/// will override any other timeouts (including reads and writes). This has been
+/// fixed in ureq 2. Once we upgrade, we'll be able to have separate timeouts.
+/// Until then, the connection timeout is used for all operations.
+const DEFAULT_CONNECTION_TIMEOUT_MS: u64 = 1_000;
+const DEFAULT_RESPONSE_TIMEOUT_MS: u64 = 1_000;
+
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum Error {
-    #[error("Http error: {1}")]
-    HttpError(u16, String),
+    #[error("Http error, status code: {0}, status text: {1}, body: {2}")]
+    HttpError(u16, String, String),
     #[error("Internal error: {0}")]
     InternalError(String),
     #[error("Missing field {0}")]
     MissingField(String),
     #[error("404: Not Found: {0}/{1}")]
     NotFound(String, String),
+    #[error("Overflow error: {0}")]
+    OverflowError(String),
     #[error("Serialization error: {0}")]
     SerializationError(String),
+    #[error("Synthetic error returned: {0}")]
+    SyntheticError(String),
 }
 
 impl From<base64::DecodeError> for Error {
@@ -39,8 +60,8 @@ impl From<base64::DecodeError> for Error {
     }
 }
 
-impl From<libra_crypto::traits::CryptoMaterialError> for Error {
-    fn from(error: libra_crypto::traits::CryptoMaterialError) -> Self {
+impl From<diem_crypto::traits::CryptoMaterialError> for Error {
+    fn from(error: diem_crypto::traits::CryptoMaterialError) -> Self {
         Self::SerializationError(format!("{}", error))
     }
 }
@@ -53,15 +74,17 @@ impl From<std::io::Error> for Error {
 
 impl From<ureq::Response> for Error {
     fn from(resp: ureq::Response) -> Self {
-        if let Some(e) = resp.synthetic_error() {
-            // Local error
-            Error::InternalError(e.to_string())
-        } else {
-            // Clear buffer and use that as the message
-            let status = resp.status();
+        if resp.synthetic() {
             match resp.into_string() {
-                Ok(v) => Error::HttpError(status, v),
-                Err(e) => Error::InternalError(e.to_string()),
+                Ok(resp) => Error::SyntheticError(resp),
+                Err(error) => Error::InternalError(error.to_string()),
+            }
+        } else {
+            let status = resp.status();
+            let status_text = resp.status_text().to_string();
+            match resp.into_string() {
+                Ok(body) => Error::HttpError(status, status_text, body),
+                Err(error) => Error::InternalError(error.to_string()),
             }
         }
     }
@@ -91,29 +114,44 @@ pub struct Client {
     agent: ureq::Agent,
     host: String,
     token: String,
-    tls_config: Option<Arc<rustls::ClientConfig>>,
+    tls_connector: Arc<native_tls::TlsConnector>,
+
+    /// Timeout for new socket connections to vault.
+    connection_timeout_ms: u64,
+    /// Timeout for generic vault responses (e.g., reads and writes).
+    response_timeout_ms: u64,
 }
 
 impl Client {
-    pub fn new(host: String, token: String, ca_certificate: Option<String>) -> Self {
-        let tls_config = if let Some(certificate) = ca_certificate {
-            let mut tls_config = rustls::ClientConfig::new();
-            // First try the certificate as a DER encoded cert, then as a PEM, and then panic.
-            let cert = rustls::Certificate(certificate.as_bytes().to_vec());
-            if tls_config.root_store.add(&cert).is_err() {
-                let certs = rustls::internal::pemfile::certs(&mut certificate.as_bytes()).unwrap();
-                tls_config.root_store.add(&certs[0]).unwrap();
+    pub fn new(
+        host: String,
+        token: String,
+        ca_certificate: Option<String>,
+        connection_timeout_ms: Option<u64>,
+        response_timeout_ms: Option<u64>,
+    ) -> Self {
+        let mut tls_builder = native_tls::TlsConnector::builder();
+        tls_builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
+        if let Some(certificate) = ca_certificate {
+            // First try the certificate as a PEM encoded cert, then as DER, and then panic.
+            let mut cert = native_tls::Certificate::from_pem(certificate.as_bytes());
+            if cert.is_err() {
+                cert = native_tls::Certificate::from_der(certificate.as_bytes());
             }
-            Some(Arc::new(tls_config))
-        } else {
-            None
-        };
+            tls_builder.add_root_certificate(cert.unwrap());
+        }
+        let tls_connector = Arc::new(tls_builder.build().unwrap());
+
+        let connection_timeout_ms = connection_timeout_ms.unwrap_or(DEFAULT_CONNECTION_TIMEOUT_MS);
+        let response_timeout_ms = response_timeout_ms.unwrap_or(DEFAULT_RESPONSE_TIMEOUT_MS);
 
         Self {
             agent: ureq::Agent::new().set("connection", "keep-alive").build(),
             host,
             token,
-            tls_config,
+            tls_connector,
+            connection_timeout_ms,
+            response_timeout_ms,
         }
     }
 
@@ -122,31 +160,15 @@ impl Client {
             .agent
             .delete(&format!("{}/v1/sys/policy/{}", self.host, policy_name));
         let resp = self.upgrade_request(request).call();
-        if resp.ok() {
-            // Explicitly clear buffer so the stream can be re-used.
-            resp.into_string()?;
-            Ok(())
-        } else {
-            Err(resp.into())
-        }
+
+        process_generic_response(resp)
     }
 
     pub fn list_policies(&self) -> Result<Vec<String>, Error> {
         let request = self.agent.get(&format!("{}/v1/sys/policy", self.host));
         let resp = self.upgrade_request(request).call();
-        match resp.status() {
-            200 => {
-                let policies: ListPoliciesResponse = serde_json::from_str(&resp.into_string()?)?;
-                Ok(policies.policies)
-            }
-            // There are no policies.
-            404 => {
-                // Explicitly clear buffer so the stream can be re-used.
-                resp.into_string()?;
-                Ok(vec![])
-            }
-            _ => Err(resp.into()),
-        }
+
+        process_policy_list_response(resp)
     }
 
     /// Retrieves the policy at the given policy name.
@@ -155,10 +177,8 @@ impl Client {
             .agent
             .get(&format!("{}/v1/sys/policy/{}", self.host, policy_name));
         let resp = self.upgrade_request(request).call();
-        match resp.status() {
-            200 => Ok(Policy::try_from(resp.into_json()?)?),
-            _ => Err(resp.into()),
-        }
+
+        process_policy_read_response(resp)
     }
 
     /// Create a new policy in Vault, see the explanation for Policy for how the data is
@@ -169,13 +189,8 @@ impl Client {
             .agent
             .post(&format!("{}/v1/sys/policy/{}", self.host, policy_name));
         let resp = self.upgrade_request(request).send_json(policy.try_into()?);
-        if resp.ok() {
-            // Explicitly clear buffer so the stream can be re-used.
-            resp.into_string()?;
-            Ok(())
-        } else {
-            Err(resp.into())
-        }
+
+        process_generic_response(resp)
     }
 
     /// Creates a new token or identity for accessing Vault. The token will have access to anything
@@ -187,12 +202,32 @@ impl Client {
         let resp = self
             .upgrade_request(request)
             .send_json(json!({ "policies": policies }));
-        if resp.ok() {
-            let resp: CreateTokenResponse = serde_json::from_str(&resp.into_string()?)?;
-            Ok(resp.auth.client_token)
+
+        process_token_create_response(resp)
+    }
+
+    pub fn renew_token_self(&self, increment: Option<u32>) -> Result<u32, Error> {
+        let request = self
+            .agent
+            .post(&format!("{}/v1/auth/token/renew-self", self.host));
+        let mut request = self.upgrade_request(request);
+        let resp = if let Some(increment) = increment {
+            request.send_json(json!({ "increment": increment }))
         } else {
-            Err(resp.into())
-        }
+            request.call()
+        };
+
+        process_token_renew_response(resp)
+    }
+
+    pub fn revoke_token_self(&self) -> Result<(), Error> {
+        let request = self
+            .agent
+            .post(&format!("{}/v1/auth/token/revoke-self", self.host));
+        let mut request = self.upgrade_request(request);
+        let resp = request.call();
+
+        process_generic_response(resp)
     }
 
     /// List all stored secrets
@@ -202,19 +237,8 @@ impl Client {
             &format!("{}/v1/secret/metadata/{}", self.host, secret),
         );
         let resp = self.upgrade_request(request).call();
-        match resp.status() {
-            200 => {
-                let resp: ReadSecretListResponse = serde_json::from_str(&resp.into_string()?)?;
-                Ok(resp.data.keys)
-            }
-            // There are no secrets.
-            404 => {
-                // Explicitly clear buffer so the stream can be re-used.
-                resp.into_string()?;
-                Ok(vec![])
-            }
-            _ => Err(resp.into()),
-        }
+
+        process_secret_list_response(resp)
     }
 
     /// Delete a specific secret store
@@ -223,40 +247,18 @@ impl Client {
             .agent
             .delete(&format!("{}/v1/secret/metadata/{}", self.host, secret));
         let resp = self.upgrade_request(request).call();
-        if resp.ok() {
-            // Explicitly clear buffer so the stream can be re-used.
-            resp.into_string()?;
-            Ok(())
-        } else {
-            Err(resp.into())
-        }
+
+        process_generic_response(resp)
     }
 
     /// Read a key/value pair from a given secret store.
-    pub fn read_secret(&self, secret: &str, key: &str) -> Result<ReadResponse<String>, Error> {
+    pub fn read_secret(&self, secret: &str, key: &str) -> Result<ReadResponse<Value>, Error> {
         let request = self
             .agent
             .get(&format!("{}/v1/secret/data/{}", self.host, secret));
         let resp = self.upgrade_request(request).call();
-        match resp.status() {
-            200 => {
-                let mut resp: ReadSecretResponse = serde_json::from_str(&resp.into_string()?)?;
-                let data = &mut resp.data;
-                let value = data
-                    .data
-                    .remove(key)
-                    .ok_or_else(|| Error::NotFound(secret.into(), key.into()))?;
-                let created_time = data.metadata.created_time.clone();
-                let version = data.metadata.version;
-                Ok(ReadResponse::new(created_time, value, version))
-            }
-            404 => {
-                // Explicitly clear buffer so the stream can be re-used.
-                resp.into_string()?;
-                Err(Error::NotFound(secret.into(), key.into()))
-            }
-            _ => Err(resp.into()),
-        }
+
+        process_secret_read_response(secret, key, resp)
     }
 
     pub fn create_ed25519_key(&self, name: &str, exportable: bool) -> Result<(), Error> {
@@ -266,19 +268,8 @@ impl Client {
         let resp = self
             .upgrade_request(request)
             .send_json(json!({ "type": "ed25519", "exportable": exportable }));
-        match resp.status() {
-            200 | 204 => {
-                // Explicitly clear buffer so the stream can be re-used.
-                resp.into_string()?;
-                Ok(())
-            }
-            404 => {
-                // Explicitly clear buffer so the stream can be re-used.
-                resp.into_string()?;
-                Err(Error::NotFound("transit/".into(), name.into()))
-            }
-            _ => Err(resp.into()),
-        }
+
+        process_transit_create_response(name, resp)
     }
 
     pub fn delete_key(&self, name: &str) -> Result<(), Error> {
@@ -289,23 +280,14 @@ impl Client {
             .upgrade_request(request)
             .send_json(json!({ "deletion_allowed": true }));
 
-        if !resp.ok() {
-            return Err(resp.into());
-        }
-        // Explicitly clear buffer so the stream can be re-used.
-        resp.into_string()?;
+        process_generic_response(resp)?;
 
         let request = self
             .agent
             .delete(&format!("{}/v1/transit/keys/{}", self.host, name));
         let resp = self.upgrade_request(request).call();
-        if resp.ok() {
-            // Explicitly clear buffer so the stream can be re-used.
-            resp.into_string()?;
-            Ok(())
-        } else {
-            Err(resp.into())
-        }
+
+        process_generic_response(resp)
     }
 
     pub fn export_ed25519_key(
@@ -318,22 +300,8 @@ impl Client {
             self.host, name
         ));
         let resp = self.upgrade_request(request).call();
-        if resp.ok() {
-            let export_key: ExportKeyResponse = serde_json::from_str(&resp.into_string()?)?;
-            if let Some(version) = version {
-                let key = export_key.data.keys.iter().find(|(k, _v)| **k == version);
-                let (_, key) = key.ok_or_else(|| Error::NotFound("transit".into(), name.into()))?;
-                // Composite key [private|public]
-                Ok(Ed25519PrivateKey::try_from(&base64::decode(key)?[..32])?)
-            } else if let Some(key) = export_key.data.keys.values().last() {
-                // Composite key [private|public]
-                Ok(Ed25519PrivateKey::try_from(&base64::decode(key)?[..32])?)
-            } else {
-                Err(Error::NotFound("transit".into(), name.into()))
-            }
-        } else {
-            Err(resp.into())
-        }
+
+        process_transit_export_response(name, version, resp)
     }
 
     pub fn import_ed25519_key(&self, name: &str, key: &Ed25519PrivateKey) -> Result<(), Error> {
@@ -344,14 +312,8 @@ impl Client {
         let resp = self
             .upgrade_request(request)
             .send_json(json!({ "backup": backup }));
-        match resp.status() {
-            204 => {
-                // Explicitly clear buffer so the stream can be re-used.
-                resp.into_string()?;
-                Ok(())
-            }
-            _ => Err(resp.into()),
-        }
+
+        process_transit_restore_response(resp)
     }
 
     pub fn list_keys(&self) -> Result<Vec<String>, Error> {
@@ -359,18 +321,8 @@ impl Client {
             .agent
             .request("LIST", &format!("{}/v1/transit/keys", self.host));
         let resp = self.upgrade_request(request).call();
-        match resp.status() {
-            200 => {
-                let list_keys: ListKeysResponse = serde_json::from_str(&resp.into_string()?)?;
-                Ok(list_keys.data.keys)
-            }
-            404 => {
-                // Explicitly clear buffer so the stream can be re-used.
-                resp.into_string()?;
-                Err(Error::NotFound("transit/".into(), "keys".into()))
-            }
-            _ => Err(resp.into()),
-        }
+
+        process_transit_list_response(resp)
     }
 
     pub fn read_ed25519_key(
@@ -381,26 +333,8 @@ impl Client {
             .agent
             .get(&format!("{}/v1/transit/keys/{}", self.host, name));
         let resp = self.upgrade_request(request).call();
-        match resp.status() {
-            200 => {
-                let read_key: ReadKeyResponse = serde_json::from_str(&resp.into_string()?)?;
-                let mut read_resp = Vec::new();
-                for (version, value) in read_key.data.keys {
-                    read_resp.push(ReadResponse::new(
-                        value.creation_time,
-                        Ed25519PublicKey::try_from(base64::decode(&value.public_key)?.as_slice())?,
-                        version,
-                    ));
-                }
-                Ok(read_resp)
-            }
-            404 => {
-                // Explicitly clear buffer so the stream can be re-used.
-                resp.into_string()?;
-                Err(Error::NotFound("transit/".into(), name.into()))
-            }
-            _ => Err(resp.into()),
-        }
+
+        process_transit_read_response(name, resp)
     }
 
     pub fn rotate_key(&self, name: &str) -> Result<(), Error> {
@@ -408,13 +342,84 @@ impl Client {
             .agent
             .post(&format!("{}/v1/transit/keys/{}/rotate", self.host, name));
         let resp = self.upgrade_request(request).call();
-        if resp.ok() {
-            // Explicitly clear buffer so the stream can be re-used.
-            resp.into_string()?;
-            Ok(())
-        } else {
-            Err(resp.into())
-        }
+
+        process_generic_response(resp)
+    }
+
+    /// Trims the number of key versions held in vault storage. This prevents stale
+    /// keys from sitting around for too long and becoming susceptible to key
+    /// gathering attacks.
+    ///
+    /// Once the key versions have been trimmed, this method returns the most
+    /// recent (i.e., highest versioned) public key for the given cryptographic
+    /// key name.
+    pub fn trim_key_versions(&self, name: &str) -> Result<Ed25519PublicKey, Error> {
+        // Read all keys and versions
+        let all_pub_keys = self.read_ed25519_key(name)?;
+
+        // Find the maximum and minimum versions
+        let max_version = all_pub_keys
+            .iter()
+            .map(|resp| resp.version)
+            .max()
+            .ok_or_else(|| Error::NotFound("transit/".into(), name.into()))?;
+        let min_version = all_pub_keys
+            .iter()
+            .map(|resp| resp.version)
+            .min()
+            .ok_or_else(|| Error::NotFound("transit/".into(), name.into()))?;
+
+        // Trim keys if too many versions exist
+        if (max_version - min_version) >= MAX_NUM_KEY_VERSIONS {
+            // let min_available_version = max_version - MAX_NUM_KEY_VERSIONS + 1;
+            let min_available_version = max_version
+                .checked_sub(MAX_NUM_KEY_VERSIONS)
+                .and_then(|n| n.checked_add(1))
+                .ok_or_else(|| {
+                    Error::OverflowError("trim_key_versions::min_available_version".into())
+                })?;
+            self.set_minimum_encrypt_decrypt_version(name, min_available_version)?;
+            self.set_minimum_available_version(name, min_available_version)?;
+        };
+
+        let newest_pub_key = all_pub_keys
+            .iter()
+            .find(|pub_key| pub_key.version == max_version)
+            .ok_or_else(|| Error::NotFound("transit/".into(), name.into()))?;
+        Ok(newest_pub_key.value.clone())
+    }
+
+    /// Trims the key versions according to the minimum available version specified.
+    /// This operation deletes any older keys and cannot be undone.
+    fn set_minimum_available_version(
+        &self,
+        name: &str,
+        min_available_version: u32,
+    ) -> Result<(), Error> {
+        let request = self
+            .agent
+            .post(&format!("{}/v1/transit/keys/{}/trim", self.host, name));
+        let resp = self
+            .upgrade_request(request)
+            .send_json(json!({ "min_available_version": min_available_version }));
+
+        process_generic_response(resp)
+    }
+
+    /// Sets the minimum encryption and decryption versions for a named cryptographic key.
+    fn set_minimum_encrypt_decrypt_version(
+        &self,
+        name: &str,
+        min_version: u32,
+    ) -> Result<(), Error> {
+        let request = self
+            .agent
+            .post(&format!("{}/v1/transit/keys/{}/config", self.host, name));
+        let resp = self.upgrade_request(request).send_json(
+            json!({ "min_encryption_version": min_version, "min_decryption_version": min_version }),
+        );
+
+        process_generic_response(resp)
     }
 
     pub fn sign_ed25519(
@@ -433,34 +438,32 @@ impl Client {
             .agent
             .post(&format!("{}/v1/transit/sign/{}", self.host, name));
         let resp = self.upgrade_request(request).send_json(data);
-        if resp.ok() {
-            let signature: SignatureResponse = serde_json::from_str(&resp.into_string()?)?;
-            let signature = &signature.data.signature;
-            let signature_pieces: Vec<_> = signature.split(':').collect();
-            let signature = signature_pieces
-                .get(2)
-                .ok_or_else(|| Error::SerializationError(signature.into()))?;
-            Ok(Ed25519Signature::try_from(
-                base64::decode(&signature)?.as_slice(),
-            )?)
-        } else {
-            Err(resp.into())
-        }
+
+        process_transit_sign_response(resp)
     }
 
     /// Create or update a key/value pair in a given secret store.
-    pub fn write_secret(&self, secret: &str, key: &str, value: &str) -> Result<(), Error> {
+    pub fn write_secret(
+        &self,
+        secret: &str,
+        key: &str,
+        value: &Value,
+        version: Option<u32>,
+    ) -> Result<u32, Error> {
+        let payload = if let Some(version) = version {
+            json!({ "data": { key: value }, "options": {"cas": version} })
+        } else {
+            json!({ "data": { key: value } })
+        };
+
         let request = self
             .agent
             .put(&format!("{}/v1/secret/data/{}", self.host, secret));
-        let resp = self
-            .upgrade_request(request)
-            .send_json(json!({ "data": { key: value } }));
+        let resp = self.upgrade_request(request).send_json(payload);
 
         if resp.ok() {
-            // Explicitly clear buffer so the stream can be re-used.
-            resp.into_string()?;
-            Ok(())
+            let resp: WriteSecretResponse = serde_json::from_str(&resp.into_string()?)?;
+            Ok(resp.data.version)
         } else {
             Err(resp.into())
         }
@@ -471,12 +474,8 @@ impl Client {
     pub fn unsealed(&self) -> Result<bool, Error> {
         let request = self.agent.get(&format!("{}/v1/sys/seal-status", self.host));
         let resp = self.upgrade_request_without_token(request).call();
-        if resp.ok() {
-            let resp: SealStatusResponse = serde_json::from_str(&resp.into_string()?)?;
-            Ok(!resp.sealed)
-        } else {
-            Err(resp.into())
-        }
+
+        process_unsealed_response(resp)
     }
 
     fn upgrade_request(&self, request: ureq::Request) -> ureq::Request {
@@ -486,11 +485,241 @@ impl Client {
     }
 
     fn upgrade_request_without_token(&self, mut request: ureq::Request) -> ureq::Request {
-        request.timeout_connect(TIMEOUT);
-        if let Some(tls_config) = self.tls_config.as_ref() {
-            request.set_tls_config(tls_config.clone());
-        }
+        request.timeout_connect(self.connection_timeout_ms);
+        request.timeout(Duration::from_millis(self.response_timeout_ms));
+        request.set_tls_connector(self.tls_connector.clone());
         request
+    }
+}
+
+/// Processes a generic response returned by a vault request. This function simply just checks
+/// that the response was not an error and calls response.into_string() to clear the ureq stream.
+pub fn process_generic_response(resp: Response) -> Result<(), Error> {
+    if resp.ok() {
+        // Explicitly clear buffer so the stream can be re-used.
+        resp.into_string()?;
+        Ok(())
+    } else {
+        Err(resp.into())
+    }
+}
+
+/// Processes the response returned by a policy list vault request.
+pub fn process_policy_list_response(resp: Response) -> Result<Vec<String>, Error> {
+    match resp.status() {
+        200 => {
+            let policies: ListPoliciesResponse = serde_json::from_str(&resp.into_string()?)?;
+            Ok(policies.policies)
+        }
+        // There are no policies.
+        404 => {
+            // Explicitly clear buffer so the stream can be re-used.
+            resp.into_string()?;
+            Ok(vec![])
+        }
+        _ => Err(resp.into()),
+    }
+}
+
+/// Processes the response returned by a policy read vault request.
+pub fn process_policy_read_response(resp: Response) -> Result<Policy, Error> {
+    match resp.status() {
+        200 => Ok(Policy::try_from(resp.into_json()?)?),
+        _ => Err(resp.into()),
+    }
+}
+
+/// Processes the response returned by a secret list vault request.
+pub fn process_secret_list_response(resp: Response) -> Result<Vec<String>, Error> {
+    match resp.status() {
+        200 => {
+            let resp: ReadSecretListResponse = serde_json::from_str(&resp.into_string()?)?;
+            Ok(resp.data.keys)
+        }
+        // There are no secrets.
+        404 => {
+            // Explicitly clear buffer so the stream can be re-used.
+            resp.into_string()?;
+            Ok(vec![])
+        }
+        _ => Err(resp.into()),
+    }
+}
+
+/// Processes the response returned by a secret read vault request.
+pub fn process_secret_read_response(
+    secret: &str,
+    key: &str,
+    resp: Response,
+) -> Result<ReadResponse<Value>, Error> {
+    match resp.status() {
+        200 => {
+            let mut resp: ReadSecretResponse = serde_json::from_str(&resp.into_string()?)?;
+            let data = &mut resp.data;
+            let value = data
+                .data
+                .remove(key)
+                .ok_or_else(|| Error::NotFound(secret.into(), key.into()))?;
+            let created_time = data.metadata.created_time.clone();
+            let version = data.metadata.version;
+            Ok(ReadResponse::new(created_time, value, version))
+        }
+        404 => {
+            // Explicitly clear buffer so the stream can be re-used.
+            resp.into_string()?;
+            Err(Error::NotFound(secret.into(), key.into()))
+        }
+        _ => Err(resp.into()),
+    }
+}
+
+/// Processes the response returned by a token create vault request.
+pub fn process_token_create_response(resp: Response) -> Result<String, Error> {
+    if resp.ok() {
+        let resp: CreateTokenResponse = serde_json::from_str(&resp.into_string()?)?;
+        Ok(resp.auth.client_token)
+    } else {
+        Err(resp.into())
+    }
+}
+
+/// Processes the response returned by a token renew vault request.
+pub fn process_token_renew_response(resp: Response) -> Result<u32, Error> {
+    if resp.ok() {
+        let resp: RenewTokenResponse = serde_json::from_str(&resp.into_string()?)?;
+        Ok(resp.auth.lease_duration)
+    } else {
+        Err(resp.into())
+    }
+}
+
+/// Processes the response returned by a transit key create vault request.
+pub fn process_transit_create_response(name: &str, resp: Response) -> Result<(), Error> {
+    match resp.status() {
+        200 | 204 => {
+            // Explicitly clear buffer so the stream can be re-used.
+            resp.into_string()?;
+            Ok(())
+        }
+        404 => {
+            // Explicitly clear buffer so the stream can be re-used.
+            resp.into_string()?;
+            Err(Error::NotFound("transit/".into(), name.into()))
+        }
+        _ => Err(resp.into()),
+    }
+}
+
+/// Processes the response returned by a transit key export vault request.
+pub fn process_transit_export_response(
+    name: &str,
+    version: Option<u32>,
+    resp: Response,
+) -> Result<Ed25519PrivateKey, Error> {
+    if resp.ok() {
+        let export_key: ExportKeyResponse = serde_json::from_str(&resp.into_string()?)?;
+        let composite_key = if let Some(version) = version {
+            let key = export_key.data.keys.iter().find(|(k, _v)| **k == version);
+            let (_, key) = key.ok_or_else(|| Error::NotFound("transit/".into(), name.into()))?;
+            key
+        } else if let Some(key) = export_key.data.keys.values().last() {
+            key
+        } else {
+            return Err(Error::NotFound("transit/".into(), name.into()));
+        };
+
+        let composite_key = base64::decode(composite_key)?;
+        if let Some(composite_key) = composite_key.get(0..ED25519_PRIVATE_KEY_LENGTH) {
+            Ok(Ed25519PrivateKey::try_from(composite_key)?)
+        } else {
+            Err(Error::InternalError(
+                "Insufficient key length returned by vault export key request".into(),
+            ))
+        }
+    } else {
+        Err(resp.into())
+    }
+}
+
+/// Processes the response returned by a transit key list vault request.
+pub fn process_transit_list_response(resp: Response) -> Result<Vec<String>, Error> {
+    match resp.status() {
+        200 => {
+            let list_keys: ListKeysResponse = serde_json::from_str(&resp.into_string()?)?;
+            Ok(list_keys.data.keys)
+        }
+        404 => {
+            // Explicitly clear buffer so the stream can be re-used.
+            resp.into_string()?;
+            Err(Error::NotFound("transit/".into(), "keys".into()))
+        }
+        _ => Err(resp.into()),
+    }
+}
+
+/// Processes the response returned by a transit key read vault request.
+pub fn process_transit_read_response(
+    name: &str,
+    resp: Response,
+) -> Result<Vec<ReadResponse<Ed25519PublicKey>>, Error> {
+    match resp.status() {
+        200 => {
+            let read_key: ReadKeyResponse = serde_json::from_str(&resp.into_string()?)?;
+            let mut read_resp = Vec::new();
+            for (version, value) in read_key.data.keys {
+                read_resp.push(ReadResponse::new(
+                    value.creation_time,
+                    Ed25519PublicKey::try_from(base64::decode(&value.public_key)?.as_slice())?,
+                    version,
+                ));
+            }
+            Ok(read_resp)
+        }
+        404 => {
+            // Explicitly clear buffer so the stream can be re-used.
+            resp.into_string()?;
+            Err(Error::NotFound("transit/".into(), name.into()))
+        }
+        _ => Err(resp.into()),
+    }
+}
+
+/// Processes the response returned by a transit key restore vault request.
+pub fn process_transit_restore_response(resp: Response) -> Result<(), Error> {
+    match resp.status() {
+        204 => {
+            // Explicitly clear buffer so the stream can be re-used.
+            resp.into_string()?;
+            Ok(())
+        }
+        _ => Err(resp.into()),
+    }
+}
+
+/// Processes the response returned by a transit key sign vault request.
+pub fn process_transit_sign_response(resp: Response) -> Result<Ed25519Signature, Error> {
+    if resp.ok() {
+        let signature: SignatureResponse = serde_json::from_str(&resp.into_string()?)?;
+        let signature = &signature.data.signature;
+        let signature_pieces: Vec<_> = signature.split(':').collect();
+        let signature = signature_pieces
+            .get(2)
+            .ok_or_else(|| Error::SerializationError(signature.into()))?;
+        Ok(Ed25519Signature::try_from(
+            base64::decode(&signature)?.as_slice(),
+        )?)
+    } else {
+        Err(resp.into())
+    }
+}
+
+/// Processes the response returned by a seal-status() vault request.
+pub fn process_unsealed_response(resp: Response) -> Result<bool, Error> {
+    if resp.ok() {
+        let resp: SealStatusResponse = serde_json::from_str(&resp.into_string()?)?;
+        Ok(!resp.sealed)
+    } else {
+        Err(resp.into())
     }
 }
 
@@ -501,7 +730,7 @@ impl Client {
 ///       "name":"local_owner_key__consensus",
 ///       "keys":{
 ///          "1":{
-///             "key":"C3R5O8uAfrgv7sJmCMSLEp1R2HmkZtwdfGT/xVvZVvgCGo6TkWga/ojplJFMM+i2805X3CV7IRyNLCSJcr4AqQ==",
+///             "key":"C3R5O8uAfrgv7sJmCMSLEp1R2HmkZtwdfGT/xVvZVvgCGo6TkWga/ojplJFMM+i2805X3CV7IRyNBCSJcr4AqQ==",
 ///             "hmac_key":null,
 ///             "time":"2020-05-29T06:27:38.1233515Z",
 ///             "ec_x":null,
@@ -540,7 +769,7 @@ impl Client {
 /// This is intended to be a very simple application of it only for the purpose of introducing a
 /// single key with no versioning history into Vault. This is /only/ for test purposes and not
 /// intended for production use cases.
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct KeyBackup {
     policy: KeyBackupPolicy,
 }
@@ -554,29 +783,34 @@ impl KeyBackup {
         let now = chrono::Utc::now();
         let time_as_str = now.to_rfc3339();
 
-        let mut info = KeyBackupInfo::default();
-        info.key = Some(base64::encode(key_bytes));
-        info.public_key = Some(base64::encode(pub_key_bytes));
-        info.creation_time = now.timestamp_subsec_millis();
-        info.time = time_as_str.clone();
-
-        let mut key_backup = Self {
-            policy: KeyBackupPolicy::default(),
+        let info = KeyBackupInfo {
+            key: Some(base64::encode(key_bytes)),
+            public_key: Some(base64::encode(pub_key_bytes)),
+            creation_time: now.timestamp_subsec_millis(),
+            time: time_as_str.clone(),
+            ..Default::default()
         };
 
-        key_backup.policy.exportable = true;
-        key_backup.policy.min_decryption_version = 1;
-        key_backup.policy.latest_version = 1;
-        key_backup.policy.archive_version = 1;
-        key_backup.policy.backup_type = 2;
+        let mut key_backup = Self {
+            policy: KeyBackupPolicy {
+                exportable: true,
+                min_decryption_version: 1,
+                latest_version: 1,
+                archive_version: 1,
+                backup_type: 2,
+                backup_info: BackupInfo {
+                    time: time_as_str,
+                    version: 1,
+                },
+                ..Default::default()
+            },
+        };
         key_backup.policy.keys.insert(1, info);
-        key_backup.policy.backup_info.time = time_as_str;
-        key_backup.policy.backup_info.version = 1;
         key_backup
     }
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct KeyBackupPolicy {
     name: String,
     keys: BTreeMap<u32, KeyBackupInfo>,
@@ -601,7 +835,7 @@ pub struct KeyBackupPolicy {
     storage_prefix: String,
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct KeyBackupInfo {
     key: Option<String>,
     hhmac_key: Option<String>,
@@ -615,7 +849,7 @@ pub struct KeyBackupInfo {
     creation_time: u32,
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct BackupInfo {
     time: String,
     version: u32,
@@ -761,8 +995,8 @@ struct ReadKeys {
     key_type: String,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
-struct ReadKey {
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ReadKey {
     creation_time: String,
     public_key: String,
 }
@@ -809,7 +1043,7 @@ struct ReadSecretResponse {
 /// See ReadPolicyResponse
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 struct ReadSecretData {
-    data: BTreeMap<String, String>,
+    data: BTreeMap<String, Value>,
     metadata: ReadSecretMetadata,
 }
 
@@ -818,6 +1052,32 @@ struct ReadSecretData {
 struct ReadSecretMetadata {
     created_time: String,
     version: u32,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+struct WriteSecretResponse {
+    data: ReadSecretMetadata,
+}
+
+/// {
+///   "auth": {
+///     "client_token": "ABCD",
+///     "policies": ["web", "stage"],
+///     "metadata": {
+///       "user": "armon"
+///     },
+///     "lease_duration": 3600,
+///     "renewable": true
+///   }
+/// }
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+struct RenewTokenResponse {
+    auth: RenewTokenAuth,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+struct RenewTokenAuth {
+    lease_duration: u32,
 }
 
 /// This data structure is used to represent both policies read from Vault and written to Vault.
@@ -834,7 +1094,7 @@ struct ReadSecretMetadata {
 /// }
 /// Note: Vault claims rules is deprecated and policy should be used instead, but that doesn't seem
 /// to work and makes the reading asymmetrical from the writing.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct Policy {
     #[serde(skip)]
     internal_rules: PolicyPaths,
@@ -878,19 +1138,19 @@ impl TryFrom<&Policy> for serde_json::Value {
 }
 
 /// Represents the policy for a given path.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct PolicyPaths {
     path: BTreeMap<String, PathPolicy>,
 }
 
 /// Represents the set of capabilities used within a policy.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct PathPolicy {
     capabilities: Vec<Capability>,
 }
 
 /// The various set of capabilities available to a policy within Vault.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Capability {
     Create,

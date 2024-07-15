@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! `conn_notifs_channel` is a channel which delivers to the receiver only the last of N
@@ -9,24 +9,43 @@
 //! and `conn_notifs_channel::Sender` which behave similarly to existing mpsc data structures.
 
 use crate::peer_manager::ConnectionNotification;
-use channel::{libra_channel, message_queues::QueueStyle};
-use libra_types::PeerId;
-use std::num::NonZeroUsize;
+use channel::{diem_channel, message_queues::QueueStyle};
+use diem_types::PeerId;
 
-pub type Sender = libra_channel::Sender<PeerId, ConnectionNotification>;
-pub type Receiver = libra_channel::Receiver<PeerId, ConnectionNotification>;
+pub type Sender = diem_channel::Sender<PeerId, ConnectionNotification>;
+pub type Receiver = diem_channel::Receiver<PeerId, ConnectionNotification>;
 
 pub fn new() -> (Sender, Receiver) {
-    libra_channel::new(QueueStyle::LIFO, NonZeroUsize::new(1).unwrap(), None)
+    diem_channel::new(QueueStyle::LIFO, 1, None)
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::peer::DisconnectReason;
+    use crate::{peer::DisconnectReason, transport::ConnectionMetadata};
+    use diem_config::network_id::NetworkContext;
     use futures::{executor::block_on, future::FutureExt, stream::StreamExt};
-    use libra_config::network_id::NetworkContext;
-    use libra_network_address::NetworkAddress;
+
+    fn send_new_peer(sender: &mut Sender, connection: ConnectionMetadata) {
+        let peer_id = connection.remote_peer_id;
+        let notif =
+            ConnectionNotification::NewPeer(connection, NetworkContext::mock_with_peer_id(peer_id));
+        sender.push(peer_id, notif).unwrap()
+    }
+
+    fn send_lost_peer(
+        sender: &mut Sender,
+        connection: ConnectionMetadata,
+        reason: DisconnectReason,
+    ) {
+        let peer_id = connection.remote_peer_id;
+        let notif = ConnectionNotification::LostPeer(
+            connection,
+            NetworkContext::mock_with_peer_id(peer_id),
+            reason,
+        );
+        sender.push(peer_id, notif).unwrap()
+    }
 
     #[test]
     fn send_n_get_1() {
@@ -34,78 +53,30 @@ mod test {
         let peer_id_a = PeerId::random();
         let peer_id_b = PeerId::random();
         let task = async move {
-            sender
-                .push(
-                    peer_id_a,
-                    ConnectionNotification::NewPeer(
-                        peer_id_a,
-                        NetworkAddress::mock(),
-                        NetworkContext::mock(),
-                    ),
-                )
-                .unwrap();
-            sender
-                .push(
-                    peer_id_a,
-                    ConnectionNotification::LostPeer(
-                        peer_id_a,
-                        NetworkAddress::mock(),
-                        DisconnectReason::ConnectionLost,
-                    ),
-                )
-                .unwrap();
-            sender
-                .push(
-                    peer_id_a,
-                    ConnectionNotification::NewPeer(
-                        peer_id_a,
-                        NetworkAddress::mock(),
-                        NetworkContext::mock(),
-                    ),
-                )
-                .unwrap();
-            sender
-                .push(
-                    peer_id_a,
-                    ConnectionNotification::LostPeer(
-                        peer_id_a,
-                        NetworkAddress::mock(),
-                        DisconnectReason::Requested,
-                    ),
-                )
-                .unwrap();
-            // Ensure that only the last message is received.
-            assert_eq!(
-                receiver.select_next_some().await,
-                ConnectionNotification::LostPeer(
-                    peer_id_a,
-                    NetworkAddress::mock(),
-                    DisconnectReason::Requested
-                )
+            let conn_a = ConnectionMetadata::mock(peer_id_a);
+            let conn_b = ConnectionMetadata::mock(peer_id_b);
+            send_new_peer(&mut sender, conn_a.clone());
+            send_lost_peer(
+                &mut sender,
+                conn_a.clone(),
+                DisconnectReason::ConnectionLost,
             );
+            send_new_peer(&mut sender, conn_a.clone());
+            send_lost_peer(&mut sender, conn_a.clone(), DisconnectReason::Requested);
+
+            // Ensure that only the last message is received.
+            let notif = ConnectionNotification::LostPeer(
+                conn_a.clone(),
+                NetworkContext::mock_with_peer_id(peer_id_a),
+                DisconnectReason::Requested,
+            );
+            assert_eq!(receiver.select_next_some().await, notif,);
             // Ensures that there is no other value which is ready
             assert_eq!(receiver.select_next_some().now_or_never(), None);
 
-            sender
-                .push(
-                    peer_id_a,
-                    ConnectionNotification::NewPeer(
-                        peer_id_a,
-                        NetworkAddress::mock(),
-                        NetworkContext::mock(),
-                    ),
-                )
-                .unwrap();
-            sender
-                .push(
-                    peer_id_b,
-                    ConnectionNotification::NewPeer(
-                        peer_id_b,
-                        NetworkAddress::mock(),
-                        NetworkContext::mock(),
-                    ),
-                )
-                .unwrap();
+            send_new_peer(&mut sender, conn_a);
+            send_new_peer(&mut sender, conn_b);
+
             // Assert that we receive 2 updates, since they are sent for different peers.
             let _ = receiver.select_next_some().await;
             let _ = receiver.select_next_some().await;

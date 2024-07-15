@@ -1,17 +1,20 @@
-error: 
+error[E05001]: ability constraint not satisfied
+  ┌─ tests/move_check/typing/constraints_not_satisfied_lvalues_bind_type.move:6:16
+  │
+2 │     struct CupC<T: copy> { f: T }
+  │                    ---- 'copy' constraint declared here
+3 │     struct R {}
+  │            - To satisfy the constraint, the 'copy' ability would need to be added here
+  ·
+6 │         let x: CupC<R> = abort 0;
+  │                ^^^^^^^
+  │                │    │
+  │                │    The type '0x8675309::M::R' does not have the ability 'copy'
+  │                'copy' constraint not satisifed
 
-   ┌── tests/move_check/typing/constraints_not_satisfied_lvalues_bind_type.move:6:16 ───
-   │
- 6 │         let x: CupC<R> = abort 0;
-   │                ^^^^^^^ Constraint not satisfied.
-   ·
- 6 │         let x: CupC<R> = abort 0;
-   │                     - The resource type '0x8675309::M::R' does not satisfy the constraint 'copyable'
-   ·
- 3 │     resource struct R {}
-   │     -------- The type's constraint information was determined here
-   ·
- 2 │     struct CupC<T: copyable> {}
-   │                    -------- 'copyable' constraint declared here
-   │
+warning[W09005]: dead or unreachable code
+  ┌─ tests/move_check/typing/constraints_not_satisfied_lvalues_bind_type.move:6:26
+  │
+6 │         let x: CupC<R> = abort 0;
+  │                          ^^^^^^^ Invalid use of a divergent expression. The code following the evaluation of this expression will be dead and should be removed.
 

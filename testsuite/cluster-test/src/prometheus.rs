@@ -1,9 +1,9 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
-use anyhow::{bail, format_err, Result};
+use anyhow::{anyhow, bail, format_err, Result};
 use reqwest::Url;
 use serde::Deserialize;
 use std::{collections::HashMap, time::Duration};
@@ -41,7 +41,7 @@ impl Prometheus {
 
     pub fn link_to_dashboard(&self, start: Duration, end: Duration) -> String {
         format!(
-            "{}d/overview10/overview?orgId=1&from={}&to={}",
+            "{}d/performance/performance?orgId=1&from={}&to={}",
             self.grafana_base_url,
             start.as_millis(),
             end.as_millis()
@@ -64,8 +64,13 @@ impl Prometheus {
                 end.as_secs(),
                 step
             ))
-            .expect("Failed to make query_range url");
-
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to make query range due to unparseable url: {} resulting in Error: {}",
+                    self.url,
+                    e
+                )
+            })?;
         let response = self
             .client
             .get(url.clone())

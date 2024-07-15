@@ -1,12 +1,12 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! The socket module implements the post-handshake part of the protocol.
-//! Its main type (`NoiseStream`) is returned after a successful [handshake].
+//! Its main type [`NoiseStream`] is returned after a successful [handshake].
 //! functions in this module enables encrypting and decrypting messages from a socket.
 //! Note that since noise is length-unaware, we have to prefix every noise message with its length
 //!
-//! [handshake]: network::noise::handshake
+//! [handshake]: crate::noise::handshake
 
 use futures::{
     io::{AsyncRead, AsyncWrite},
@@ -19,8 +19,8 @@ use std::{
     task::{Context, Poll},
 };
 
-use libra_crypto::{noise, x25519};
-use libra_logger::prelude::*;
+use diem_crypto::{noise, x25519};
+use diem_logger::prelude::*;
 
 //
 // NoiseStream
@@ -68,7 +68,7 @@ impl<TSocket> NoiseStream<TSocket> {
 // ----------------
 //
 
-/// Possible read states for a [NoiseStream]
+/// Possible read states for a [`NoiseStream`]
 #[derive(Debug)]
 enum ReadState {
     /// Initial State
@@ -89,7 +89,7 @@ impl<TSocket> NoiseStream<TSocket>
 where
     TSocket: AsyncRead + Unpin,
 {
-    fn poll_read(&mut self, mut context: &mut Context, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+    fn poll_read(&mut self, context: &mut Context, buf: &mut [u8]) -> Poll<io::Result<usize>> {
         loop {
             trace!("NoiseStream ReadState::{:?}", self.read_state);
             match self.read_state {
@@ -104,7 +104,7 @@ where
                     ref mut offset,
                 } => {
                     match ready!(poll_read_u16frame_len(
-                        &mut context,
+                        context,
                         Pin::new(&mut self.socket),
                         buf,
                         offset
@@ -112,7 +112,8 @@ where
                         Ok(Some(frame_len)) => {
                             // Empty Frame
                             if frame_len == 0 {
-                                self.read_state = ReadState::Init;
+                                // 0-length messages are not expected
+                                self.read_state = ReadState::Eof(Err(()));
                             } else {
                                 self.read_state = ReadState::ReadFrame {
                                     frame_len,
@@ -136,7 +137,7 @@ where
                     ref mut offset,
                 } => {
                     match ready!(poll_read_exact(
-                        &mut context,
+                        context,
                         Pin::new(&mut self.socket),
                         &mut self.buffers.read_buffer[..(frame_len as usize)],
                         offset
@@ -152,7 +153,7 @@ where
                                     };
                                 }
                                 Err(e) => {
-                                    error!("Decryption Error: {}", e);
+                                    error!(error = %e, "Decryption Error: {}", e);
                                     self.read_state = ReadState::DecryptionError(e);
                                 }
                             }
@@ -205,7 +206,7 @@ where
 // ----------------
 //
 
-/// Possible write states for a [NoiseStream]
+/// Possible write states for a [`NoiseStream`]
 #[derive(Debug)]
 enum WriteState {
     /// Initial State
@@ -234,7 +235,7 @@ where
 {
     fn poll_write_or_flush(
         &mut self,
-        mut context: &mut Context,
+        context: &mut Context,
         buf: Option<&[u8]>,
     ) -> Poll<io::Result<Option<usize>>> {
         loop {
@@ -289,7 +290,7 @@ where
                                 };
                             }
                             Err(e) => {
-                                error!("Encryption Error: {}", e);
+                                error!(error = %e, "Encryption Error: {}", e);
                                 let err = io::Error::new(
                                     io::ErrorKind::InvalidData,
                                     format!("EncryptionError: {}", e),
@@ -310,7 +311,7 @@ where
                     ref mut offset,
                 } => {
                     match ready!(poll_write_all(
-                        &mut context,
+                        context,
                         Pin::new(&mut self.socket),
                         buf,
                         offset
@@ -334,7 +335,7 @@ where
                     ref mut offset,
                 } => {
                     match ready!(poll_write_all(
-                        &mut context,
+                        context,
                         Pin::new(&mut self.socket),
                         &self.buffers.write_buffer[..(frame_len as usize)],
                         offset
@@ -351,7 +352,7 @@ where
                     }
                 }
                 WriteState::Flush => {
-                    ready!(Pin::new(&mut self.socket).poll_flush(&mut context))?;
+                    ready!(Pin::new(&mut self.socket).poll_flush(context))?;
                     self.write_state = WriteState::Init;
                 }
                 WriteState::Eof => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
@@ -430,7 +431,7 @@ where
 const MAX_WRITE_BUFFER_LENGTH: usize = noise::decrypted_len(noise::MAX_SIZE_NOISE_MSG);
 
 /// Collection of buffers used for buffering data during the various read/write states of a
-/// NoiseStream
+/// [`NoiseStream`]
 struct NoiseBuffers {
     /// A read buffer, used for both a received ciphertext and then for its decrypted content.
     read_buffer: [u8; noise::MAX_SIZE_NOISE_MSG],
@@ -461,7 +462,7 @@ impl ::std::fmt::Debug for NoiseBuffers {
 
 /// Write an offset of a buffer to a socket, only returns Ready once done.
 fn poll_write_all<TSocket>(
-    mut context: &mut Context,
+    context: &mut Context,
     mut socket: Pin<&mut TSocket>,
     buf: &[u8],
     offset: &mut usize,
@@ -470,7 +471,7 @@ where
     TSocket: AsyncWrite,
 {
     loop {
-        let n = ready!(socket.as_mut().poll_write(&mut context, &buf[*offset..]))?;
+        let n = ready!(socket.as_mut().poll_write(context, &buf[*offset..]))?;
         trace!("poll_write_all: wrote {}/{} bytes", *offset + n, buf.len());
         if n == 0 {
             return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
@@ -515,7 +516,7 @@ where
 /// It is possible that this function never completes,
 /// so a timeout needs to be set on the caller side.
 fn poll_read_exact<TSocket>(
-    mut context: &mut Context,
+    context: &mut Context,
     mut socket: Pin<&mut TSocket>,
     buf: &mut [u8],
     offset: &mut usize,
@@ -524,7 +525,7 @@ where
     TSocket: AsyncRead,
 {
     loop {
-        let n = ready!(socket.as_mut().poll_read(&mut context, &mut buf[*offset..]))?;
+        let n = ready!(socket.as_mut().poll_read(context, &mut buf[*offset..]))?;
         trace!("poll_read_exact: read {}/{} bytes", *offset + n, buf.len());
         if n == 0 {
             return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
@@ -547,15 +548,15 @@ mod test {
     use super::*;
     use crate::{
         noise::{AntiReplayTimestamps, HandshakeAuthMode, NoiseUpgrader},
-        testutils::fake_socket::ReadWriteTestSocket,
+        testutils::fake_socket::{ReadOnlyTestSocket, ReadWriteTestSocket},
     };
+    use diem_config::network_id::NetworkContext;
+    use diem_crypto::{test_utils::TEST_SEED, traits::Uniform as _, x25519};
     use futures::{
         executor::block_on,
         future::join,
         io::{AsyncReadExt, AsyncWriteExt},
     };
-    use libra_crypto::{test_utils::TEST_SEED, traits::Uniform as _, x25519};
-    use libra_types::PeerId;
     use memsocket::MemorySocket;
     use rand::SeedableRng as _;
     use std::io;
@@ -569,21 +570,21 @@ mod test {
 
         let client_private = x25519::PrivateKey::generate(&mut rng);
         let client_public = client_private.public_key();
-        let client_peer_id = PeerId::from_identity_public_key(client_public);
+        let client_peer_id = diem_types::account_address::from_identity_public_key(client_public);
 
         let server_private = x25519::PrivateKey::generate(&mut rng);
         let server_public = server_private.public_key();
-        let server_peer_id = PeerId::from_identity_public_key(server_public);
+        let server_peer_id = diem_types::account_address::from_identity_public_key(server_public);
 
         let client = NoiseUpgrader::new(
-            client_peer_id,
+            NetworkContext::mock_with_peer_id(client_peer_id),
             client_private,
-            HandshakeAuthMode::ServerOnly,
+            HandshakeAuthMode::server_only(),
         );
         let server = NoiseUpgrader::new(
-            server_peer_id,
+            NetworkContext::mock_with_peer_id(server_peer_id),
             server_private,
-            HandshakeAuthMode::ServerOnly,
+            HandshakeAuthMode::server_only(),
         );
 
         ((client, client_public), (server, server_public))
@@ -606,7 +607,7 @@ mod test {
 
         //
         let client_session = client_session.unwrap();
-        let (server_session, _) = server_session.unwrap();
+        let (server_session, _, _) = server_session.unwrap();
         (client_session, server_session)
     }
 
@@ -628,6 +629,27 @@ mod test {
         assert_eq!(buf, b"stormlight archive");
 
         Ok(())
+    }
+
+    // we used to time out when given a stream of all zeros, now we want an EOF
+    #[test]
+    fn dont_read_forever() {
+        // setup fake socket
+        let mut fake_socket = ReadOnlyTestSocket::new(&[0u8]);
+
+        // the socket will read a continuous streams of zeros
+        fake_socket.set_trailing();
+
+        // setup a NoiseStream with a dummy state
+        let noise_session = noise::NoiseSession::new_for_testing();
+        let mut peer = NoiseStream::new(fake_socket, noise_session);
+
+        // make sure we error and we don't continuously read
+        block_on(async move {
+            let mut buffer = [0u8; 128];
+            let res = peer.read(&mut buffer).await;
+            assert!(res.is_err());
+        });
     }
 
     #[test]
@@ -691,7 +713,7 @@ mod test {
 
         // get session
         let mut client = client.unwrap();
-        let (mut server, _) = server.unwrap();
+        let (mut server, _, _) = server.unwrap();
 
         // test send and receive
         block_on(client.write_all(b"The Name of the Wind")).unwrap();

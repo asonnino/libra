@@ -1,13 +1,12 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     config::{LoggerConfig, SecureBackend},
-    keys::KeyPair,
+    keys::ConfigKey,
 };
-use libra_crypto::{ed25519::Ed25519PrivateKey, Uniform};
-use libra_network_address::NetworkAddress;
-use libra_types::{waypoint::Waypoint, PeerId};
+use diem_crypto::{ed25519::Ed25519PrivateKey, Uniform};
+use diem_types::{network_address::NetworkAddress, waypoint::Waypoint, PeerId};
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -23,6 +22,11 @@ pub struct SafetyRulesConfig {
     pub service: SafetyRulesService,
     pub test: Option<SafetyRulesTestConfig>,
     pub verify_vote_proposal_signature: bool,
+    pub export_consensus_key: bool,
+    // Read/Write/Connect networking operation timeout in milliseconds.
+    pub network_timeout_ms: u64,
+    pub enable_cached_safety_data: bool,
+    pub decoupled_execution: bool,
 }
 
 impl Default for SafetyRulesConfig {
@@ -33,6 +37,11 @@ impl Default for SafetyRulesConfig {
             service: SafetyRulesService::Thread,
             test: None,
             verify_vote_proposal_signature: true,
+            export_consensus_key: false,
+            // Default value of 30 seconds for a timeout
+            network_timeout_ms: 30_000,
+            enable_cached_safety_data: true,
+            decoupled_execution: false,
         }
     }
 }
@@ -46,7 +55,7 @@ impl SafetyRulesConfig {
 }
 
 /// Defines how safety rules should be executed
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum SafetyRulesService {
     /// This runs safety rules in the same thread as event processor
@@ -56,14 +65,11 @@ pub enum SafetyRulesService {
     /// This runs safety rules in the same thread as event processor but data is passed through the
     /// light weight RPC (serializer)
     Serializer,
-    /// This instructs Consensus that this is an test model, where Consensus should take the
-    /// existing config, create a new process, and pass it the config
-    SpawnedProcess(RemoteService),
     /// This creates a separate thread to run safety rules, it is similar to a fork / exec style
     Thread,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteService {
     pub server_address: NetworkAddress,
@@ -79,41 +85,39 @@ impl RemoteService {
     }
 }
 
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
-#[cfg_attr(any(test, feature = "fuzzing"), derive(Clone))]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct SafetyRulesTestConfig {
     pub author: PeerId,
-    #[serde(rename = "consensus_private_key")]
-    pub consensus_keypair: Option<KeyPair<Ed25519PrivateKey>>,
-    #[serde(rename = "execution_private_key")]
-    pub execution_keypair: Option<KeyPair<Ed25519PrivateKey>>,
+    pub consensus_key: Option<ConfigKey<Ed25519PrivateKey>>,
+    pub execution_key: Option<ConfigKey<Ed25519PrivateKey>>,
     pub waypoint: Option<Waypoint>,
-}
-
-#[cfg(not(any(test, feature = "fuzzing")))]
-impl Clone for SafetyRulesTestConfig {
-    fn clone(&self) -> Self {
-        Self::new(self.author)
-    }
 }
 
 impl SafetyRulesTestConfig {
     pub fn new(author: PeerId) -> Self {
         Self {
             author,
-            consensus_keypair: None,
-            execution_keypair: None,
+            consensus_key: None,
+            execution_key: None,
             waypoint: None,
         }
     }
 
+    pub fn consensus_key(&mut self, key: Ed25519PrivateKey) {
+        self.consensus_key = Some(ConfigKey::new(key));
+    }
+
+    pub fn execution_key(&mut self, key: Ed25519PrivateKey) {
+        self.execution_key = Some(ConfigKey::new(key));
+    }
+
     pub fn random_consensus_key(&mut self, rng: &mut StdRng) {
         let privkey = Ed25519PrivateKey::generate(rng);
-        self.consensus_keypair = Some(KeyPair::<Ed25519PrivateKey>::load(privkey));
+        self.consensus_key = Some(ConfigKey::<Ed25519PrivateKey>::new(privkey));
     }
 
     pub fn random_execution_key(&mut self, rng: &mut StdRng) {
         let privkey = Ed25519PrivateKey::generate(rng);
-        self.execution_keypair = Some(KeyPair::<Ed25519PrivateKey>::load(privkey));
+        self.execution_key = Some(ConfigKey::<Ed25519PrivateKey>::new(privkey));
     }
 }

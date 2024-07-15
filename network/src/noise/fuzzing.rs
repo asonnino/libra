@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //
@@ -9,14 +9,16 @@
 //
 
 use crate::{
-    noise::{AntiReplayTimestamps, HandshakeAuthMode, NoiseUpgrader},
+    noise::{stream::NoiseStream, AntiReplayTimestamps, HandshakeAuthMode, NoiseUpgrader},
     testutils::fake_socket::{ReadOnlyTestSocket, ReadWriteTestSocket},
 };
+use diem_config::network_id::NetworkContext;
+use diem_crypto::{noise::NoiseSession, test_utils::TEST_SEED, x25519, Uniform as _};
+use diem_types::PeerId;
 use futures::{executor::block_on, future::join};
-use libra_crypto::{test_utils::TEST_SEED, x25519, Uniform as _};
-use libra_types::PeerId;
+use futures_util::io::AsyncReadExt;
 use once_cell::sync::Lazy;
-use rand_core::SeedableRng;
+use rand::SeedableRng;
 
 //
 // Corpus generation
@@ -36,11 +38,13 @@ pub static KEYPAIRS: Lazy<(
 
     let initiator_private_key = x25519::PrivateKey::generate(&mut rng);
     let initiator_public_key = initiator_private_key.public_key();
-    let initiator_peer_id = PeerId::from_identity_public_key(initiator_public_key);
+    let initiator_peer_id =
+        diem_types::account_address::from_identity_public_key(initiator_public_key);
 
     let responder_private_key = x25519::PrivateKey::generate(&mut rng);
     let responder_public_key = responder_private_key.public_key();
-    let responder_peer_id = PeerId::from_identity_public_key(responder_public_key);
+    let responder_peer_id =
+        diem_types::account_address::from_identity_public_key(responder_public_key);
 
     (
         (
@@ -64,14 +68,14 @@ fn generate_first_two_messages() -> (Vec<u8>, Vec<u8>) {
     ) = KEYPAIRS.clone();
 
     let initiator = NoiseUpgrader::new(
-        initiator_peer_id,
+        NetworkContext::mock_with_peer_id(initiator_peer_id),
         initiator_private_key,
-        HandshakeAuthMode::ServerOnly,
+        HandshakeAuthMode::server_only(),
     );
     let responder = NoiseUpgrader::new(
-        responder_peer_id,
+        NetworkContext::mock_with_peer_id(responder_peer_id),
         responder_private_key,
-        HandshakeAuthMode::ServerOnly,
+        HandshakeAuthMode::server_only(),
     );
 
     // create exposing socket
@@ -89,7 +93,7 @@ fn generate_first_two_messages() -> (Vec<u8>, Vec<u8>) {
 
     // take result
     let initiator_session = initiator_session.unwrap();
-    let (responder_session, peer_id) = responder_session.unwrap();
+    let (responder_session, peer_id, _) = responder_session.unwrap();
 
     // some sanity checks
     assert_eq!(initiator_session.get_remote_static(), responder_public_key);
@@ -99,7 +103,7 @@ fn generate_first_two_messages() -> (Vec<u8>, Vec<u8>) {
     (init_msg, resp_msg)
 }
 
-pub fn generate_corpus(gen: &mut libra_proptest_helpers::ValueGenerator) -> Vec<u8> {
+pub fn generate_corpus(gen: &mut diem_proptest_helpers::ValueGenerator) -> Vec<u8> {
     let (init_msg, resp_msg) = generate_first_two_messages();
     // choose a random one
     let strategy = proptest::arbitrary::any::<bool>();
@@ -123,14 +127,15 @@ fn fake_timestamp() -> [u8; AntiReplayTimestamps::TIMESTAMP_SIZE] {
     [0u8; AntiReplayTimestamps::TIMESTAMP_SIZE]
 }
 
+/// Fuzz a client during the handshake
 pub fn fuzz_initiator(data: &[u8]) {
     // setup initiator
     let ((initiator_private_key, _, initiator_peer_id), (_, responder_public_key, _)) =
         KEYPAIRS.clone();
     let initiator = NoiseUpgrader::new(
-        initiator_peer_id,
+        NetworkContext::mock_with_peer_id(initiator_peer_id),
         initiator_private_key,
-        HandshakeAuthMode::ServerOnly,
+        HandshakeAuthMode::server_only(),
     );
 
     // setup NoiseStream
@@ -141,13 +146,14 @@ pub fn fuzz_initiator(data: &[u8]) {
     let _ = block_on(initiator.upgrade_outbound(fake_socket, responder_public_key, fake_timestamp));
 }
 
+/// Fuzz a server during the handshake
 pub fn fuzz_responder(data: &[u8]) {
     // setup responder
     let (_, (responder_private_key, _, responder_peer_id)) = KEYPAIRS.clone();
     let responder = NoiseUpgrader::new(
-        responder_peer_id,
+        NetworkContext::mock_with_peer_id(responder_peer_id),
         responder_private_key,
-        HandshakeAuthMode::ServerOnly,
+        HandshakeAuthMode::server_only(),
     );
 
     // setup NoiseStream
@@ -158,6 +164,27 @@ pub fn fuzz_responder(data: &[u8]) {
     let _ = block_on(responder.upgrade_inbound(fake_socket));
 }
 
+/// Fuzz a peer post-handshake
+pub fn fuzz_post_handshake(data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+
+    // setup fake socket
+    let mut fake_socket = ReadOnlyTestSocket::new(data);
+    fake_socket.set_trailing();
+
+    // setup a NoiseStream with a dummy state
+    let noise_session = NoiseSession::new_for_testing();
+    let mut peer = NoiseStream::new(fake_socket, noise_session);
+
+    // read fuzz data
+    block_on(async move {
+        let mut buffer = [0u8; 1024];
+        let _ = peer.read(&mut buffer).await;
+    });
+}
+
 //
 // Tests
 // =====
@@ -166,8 +193,9 @@ pub fn fuzz_responder(data: &[u8]) {
 //
 
 #[test]
-fn test_noise_fuzzer() {
+fn test_noise_fuzzers() {
     let (init_msg, resp_msg) = generate_first_two_messages();
     fuzz_responder(&init_msg);
     fuzz_initiator(&resp_msg);
+    fuzz_post_handshake(&resp_msg);
 }

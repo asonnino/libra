@@ -1,15 +1,16 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #[cfg(test)]
 mod mock_vm_test;
 
-use libra_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
-use libra_state_view::StateView;
-use libra_types::{
+use diem_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
+use diem_state_view::StateView;
+use diem_types::{
     access_path::AccessPath,
     account_address::AccountAddress,
-    account_config::{association_address, validator_set_address, LBR_NAME},
+    account_config::{diem_root_address, validator_set_address, XUS_NAME},
+    chain_id::ChainId,
     contract_event::ContractEvent,
     event::EventKey,
     on_chain_config::{
@@ -19,10 +20,10 @@ use libra_types::{
         RawTransaction, Script, SignedTransaction, Transaction, TransactionArgument,
         TransactionOutput, TransactionPayload, TransactionStatus,
     },
-    vm_status::{StatusCode, VMStatus},
+    vm_status::{KeptVMStatus, StatusCode, VMStatus},
     write_set::{WriteOp, WriteSet, WriteSetMut},
 };
-use libra_vm::VMExecutor;
+use diem_vm::VMExecutor;
 use move_core_types::{language_storage::TypeTag, move_resource::MoveResource};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -42,12 +43,11 @@ enum MockVMTransaction {
 }
 
 pub static KEEP_STATUS: Lazy<TransactionStatus> =
-    Lazy::new(|| TransactionStatus::Keep(VMStatus::new(StatusCode::EXECUTED)));
+    Lazy::new(|| TransactionStatus::Keep(KeptVMStatus::Executed));
 
-// We use 10 as the assertion error code for insufficient balance within the Libra coin contract.
-pub static DISCARD_STATUS: Lazy<TransactionStatus> = Lazy::new(|| {
-    TransactionStatus::Discard(VMStatus::new(StatusCode::ABORTED).with_sub_status(10))
-});
+// We use 10 as the assertion error code for insufficient balance within the Diem coin contract.
+pub static DISCARD_STATUS: Lazy<TransactionStatus> =
+    Lazy::new(|| TransactionStatus::Discard(StatusCode::INSUFFICIENT_BALANCE_FOR_TRANSACTION_FEE));
 
 pub struct MockVM;
 
@@ -69,7 +69,7 @@ impl VMExecutor for MockVM {
                     new_epoch_event_key(),
                     0,
                     TypeTag::Bool,
-                    lcs::to_bytes(&0).unwrap(),
+                    bcs::to_bytes(&0).unwrap(),
                 )],
                 0,
                 KEEP_STATUS.clone(),
@@ -83,7 +83,7 @@ impl VMExecutor for MockVM {
         let mut outputs = vec![];
 
         for txn in transactions {
-            match decode_transaction(&txn.as_signed_user_txn().unwrap()) {
+            match decode_transaction(txn.as_signed_user_txn().unwrap()) {
                 MockVMTransaction::Mint { sender, amount } => {
                     let old_balance = read_balance(&output_cache, state_view, sender);
                     let new_balance = old_balance + amount;
@@ -140,12 +140,12 @@ impl VMExecutor for MockVM {
                         write_set,
                         events,
                         0,
-                        TransactionStatus::Keep(VMStatus::new(StatusCode::EXECUTED)),
+                        TransactionStatus::Keep(KeptVMStatus::Executed),
                     ));
                 }
                 MockVMTransaction::Reconfiguration => {
                     read_balance_from_storage(state_view, &balance_ap(validator_set_address()));
-                    read_balance_from_storage(state_view, &balance_ap(association_address()));
+                    read_balance_from_storage(state_view, &balance_ap(diem_root_address()));
                     outputs.push(TransactionOutput::new(
                         // WriteSet cannot be empty so use genesis writeset only for testing.
                         gen_genesis_writeset(),
@@ -154,7 +154,7 @@ impl VMExecutor for MockVM {
                             new_epoch_event_key(),
                             0,
                             TypeTag::Bool,
-                            lcs::to_bytes(&0).unwrap(),
+                            bcs::to_bytes(&0).unwrap(),
                         )],
                         0,
                         KEEP_STATUS.clone(),
@@ -192,16 +192,16 @@ fn read_seqnum(
 }
 
 fn read_balance_from_storage(state_view: &dyn StateView, balance_access_path: &AccessPath) -> u64 {
-    read_u64_from_storage(state_view, &balance_access_path)
+    read_u64_from_storage(state_view, balance_access_path)
 }
 
 fn read_seqnum_from_storage(state_view: &dyn StateView, seqnum_access_path: &AccessPath) -> u64 {
-    read_u64_from_storage(state_view, &seqnum_access_path)
+    read_u64_from_storage(state_view, seqnum_access_path)
 }
 
 fn read_u64_from_storage(state_view: &dyn StateView, access_path: &AccessPath) -> u64 {
     state_view
-        .get(&access_path)
+        .get(access_path)
         .expect("Failed to query storage.")
         .map_or(0, |bytes| decode_bytes(&bytes))
 }
@@ -225,11 +225,11 @@ fn gen_genesis_writeset() -> WriteSet {
     let validator_set_ap = ValidatorSet::CONFIG_ID.access_path();
     write_set.push((
         validator_set_ap,
-        WriteOp::Value(lcs::to_bytes(&ValidatorSet::new(vec![])).unwrap()),
+        WriteOp::Value(bcs::to_bytes(&ValidatorSet::new(vec![])).unwrap()),
     ));
     write_set.push((
         AccessPath::new(config_address(), ConfigurationResource::resource_path()),
-        WriteOp::Value(lcs::to_bytes(&ConfigurationResource::default()).unwrap()),
+        WriteOp::Value(bcs::to_bytes(&ConfigurationResource::default()).unwrap()),
     ));
     write_set
         .freeze()
@@ -313,8 +313,9 @@ fn encode_transaction(sender: AccountAddress, program: Script) -> Transaction {
         program,
         0,
         0,
-        LBR_NAME.to_owned(),
-        std::time::Duration::from_secs(0),
+        XUS_NAME.to_owned(),
+        0,
+        ChainId::test(),
     );
 
     let privkey = Ed25519PrivateKey::generate_for_testing();
@@ -327,7 +328,8 @@ fn encode_transaction(sender: AccountAddress, program: Script) -> Transaction {
 }
 
 pub fn encode_reconfiguration_transaction(sender: AccountAddress) -> Transaction {
-    let raw_transaction = RawTransaction::new_write_set(sender, 0, WriteSet::default());
+    let raw_transaction =
+        RawTransaction::new_write_set(sender, 0, WriteSet::default(), ChainId::test());
 
     let privkey = Ed25519PrivateKey::generate_for_testing();
     Transaction::UserTransaction(
@@ -365,6 +367,10 @@ fn decode_transaction(txn: &SignedTransaction) -> MockVMTransaction {
                 },
                 _ => unimplemented!("Transaction must have one or two arguments."),
             }
+        }
+        TransactionPayload::ScriptFunction(_) => {
+            // TODO: we need to migrate Script to ScriptFunction later
+            unimplemented!("MockVM does not support script function transaction payload.")
         }
         TransactionPayload::WriteSet(_) => {
             // Use WriteSet for reconfig only for testing.

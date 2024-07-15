@@ -1,22 +1,25 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module provides mock dbreader for tests.
 
-use crate::{DbReader, StartupInfo, TreeState};
+use crate::{DbReader, Order, StartupInfo, TreeState};
 use anyhow::Result;
-use libra_crypto::HashValue;
-use libra_types::{
+use diem_crypto::HashValue;
+use diem_types::{
     account_address::AccountAddress,
     account_config::AccountResource,
     account_state::AccountState,
     account_state_blob::{AccountStateBlob, AccountStateWithProof},
-    contract_event::ContractEvent,
+    contract_event::{ContractEvent, EventByVersionWithProof, EventWithProof},
     epoch_change::EpochChangeProof,
     event::{EventHandle, EventKey},
     ledger_info::LedgerInfoWithSignatures,
-    proof::{AccumulatorConsistencyProof, SparseMerkleProof},
-    transaction::{TransactionListWithProof, TransactionWithProof, Version},
+    proof::SparseMerkleProof,
+    state_proof::StateProof,
+    transaction::{
+        AccountTransactionsWithProof, TransactionListWithProof, TransactionWithProof, Version,
+    },
 };
 use move_core_types::move_resource::MoveResource;
 use std::convert::TryFrom;
@@ -48,9 +51,30 @@ impl DbReader for MockDbReader {
         &self,
         _event_key: &EventKey,
         _start: u64,
-        _ascending: bool,
+        _order: Order,
         _limit: u64,
     ) -> Result<Vec<(u64, ContractEvent)>> {
+        unimplemented!()
+    }
+
+    /// Returns events by given event key
+    fn get_events_with_proofs(
+        &self,
+        _event_key: &EventKey,
+        _start: u64,
+        _order: Order,
+        _limit: u64,
+        _known_version: Option<u64>,
+    ) -> Result<Vec<EventWithProof>> {
+        unimplemented!()
+    }
+
+    fn get_event_by_version_with_proof(
+        &self,
+        _event_key: &EventKey,
+        _version: u64,
+        _proof_version: u64,
+    ) -> Result<EventByVersionWithProof> {
         unimplemented!()
     }
 
@@ -74,13 +98,24 @@ impl DbReader for MockDbReader {
         unimplemented!()
     }
 
-    fn get_txn_by_account(
+    fn get_account_transaction(
         &self,
         _address: AccountAddress,
         _seq_num: u64,
+        _include_events: bool,
         _ledger_version: Version,
-        _fetch_events: bool,
     ) -> Result<Option<TransactionWithProof>> {
+        unimplemented!()
+    }
+
+    fn get_account_transactions(
+        &self,
+        _address: AccountAddress,
+        _start_seq_num: u64,
+        _limit: u64,
+        _include_events: bool,
+        _ledger_version: Version,
+    ) -> Result<AccountTransactionsWithProof> {
         unimplemented!()
     }
 
@@ -88,18 +123,11 @@ impl DbReader for MockDbReader {
         &self,
         _known_version: u64,
         _ledger_info: LedgerInfoWithSignatures,
-    ) -> Result<(EpochChangeProof, AccumulatorConsistencyProof)> {
+    ) -> Result<StateProof> {
         unimplemented!()
     }
 
-    fn get_state_proof(
-        &self,
-        _known_version: u64,
-    ) -> Result<(
-        LedgerInfoWithSignatures,
-        EpochChangeProof,
-        AccumulatorConsistencyProof,
-    )> {
+    fn get_state_proof(&self, _known_version: u64) -> Result<StateProof> {
         unimplemented!()
     }
 
@@ -116,7 +144,10 @@ impl DbReader for MockDbReader {
         &self,
         _address: AccountAddress,
         _version: Version,
-    ) -> Result<(Option<AccountStateBlob>, SparseMerkleProof)> {
+    ) -> Result<(
+        Option<AccountStateBlob>,
+        SparseMerkleProof<AccountStateBlob>,
+    )> {
         unimplemented!()
     }
 
@@ -144,13 +175,12 @@ fn get_mock_account_state_blob() -> AccountStateBlob {
         None,
         EventHandle::random_handle(0),
         EventHandle::random_handle(0),
-        false,
     );
 
     let mut account_state = AccountState::default();
     account_state.insert(
         AccountResource::resource_path(),
-        lcs::to_bytes(&account_resource).unwrap(),
+        bcs::to_bytes(&account_resource).unwrap(),
     );
 
     AccountStateBlob::try_from(&account_state).unwrap()

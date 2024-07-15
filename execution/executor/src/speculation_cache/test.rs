@@ -1,8 +1,8 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use libra_types::{block_info::BlockInfo, epoch_state::EpochState};
+use diem_types::{block_info::BlockInfo, epoch_state::EpochState};
 
 fn id(index: u64) -> HashValue {
     let bytes = index.to_be_bytes();
@@ -76,10 +76,10 @@ fn test_branch() {
     let mut cache = create_cache();
     // put counting blocks as a separate line to avoid core dump
     // if assertion fails.
-    let mut num_blocks = cache.block_map.lock().unwrap().len();
+    let mut num_blocks = cache.block_map.lock().len();
     assert_eq!(num_blocks, 11);
     cache.prune(&gen_ledger_info(id(9), false)).unwrap();
-    num_blocks = cache.block_map.lock().unwrap().len();
+    num_blocks = cache.block_map.lock().len();
     assert_eq!(num_blocks, 2);
     assert_eq!(cache.committed_block_id, id(9));
 }
@@ -88,7 +88,7 @@ fn test_branch() {
 fn test_reconfig_id_update() {
     let mut cache = create_cache();
     cache.prune(&gen_ledger_info(id(1), true)).unwrap();
-    let num_blocks = cache.block_map.lock().unwrap().len();
+    let num_blocks = cache.block_map.lock().len();
     assert_eq!(num_blocks, 4);
     assert_ne!(cache.committed_block_id, id(1));
 }

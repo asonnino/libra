@@ -1,30 +1,92 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{utils::project_root, Result};
-use anyhow::anyhow;
+use crate::{
+    cargo::selected_package::{SelectedInclude, SelectedPackages},
+    config::CargoConfig,
+    utils::{
+        apply_sccache_if_possible, log_sccache_stats, project_root, sccache_should_run,
+        stop_sccache_server,
+    },
+    Result,
+};
+use anyhow::{anyhow, Context};
+use cargo_metadata::Message;
+use indexmap::map::IndexMap;
 use log::{info, warn};
 use std::{
     ffi::{OsStr, OsString},
+    io::Cursor,
     path::Path,
     process::{Command, Output, Stdio},
     time::Instant,
 };
 
+pub mod build_args;
+pub mod selected_package;
+
+const SECRET_ENVS: &[&str] = &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"];
 pub struct Cargo {
     inner: Command,
     pass_through_args: Vec<OsString>,
-    env_additions: Vec<(OsString, OsString)>,
+    env_additions: IndexMap<OsString, Option<OsString>>,
+    on_close: fn(),
+}
+
+impl Drop for Cargo {
+    fn drop(&mut self) {
+        (self.on_close)();
+    }
 }
 
 impl Cargo {
-    pub fn new<S: AsRef<OsStr>>(command: S) -> Self {
+    pub fn new<S: AsRef<OsStr>>(
+        cargo_config: &CargoConfig,
+        command: S,
+        skip_sccache: bool,
+    ) -> Self {
         let mut inner = Command::new("cargo");
+        //sccache apply
+        let envs: IndexMap<OsString, Option<OsString>> = if !skip_sccache {
+            let result = apply_sccache_if_possible(cargo_config);
+            match result {
+                Ok(env) => env
+                    .iter()
+                    .map(|(key, option)| {
+                        if let Some(val) = option {
+                            (
+                                OsString::from(key.to_owned()),
+                                Some(OsString::from(val.to_owned())),
+                            )
+                        } else {
+                            (OsString::from(key.to_owned()), None)
+                        }
+                    })
+                    .collect(),
+                Err(hmm) => {
+                    warn!("Could not install sccache: {}", hmm);
+                    IndexMap::new()
+                }
+            }
+        } else {
+            IndexMap::new()
+        };
+
+        let on_drop = if !skip_sccache && sccache_should_run(cargo_config, false) {
+            || {
+                log_sccache_stats();
+                stop_sccache_server();
+            }
+        } else {
+            || ()
+        };
+
         inner.arg(command);
         Self {
             inner,
             pass_through_args: Vec::new(),
-            env_additions: Vec::new(),
+            env_additions: envs,
+            on_close: on_drop,
         }
     }
 
@@ -33,46 +95,26 @@ impl Cargo {
         self
     }
 
-    pub fn workspace(&mut self) -> &mut Self {
-        self.inner.arg("--workspace");
-        self
-    }
-
-    pub fn all_features(&mut self) -> &mut Self {
-        self.inner.arg("--all-features");
-        self
-    }
-
-    pub fn all_targets(&mut self) -> &mut Self {
-        self.inner.arg("--all-targets");
-        self
-    }
-
     pub fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Self {
         self.inner.current_dir(dir);
         self
     }
 
-    pub fn packages<I, S>(&mut self, packages: I) -> &mut Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        for p in packages {
-            self.inner.arg("--package");
-            self.inner.arg(p);
-        }
-        self
-    }
-
-    pub fn exclusions<I, S>(&mut self, exclusions: I) -> &mut Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        for e in exclusions {
-            self.inner.arg("--exclude");
-            self.inner.arg(e);
+    pub fn packages(&mut self, packages: &SelectedPackages<'_>) -> &mut Self {
+        match &packages.includes {
+            SelectedInclude::Workspace => {
+                self.inner.arg("--workspace");
+                for &e in &packages.excludes {
+                    self.inner.args(&["--exclude", e]);
+                }
+            }
+            SelectedInclude::Includes(includes) => {
+                for &p in includes {
+                    if !packages.excludes.contains(p) {
+                        self.inner.args(&["--package", p]);
+                    }
+                }
+            }
         }
         self
     }
@@ -111,7 +153,7 @@ impl Cargo {
     /// Passes extra environment variables to x's target command.
     pub fn envs<I, K, V>(&mut self, vars: I) -> &mut Self
     where
-        I: IntoIterator<Item = (K, V)>,
+        I: IntoIterator<Item = (K, Option<V>)>,
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
     {
@@ -122,13 +164,15 @@ impl Cargo {
     }
 
     /// Passes an extra environment variable to x's target command.
-    pub fn env<K, V>(&mut self, key: K, val: V) -> &mut Self
+    pub fn env<K, V>(&mut self, key: K, val: Option<V>) -> &mut Self
     where
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
     {
+        let converted_val = val.map(|s| s.as_ref().to_owned());
+
         self.env_additions
-            .push((key.as_ref().to_os_string(), val.as_ref().to_os_string()));
+            .insert(key.as_ref().to_owned(), converted_val);
         self
     }
 
@@ -138,11 +182,10 @@ impl Cargo {
     }
 
     /// Runs this command, capturing the standard output into a `Vec<u8>`.
-    /// No logging/timing will be displayed as the result of this call from x.
+    /// Standard error is forwarded.
     pub fn run_with_output(&mut self) -> Result<Vec<u8>> {
         self.inner.stderr(Stdio::inherit());
-        // Since system out hijacked don't log for this command
-        self.do_run(false).map(|o| o.stdout)
+        self.do_run(true).map(|o| o.stdout)
     }
 
     /// Internal run command, where the magic happens.
@@ -157,13 +200,28 @@ impl Cargo {
 
         // once all the arguments are added to the command we can log it.
         if log {
-            self.env_additions
-                .iter()
-                .for_each(|t| info!("Env {:?}: {:?}", t.0, t.1));
+            self.env_additions.iter().for_each(|(name, value_option)| {
+                if let Some(env_val) = value_option {
+                    if SECRET_ENVS.contains(&name.to_str().unwrap_or_default()) {
+                        info!("export {:?}=********", name);
+                    } else {
+                        info!("export {:?}={:?}", name, env_val);
+                    }
+                } else {
+                    info!("unset {:?}", name);
+                }
+            });
             info!("Executing: {:?}", &self.inner);
         }
-        self.inner
-            .envs(self.env_additions.iter().map(|(k, v)| (k, v)));
+        // process enviroment additions, removing Options that are none...
+        for (key, option_value) in &self.env_additions {
+            if let Some(value) = option_value {
+                self.inner.env(key, value);
+            } else {
+                self.inner.env_remove(key);
+            }
+        }
+
         let now = Instant::now();
         let output = self.inner.output()?;
         // once the command has been executed we log it's success or failure.
@@ -189,135 +247,150 @@ impl Cargo {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct CargoArgs {
-    pub all_features: bool,
-    pub all_targets: bool,
-}
+// TODO: this should really be a struct instead of an enum with repeated fields.
 
 /// Represents an invocations of cargo that will call multiple other invocations of
 /// cargo based on groupings implied by the contents of <workspace-root>/x.toml.
 pub enum CargoCommand<'a> {
-    Bench(&'a [OsString]),
-    Check,
-    Clippy(&'a [OsString]),
-    Test {
+    Bench {
+        cargo_config: &'a CargoConfig,
         direct_args: &'a [OsString],
         args: &'a [OsString],
-        env: &'a [(&'a str, &'a str)],
+        env: &'a [(&'a str, Option<&'a str>)],
+    },
+    Check {
+        cargo_config: &'a CargoConfig,
+        direct_args: &'a [OsString],
+    },
+    Clippy {
+        cargo_config: &'a CargoConfig,
+        direct_args: &'a [OsString],
+        args: &'a [OsString],
+    },
+    Fix {
+        cargo_config: &'a CargoConfig,
+        direct_args: &'a [OsString],
+        args: &'a [OsString],
+    },
+    Test {
+        cargo_config: &'a CargoConfig,
+        direct_args: &'a [OsString],
+        args: &'a [OsString],
+        env: &'a [(&'a str, Option<&'a str>)],
+        skip_sccache: bool,
+    },
+    Build {
+        cargo_config: &'a CargoConfig,
+        direct_args: &'a [OsString],
+        args: &'a [OsString],
+        env: &'a [(&'a str, Option<&'a str>)],
+        skip_sccache: bool,
     },
 }
 
 impl<'a> CargoCommand<'a> {
-    pub fn run_on_local_package(&self, args: &CargoArgs) -> Result<()> {
-        let mut cargo = Cargo::new(self.as_str());
-        Self::apply_args(&mut cargo, args);
-        cargo
-            .args(self.direct_args())
-            .pass_through(self.pass_through_args())
-            .envs(self.get_extra_env().to_owned())
-            .run()
-    }
-
-    pub fn run_on_packages_separate<I, S>(&self, packages: I) -> Result<()>
-    where
-        I: IntoIterator<Item = (S, CargoArgs)>,
-        S: AsRef<OsStr>,
-    {
-        for (name, args) in packages {
-            let mut cargo = Cargo::new(self.as_str());
-            Self::apply_args(&mut cargo, &args);
-            cargo
-                .args(self.direct_args())
-                .packages(&[name])
-                .current_dir(project_root())
-                .pass_through(self.pass_through_args())
-                .envs(self.get_extra_env().to_owned())
-                .run()?;
+    pub fn cargo_config(&self) -> &CargoConfig {
+        match self {
+            CargoCommand::Bench { cargo_config, .. } => cargo_config,
+            CargoCommand::Check { cargo_config, .. } => cargo_config,
+            CargoCommand::Clippy { cargo_config, .. } => cargo_config,
+            CargoCommand::Fix { cargo_config, .. } => cargo_config,
+            CargoCommand::Test { cargo_config, .. } => cargo_config,
+            CargoCommand::Build { cargo_config, .. } => cargo_config,
         }
-        Ok(())
     }
 
-    pub fn run_on_packages_together<I, S>(&self, packages: I, args: &CargoArgs) -> Result<()>
-    where
-        I: IntoIterator<Item = S> + Clone,
-        S: AsRef<OsStr>,
-    {
-        // Early return if we have no packages to run
-        if packages.clone().into_iter().count() == 0 {
+    pub fn skip_sccache(&self) -> bool {
+        match self {
+            CargoCommand::Build { skip_sccache, .. } => *skip_sccache,
+            CargoCommand::Test { skip_sccache, .. } => *skip_sccache,
+            _ => false,
+        }
+    }
+
+    pub fn run_on_packages(&self, packages: &SelectedPackages<'_>) -> Result<()> {
+        // Early return if we have no packages to run.
+        if !packages.should_invoke() {
+            info!("no packages to {}: exiting early", self.as_str());
             return Ok(());
         }
 
-        let mut cargo = Cargo::new(self.as_str());
-        Self::apply_args(&mut cargo, args);
+        let mut cargo = self.prepare_cargo(packages);
+        cargo.run()
+    }
+
+    /// Runs this command on the selected packages, returning the standard output as a bytestring.
+    pub fn run_capture_messages(
+        &self,
+        packages: &SelectedPackages<'_>,
+    ) -> Result<impl Iterator<Item = Result<Message>>> {
+        // Early return if we have no packages to run.
+        let output = if !packages.should_invoke() {
+            info!("no packages to {}: exiting early", self.as_str());
+            vec![]
+        } else {
+            let mut cargo = self.prepare_cargo(packages);
+            cargo.args(&["--message-format", "json-render-diagnostics"]);
+            cargo.run_with_output()?
+        };
+
+        Ok(Message::parse_stream(Cursor::new(output))
+            .map(|message| message.context("error while parsing message from Cargo")))
+    }
+
+    fn prepare_cargo(&self, packages: &SelectedPackages<'_>) -> Cargo {
+        let mut cargo = Cargo::new(self.cargo_config(), self.as_str(), self.skip_sccache());
         cargo
             .current_dir(project_root())
             .args(self.direct_args())
             .packages(packages)
             .pass_through(self.pass_through_args())
-            .envs(self.get_extra_env().to_owned())
-            .run()
-    }
+            .envs(self.get_extra_env().to_owned());
 
-    pub fn run_with_exclusions<I, S>(&self, exclusions: I, args: &CargoArgs) -> Result<()>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        let mut cargo = Cargo::new(self.as_str());
-        Self::apply_args(&mut cargo, args);
         cargo
-            .current_dir(project_root())
-            .workspace()
-            .args(self.direct_args())
-            .exclusions(exclusions)
-            .pass_through(self.pass_through_args())
-            .envs(self.get_extra_env().to_owned())
-            .run()
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            CargoCommand::Bench(_) => "bench",
-            CargoCommand::Check => "check",
-            CargoCommand::Clippy(_) => "clippy",
+            CargoCommand::Bench { .. } => "bench",
+            CargoCommand::Check { .. } => "check",
+            CargoCommand::Clippy { .. } => "clippy",
+            CargoCommand::Fix { .. } => "fix",
             CargoCommand::Test { .. } => "test",
+            CargoCommand::Build { .. } => "build",
         }
     }
 
     fn pass_through_args(&self) -> &[OsString] {
         match self {
-            CargoCommand::Bench(args) => args,
-            CargoCommand::Check => &[],
-            CargoCommand::Clippy(args) => args,
+            CargoCommand::Bench { args, .. } => args,
+            CargoCommand::Check { .. } => &[],
+            CargoCommand::Clippy { args, .. } => args,
+            CargoCommand::Fix { args, .. } => args,
             CargoCommand::Test { args, .. } => args,
+            CargoCommand::Build { args, .. } => args,
         }
     }
 
     fn direct_args(&self) -> &[OsString] {
         match self {
-            CargoCommand::Bench(_) => &[],
-            CargoCommand::Check => &[],
-            CargoCommand::Clippy(_) => &[],
+            CargoCommand::Bench { direct_args, .. } => direct_args,
+            CargoCommand::Check { direct_args, .. } => direct_args,
+            CargoCommand::Clippy { direct_args, .. } => direct_args,
+            CargoCommand::Fix { direct_args, .. } => direct_args,
             CargoCommand::Test { direct_args, .. } => direct_args,
+            CargoCommand::Build { direct_args, .. } => direct_args,
         }
     }
 
-    pub fn get_extra_env(&self) -> &[(&str, &str)] {
+    pub fn get_extra_env(&self) -> &[(&str, Option<&str>)] {
         match self {
-            CargoCommand::Bench(_) => &[],
-            CargoCommand::Check => &[],
-            CargoCommand::Clippy(_) => &[],
-            CargoCommand::Test { env, .. } => &env,
-        }
-    }
-
-    fn apply_args(cargo: &mut Cargo, args: &CargoArgs) {
-        if args.all_features {
-            cargo.all_features();
-        }
-        if args.all_targets {
-            cargo.all_targets();
+            CargoCommand::Bench { env, .. } => env,
+            CargoCommand::Check { .. } => &[],
+            CargoCommand::Clippy { .. } => &[],
+            CargoCommand::Fix { .. } => &[],
+            CargoCommand::Test { env, .. } => env,
+            CargoCommand::Build { env, .. } => env,
         }
     }
 }

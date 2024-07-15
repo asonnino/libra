@@ -1,28 +1,41 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
-use crate::instance::Instance;
-use config_builder::ValidatorConfig;
-use libra_crypto::{
+use crate::instance::{Instance, ValidatorGroup};
+use diem_crypto::{
     ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
     test_utils::KeyPair,
+    Uniform,
 };
+use diem_types::{chain_id::ChainId, waypoint::Waypoint};
 use rand::prelude::*;
 use reqwest::Client;
-use std::convert::TryInto;
 
 #[derive(Clone)]
 pub struct Cluster {
     // guaranteed non-empty
     validator_instances: Vec<Instance>,
     fullnode_instances: Vec<Instance>,
+    lsr_instances: Vec<Instance>,
+    vault_instances: Vec<Instance>,
     mint_key_pair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey>,
+    waypoint: Option<Waypoint>,
+    pub chain_id: ChainId,
+}
+
+pub fn dummy_key_pair() -> KeyPair<Ed25519PrivateKey, Ed25519PublicKey> {
+    Ed25519PrivateKey::generate_for_testing().into()
 }
 
 impl Cluster {
-    pub fn from_host_port(peers: Vec<(String, u32, Option<u32>)>, mint_file: &str) -> Self {
+    pub fn from_host_port(
+        peers: Vec<(String, u32, Option<u32>)>,
+        mint_file: &str,
+        chain_id: ChainId,
+        vasp: bool,
+    ) -> Self {
         let http_client = Client::new();
         let instances: Vec<Instance> = peers
             .into_iter()
@@ -36,30 +49,45 @@ impl Cluster {
                 )
             })
             .collect();
-        let mint_key: Ed25519PrivateKey = generate_key::load_key(mint_file);
-        let mint_key_pair = KeyPair::from(mint_key);
+
+        let mint_key_pair = if vasp {
+            dummy_key_pair()
+        } else {
+            KeyPair::from(generate_key::load_key(mint_file))
+        };
         Self {
             validator_instances: instances,
             fullnode_instances: vec![],
+            lsr_instances: vec![],
+            vault_instances: vec![],
             mint_key_pair,
+            waypoint: None,
+            chain_id,
         }
     }
 
-    fn get_mint_key_pair() -> KeyPair<Ed25519PrivateKey, Ed25519PublicKey> {
-        let seed = "1337133713371337133713371337133713371337133713371337133713371337";
-        let seed = hex::decode(seed).expect("Invalid hex in seed.");
-        let seed = seed[..32].try_into().expect("Invalid seed");
-        let mut validator_config = ValidatorConfig::new();
-        validator_config.seed = seed;
-        let (mint_key, _) = validator_config.build_faucet_key();
+    fn get_mint_key_pair_from_file(
+        mint_file: &str,
+    ) -> KeyPair<Ed25519PrivateKey, Ed25519PublicKey> {
+        let mint_key: Ed25519PrivateKey = generate_key::load_key(mint_file);
         KeyPair::from(mint_key)
     }
 
-    pub fn new(validator_instances: Vec<Instance>, fullnode_instances: Vec<Instance>) -> Self {
+    pub fn new(
+        validator_instances: Vec<Instance>,
+        fullnode_instances: Vec<Instance>,
+        lsr_instances: Vec<Instance>,
+        vault_instances: Vec<Instance>,
+        waypoint: Option<Waypoint>,
+    ) -> Self {
         Self {
             validator_instances,
             fullnode_instances,
-            mint_key_pair: Self::get_mint_key_pair(),
+            lsr_instances,
+            vault_instances,
+            mint_key_pair: Self::get_mint_key_pair_from_file("/tmp/mint.key"),
+            waypoint,
+            chain_id: ChainId::test(),
         }
     }
 
@@ -75,7 +103,7 @@ impl Cluster {
         &self.validator_instances
     }
 
-    pub fn random_full_node_instance(&self) -> Instance {
+    pub fn random_fullnode_instance(&self) -> Instance {
         let mut rnd = rand::thread_rng();
         self.fullnode_instances
             .choose(&mut rnd)
@@ -87,7 +115,23 @@ impl Cluster {
         &self.fullnode_instances
     }
 
+    pub fn lsr_instances(&self) -> &[Instance] {
+        &self.lsr_instances
+    }
+
+    pub fn vault_instances(&self) -> &[Instance] {
+        &self.vault_instances
+    }
+
     pub fn all_instances(&self) -> impl Iterator<Item = &Instance> {
+        self.validator_instances
+            .iter()
+            .chain(self.fullnode_instances.iter())
+            .chain(self.lsr_instances.iter())
+            .chain(self.vault_instances.iter())
+    }
+
+    pub fn validator_and_fullnode_instances(&self) -> impl Iterator<Item = &Instance> {
         self.validator_instances
             .iter()
             .chain(self.fullnode_instances.iter())
@@ -99,6 +143,14 @@ impl Cluster {
 
     pub fn into_fullnode_instances(self) -> Vec<Instance> {
         self.fullnode_instances
+    }
+
+    pub fn into_lsr_instances(self) -> Vec<Instance> {
+        self.lsr_instances
+    }
+
+    pub fn into_vault_instances(self) -> Vec<Instance> {
+        self.vault_instances
     }
 
     pub fn mint_key_pair(&self) -> &KeyPair<Ed25519PrivateKey, Ed25519PublicKey> {
@@ -122,7 +174,7 @@ impl Cluster {
         let mut sub = vec![];
         let mut rem = self.validator_instances.clone();
         for _ in 0..c {
-            let idx_remove = rng.gen_range(0, rem.len());
+            let idx_remove = rng.gen_range(0..rem.len());
             let instance = rem.remove(idx_remove);
             sub.push(instance);
         }
@@ -138,7 +190,7 @@ impl Cluster {
         let mut sub = vec![];
         let mut rem = self.fullnode_instances.clone();
         for _ in 0..c {
-            let idx_remove = rng.gen_range(0, rem.len());
+            let idx_remove = rng.gen_range(0..rem.len());
             let instance = rem.remove(idx_remove);
             sub.push(instance);
         }
@@ -152,7 +204,11 @@ impl Cluster {
         Cluster {
             validator_instances: instances,
             fullnode_instances: vec![],
+            lsr_instances: vec![],
+            vault_instances: vec![],
             mint_key_pair: self.mint_key_pair.clone(),
+            waypoint: self.waypoint,
+            chain_id: ChainId::test(),
         }
     }
 
@@ -160,7 +216,11 @@ impl Cluster {
         Cluster {
             validator_instances: vec![],
             fullnode_instances: instances,
+            lsr_instances: vec![],
+            vault_instances: vec![],
             mint_key_pair: self.mint_key_pair.clone(),
+            waypoint: self.waypoint,
+            chain_id: ChainId::test(),
         }
     }
 
@@ -178,6 +238,39 @@ impl Cluster {
     }
 
     pub fn find_instance_by_pod(&self, pod: &str) -> Option<&Instance> {
-        self.all_instances().find(|i| i.peer_name() == pod)
+        self.validator_and_fullnode_instances()
+            .find(|i| i.peer_name() == pod)
+    }
+
+    pub fn instances_for_group(
+        &self,
+        validator_group: ValidatorGroup,
+    ) -> impl Iterator<Item = &Instance> {
+        self.all_instances()
+            .filter(move |v| v.validator_group() == validator_group)
+    }
+
+    pub fn lsr_instances_for_validators(&self, validators: &[Instance]) -> Vec<Instance> {
+        validators
+            .iter()
+            .filter_map(|l| {
+                self.lsr_instances
+                    .iter()
+                    .find(|x| l.validator_group() == x.validator_group())
+                    .cloned()
+            })
+            .collect()
+    }
+
+    pub fn vault_instances_for_validators(&self, validators: &[Instance]) -> Vec<Instance> {
+        validators
+            .iter()
+            .filter_map(|v| {
+                self.vault_instances
+                    .iter()
+                    .find(|x| v.validator_group() == x.validator_group())
+                    .cloned()
+            })
+            .collect()
     }
 }

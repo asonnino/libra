@@ -1,10 +1,11 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use super::core::{self, Context, Subst};
 use crate::{
+    diag,
     naming::ast::{self as N, Type, TypeName_, Type_},
-    parser::ast::StructName,
+    parser::ast::{Ability_, StructName},
     typing::ast as T,
 };
 use move_ir_types::location::*;
@@ -28,9 +29,9 @@ pub fn function_body_(
     }
 
     for (annotated_acquire, annotated_loc) in annotated_acquires {
-        if !seen.contains_key(&annotated_acquire) {
+        if !seen.contains_key(annotated_acquire) {
             let msg = format!(
-                "Invalid 'acquires' list. The resource '{}::{}' was never acquired by '{}', '{}', \
+                "Invalid 'acquires' list. The struct '{}::{}' was never acquired by '{}', '{}', \
                  '{}', or a transitive call",
                 context.current_module.as_ref().unwrap(),
                 annotated_acquire,
@@ -38,7 +39,9 @@ pub fn function_body_(
                 N::BuiltinFunction_::BORROW_GLOBAL,
                 N::BuiltinFunction_::BORROW_GLOBAL_MUT
             );
-            context.error(vec![(*annotated_loc, msg)])
+            context
+                .env
+                .add_diag(diag!(Declarations::UnnecessaryItem, (*annotated_loc, msg)))
         }
     }
 }
@@ -80,7 +83,7 @@ fn exp(
 ) {
     use T::UnannotatedExp_ as E;
     match &e.exp.value {
-        E::InferredNum(_) | E::Use(_) => panic!("ICE should have been expanded"),
+        E::Use(_) => panic!("ICE should have been expanded"),
 
         E::Unit { .. }
         | E::Value(_)
@@ -99,15 +102,10 @@ fn exp(
 
         E::ModuleCall(call) => {
             let loc = e.exp.loc;
-            let acquires = call
-                .acquires
-                .iter()
-                .filter(|(a, _)| valid_acquires_annot(context, loc, a))
-                .collect::<BTreeMap<_, _>>();
             let msg = || format!("Invalid call to '{}::{}'", &call.module, &call.name);
-            for (sn, sloc) in acquires {
+            for (sn, sloc) in &call.acquires {
                 check_acquire_listed(context, annotated_acquires, loc, msg, sn, *sloc);
-                seen.insert(sn.clone(), *sloc);
+                seen.insert(*sn, *sloc);
             }
 
             exp(context, annotated_acquires, seen, &call.arguments);
@@ -144,7 +142,7 @@ fn exp(
         }
 
         E::Pack(_, _, _, fields) => {
-            for (_, (_, (_, fe))) in fields.iter() {
+            for (_, _, (_, (_, fe))) in fields {
                 exp(context, annotated_acquires, seen, fe)
             }
         }
@@ -197,7 +195,7 @@ fn builtin_function(
             let msg = mk_msg(b_.display_name());
             if let Some(sn) = check_global_access(context, loc, msg, bt) {
                 check_acquire_listed(context, annotated_acquires, *loc, msg, sn, bt.loc);
-                seen.insert(sn.clone(), bt.loc);
+                seen.insert(*sn, bt.loc);
             }
         }
 
@@ -231,11 +229,15 @@ fn check_acquire_listed<F>(
             context.current_module.as_ref().unwrap(),
             global_type_name
         );
-        context.error(vec![(loc, msg()), (global_type_loc, tmsg)]);
+        context.env.add_diag(diag!(
+            TypeSafety::MissingAcquires,
+            (loc, msg()),
+            (global_type_loc, tmsg)
+        ));
     }
 }
 
-pub fn check_global_access<'a, F>(
+fn check_global_access<'a, F>(
     context: &mut Context,
     loc: &Loc,
     msg: F,
@@ -245,12 +247,6 @@ where
     F: Fn() -> String,
 {
     check_global_access_(context, loc, msg, global_type)
-}
-
-fn valid_acquires_annot(_context: &mut Context, _loc: Loc, _global_type: &StructName) -> bool {
-    // let msg = || panic!("ICE should not have recorded errors");
-    // check_global_access_(context, loc, msg, global_type, false)
-    true
 }
 
 fn check_global_access_<'a, F>(
@@ -265,27 +261,40 @@ where
     use TypeName_ as TN;
     use Type_ as T;
     let tloc = &global_type.loc;
-    let (def_loc, declared_module, sn, resource_opt) = match &global_type.value {
-        T::Var(_) => panic!("ICE type expansion failed"),
+    let (declared_module, sn) = match &global_type.value {
+        T::Var(_) | T::Apply(None, _, _) => panic!("ICE type expansion failed"),
         T::Anything | T::UnresolvedError => {
             return None;
         }
-        T::Apply(_, sp!(_, TN::ModuleType(m, s)), _args) => {
-            let def_loc = context.struct_declared_loc(m, s);
-            let resource_opt = context.resource_opt(m, s);
-            (def_loc, m.clone(), s, resource_opt)
-        }
-        T::Ref(_, _)
-        | T::Unit
-        | T::Param(_)
-        | T::Apply(_, sp!(_, TN::Multiple(_)), _)
-        | T::Apply(_, sp!(_, TN::Builtin(_)), _) => {
-            let ty_debug = core::error_format(global_type, &Subst::empty());
-            let tmsg = format!("Expected a nominal resource. Found the type: {}", ty_debug);
-
-            context.error(vec![(*loc, msg()), (*tloc, tmsg)]);
+        T::Ref(_, _) | T::Unit => {
+            // Key ability is checked by constraints, and these types do not have Key
+            assert!(context.env.has_diags());
             return None;
         }
+        T::Apply(Some(abilities), sp!(_, TN::Multiple(_)), _)
+        | T::Apply(Some(abilities), sp!(_, TN::Builtin(_)), _) => {
+            // Key ability is checked by constraints
+            assert!(!abilities.has_ability_(Ability_::Key));
+            assert!(context.env.has_diags());
+            return None;
+        }
+        T::Param(_) => {
+            let ty_debug = core::error_format(global_type, &Subst::empty());
+            let tmsg = format!(
+                "Expected a struct type. Global storage operations are restricted to struct types \
+                 declared in the current module. Found the type parameter: {}",
+                ty_debug
+            );
+
+            context.env.add_diag(diag!(
+                TypeSafety::ExpectedSpecificType,
+                (*loc, msg()),
+                (*tloc, tmsg)
+            ));
+            return None;
+        }
+
+        T::Apply(Some(_), sp!(_, TN::ModuleType(m, s)), _args) => (*m, s),
     };
 
     match &context.current_module {
@@ -296,22 +305,19 @@ where
                  internal to the module'",
                 ty_debug
             );
-            context.error(vec![(*loc, msg()), (*tloc, tmsg)]);
+            context
+                .env
+                .add_diag(diag!(TypeSafety::Visibility, (*loc, msg()), (*tloc, tmsg)));
+            return None;
+        }
+        None => {
+            let msg = "Global storage operator cannot be used from a 'script' function";
+            context
+                .env
+                .add_diag(diag!(TypeSafety::Visibility, (*loc, msg)));
             return None;
         }
         _ => (),
-    }
-
-    if resource_opt.is_none() {
-        let ty_debug = core::error_format(global_type, &Subst::empty());
-        let tmsg = format!("Expected a nominal resource. Found the type: {}", ty_debug);
-
-        context.error(vec![
-            (*loc, msg()),
-            (*tloc, tmsg),
-            (def_loc, "Declared as a normal struct here".into()),
-        ]);
-        return None;
     }
 
     Some(sn)

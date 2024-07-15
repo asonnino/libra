@@ -1,15 +1,15 @@
-module M {
+module 0x8675309::M {
     struct S { u: u64 }
-    resource struct R {
+    struct R has key {
         f: u64
     }
-    struct G0<T: copyable> {}
-    struct G1<T: resource> {}
-    struct G2<T> {}
+    struct G0<T> has drop { f: T }
+    struct G1<T: key> { f: T }
+    struct G2<phantom T> has drop {}
 
 
-
-    fun t0(r: &R, r_mut: &mut R, s: S, s_ref: &S, s_mut: &mut S) {
+    fun t0(r: &R, r_mut: &mut R, s: S,
+    s_ref: &S, s_mut: &mut S) {
         (0: u8) == (1: u128);
         0 == false;
         &0 == 1;
@@ -22,10 +22,11 @@ module M {
         r == r;
     }
 
-    fun t3() {
-        G0{} == G0{};
-        G1{} == G1{};
+    fun t3<T: copy + key>(t: T) {
+        G0<R>{ f: R { f: 1 } } == G0<R>{ f: R { f: 1 } };
+        // can be dropped, but cannot infer type
         G2{} == G2{};
+        G1{ f: t } == G1{ f: t };
     }
 
     fun t4() {

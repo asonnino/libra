@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Node types of [`JellyfishMerkleTree`](crate::JellyfishMerkleTree)
@@ -7,22 +7,20 @@
 //! and [`LeafNode`] as building blocks of a 256-bit
 //! [`JellyfishMerkleTree`](crate::JellyfishMerkleTree). [`InternalNode`] represents a 4-level
 //! binary tree to optimize for IOPS: it compresses a tree with 31 nodes into one node with 16
-//! chidren at the lowest level. [`LeafNode`] stores the full key and the account blob data
-//! associated.
+//! chidren at the lowest level. [`LeafNode`] stores the full key and the value associated.
 
 #[cfg(test)]
 mod node_type_test;
 
-use crate::{nibble_path::NibblePath, ROOT_NIBBLE_HEIGHT};
+use crate::metrics::{DIEM_JELLYFISH_INTERNAL_ENCODED_BYTES, DIEM_JELLYFISH_LEAF_ENCODED_BYTES};
 use anyhow::{ensure, Context, Result};
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
-use libra_crypto::{
+use diem_crypto::{
     hash::{CryptoHash, SPARSE_MERKLE_PLACEHOLDER_HASH},
     HashValue,
 };
-use libra_nibble::Nibble;
-use libra_types::{
-    account_state_blob::AccountStateBlob,
+use diem_types::{
+    nibble::{nibble_path::NibblePath, Nibble, ROOT_NIBBLE_HEIGHT},
     proof::{SparseMerkleInternalNode, SparseMerkleLeafNode},
     transaction::Version,
 };
@@ -343,7 +341,9 @@ impl InternalNode {
         for (nibble, child) in self.children.iter() {
             let i = u8::from(*nibble);
             existence_bitmap |= 1u16 << i;
-            leaf_bitmap |= (child.is_leaf as u16) << i;
+            if child.is_leaf {
+                leaf_bitmap |= 1u16 << i;
+            }
         }
         // `leaf_bitmap` must be a subset of `existence_bitmap`.
         assert_eq!(existence_bitmap | leaf_bitmap, existence_bitmap);
@@ -353,13 +353,10 @@ impl InternalNode {
     /// Given a range [start, start + width), returns the sub-bitmap of that range.
     fn range_bitmaps(start: u8, width: u8, bitmaps: (u16, u16)) -> (u16, u16) {
         assert!(start < 16 && width.count_ones() == 1 && start % width == 0);
+        assert!(width <= 16 && (start + width) <= 16);
         // A range with `start == 8` and `width == 4` will generate a mask 0b0000111100000000.
-        let mask = if width == 16 {
-            0xffff
-        } else {
-            assert!(width <= 16);
-            (1 << width) - 1
-        } << start;
+        // use as converting to smaller integer types when 'width == 16'
+        let mask = (((1u32 << width) - 1) << start) as u16;
         (bitmaps.0 & mask, bitmaps.1 & mask)
     }
 
@@ -375,7 +372,7 @@ impl InternalNode {
         if range_existence_bitmap == 0 {
             // No child under this subtree
             *SPARSE_MERKLE_PLACEHOLDER_HASH
-        } else if range_existence_bitmap.count_ones() == 1 && (range_leaf_bitmap != 0 || width == 1)
+        } else if width == 1 || (range_existence_bitmap.count_ones() == 1 && range_leaf_bitmap != 0)
         {
             // Only 1 leaf child under this subtree or reach the lowest level
             let only_child_index = Nibble::from(range_existence_bitmap.trailing_zeros() as u8);
@@ -390,11 +387,15 @@ impl InternalNode {
                 .unwrap()
                 .hash
         } else {
-            let left_child = self.merkle_hash(start, width / 2, (existence_bitmap, leaf_bitmap));
+            let left_child = self.merkle_hash(
+                start,
+                width / 2,
+                (range_existence_bitmap, range_leaf_bitmap),
+            );
             let right_child = self.merkle_hash(
                 start + width / 2,
                 width / 2,
-                (existence_bitmap, leaf_bitmap),
+                (range_existence_bitmap, range_leaf_bitmap),
             );
             SparseMerkleInternalNode::new(left_child, right_child).hash()
         }
@@ -447,8 +448,8 @@ impl InternalNode {
             if range_existence_bitmap == 0 {
                 // No child in this range.
                 return (None, siblings);
-            } else if range_existence_bitmap.count_ones() == 1
-                && (range_leaf_bitmap.count_ones() == 1 || width == 1)
+            } else if width == 1
+                || (range_existence_bitmap.count_ones() == 1 && range_leaf_bitmap != 0)
             {
                 // Return the only 1 leaf child under this subtree or reach the lowest level
                 // Even this leaf child is not the n-th child, it should be returned instead of
@@ -496,23 +497,26 @@ pub(crate) fn get_child_and_sibling_half_start(n: Nibble, height: u8) -> (u8, u8
 
 /// Represents an account.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct LeafNode {
+pub struct LeafNode<V> {
     // The hashed account address associated with this leaf node.
     account_key: HashValue,
-    // The hash of the account state blob.
-    blob_hash: HashValue,
-    // The account blob associated with `account_key`.
-    blob: AccountStateBlob,
+    // The hash of the value.
+    value_hash: HashValue,
+    // The value stored in the leaf, associated with `account_key`.
+    value: V,
 }
 
-impl LeafNode {
+impl<V> LeafNode<V>
+where
+    V: crate::Value,
+{
     /// Creates a new leaf node.
-    pub fn new(account_key: HashValue, blob: AccountStateBlob) -> Self {
-        let blob_hash = blob.hash();
+    pub fn new(account_key: HashValue, value: V) -> Self {
+        let value_hash = value.hash();
         Self {
             account_key,
-            blob_hash,
-            blob,
+            value_hash,
+            value,
         }
     }
 
@@ -521,19 +525,19 @@ impl LeafNode {
         self.account_key
     }
 
-    /// Gets the associated blob itself.
-    pub fn blob(&self) -> &AccountStateBlob {
-        &self.blob
+    /// Gets the associated value itself.
+    pub fn value(&self) -> &V {
+        &self.value
     }
 
     pub fn hash(&self) -> HashValue {
-        SparseMerkleLeafNode::new(self.account_key, self.blob_hash).hash()
+        SparseMerkleLeafNode::new(self.account_key, self.value_hash).hash()
     }
 }
 
-impl From<LeafNode> for SparseMerkleLeafNode {
-    fn from(leaf_node: LeafNode) -> Self {
-        Self::new(leaf_node.account_key, leaf_node.blob_hash)
+impl<V> From<LeafNode<V>> for SparseMerkleLeafNode {
+    fn from(leaf_node: LeafNode<V>) -> Self {
+        Self::new(leaf_node.account_key, leaf_node.value_hash)
     }
 }
 
@@ -547,16 +551,16 @@ enum NodeTag {
 
 /// The concrete node type of [`JellyfishMerkleTree`](crate::JellyfishMerkleTree).
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Node {
+pub enum Node<V> {
     /// Represents `null`.
     Null,
     /// A wrapper of [`InternalNode`].
     Internal(InternalNode),
     /// A wrapper of [`LeafNode`].
-    Leaf(LeafNode),
+    Leaf(LeafNode<V>),
 }
 
-impl From<InternalNode> for Node {
+impl<V> From<InternalNode> for Node<V> {
     fn from(node: InternalNode) -> Self {
         Node::Internal(node)
     }
@@ -568,13 +572,16 @@ impl From<InternalNode> for Children {
     }
 }
 
-impl From<LeafNode> for Node {
-    fn from(node: LeafNode) -> Self {
+impl<V> From<LeafNode<V>> for Node<V> {
+    fn from(node: LeafNode<V>) -> Self {
         Node::Leaf(node)
     }
 }
 
-impl Node {
+impl<V> Node<V>
+where
+    V: crate::Value,
+{
     /// Creates the [`Null`](Node::Null) variant.
     pub fn new_null() -> Self {
         Node::Null
@@ -586,8 +593,8 @@ impl Node {
     }
 
     /// Creates the [`Leaf`](Node::Leaf) variant.
-    pub fn new_leaf(account_key: HashValue, blob: AccountStateBlob) -> Self {
-        Node::Leaf(LeafNode::new(account_key, blob))
+    pub fn new_leaf(account_key: HashValue, value: V) -> Self {
+        Node::Leaf(LeafNode::new(account_key, value))
     }
 
     /// Returns `true` if the node is a leaf node.
@@ -604,11 +611,13 @@ impl Node {
             }
             Node::Internal(internal_node) => {
                 out.push(NodeTag::Internal as u8);
-                internal_node.serialize(&mut out)?
+                internal_node.serialize(&mut out)?;
+                DIEM_JELLYFISH_INTERNAL_ENCODED_BYTES.inc_by(out.len() as u64);
             }
             Node::Leaf(leaf_node) => {
                 out.push(NodeTag::Leaf as u8);
-                out.extend(lcs::to_bytes(&leaf_node)?);
+                out.extend(bcs::to_bytes(&leaf_node)?);
+                DIEM_JELLYFISH_LEAF_ENCODED_BYTES.inc_by(out.len() as u64);
             }
         }
         Ok(out)
@@ -624,7 +633,7 @@ impl Node {
     }
 
     /// Recovers from serialized bytes in physical storage.
-    pub fn decode(val: &[u8]) -> Result<Node> {
+    pub fn decode(val: &[u8]) -> Result<Node<V>> {
         if val.is_empty() {
             return Err(NodeDecodeError::EmptyInput.into());
         }
@@ -633,7 +642,7 @@ impl Node {
         match node_tag {
             Some(NodeTag::Null) => Ok(Node::Null),
             Some(NodeTag::Internal) => Ok(Node::Internal(InternalNode::deserialize(&val[1..])?)),
-            Some(NodeTag::Leaf) => Ok(Node::Leaf(lcs::from_bytes(&val[1..])?)),
+            Some(NodeTag::Leaf) => Ok(Node::Leaf(bcs::from_bytes(&val[1..])?)),
             None => Err(NodeDecodeError::UnknownTag { unknown_tag: tag }.into()),
         }
     }
@@ -670,8 +679,11 @@ fn serialize_u64_varint(mut num: u64, binary: &mut Vec<u8>) {
     for _ in 0..8 {
         let low_bits = num as u8 & 0x7f;
         num >>= 7;
-        let more = (num > 0) as u8;
-        binary.push(low_bits | more << 7);
+        let more = match num {
+            0 => 0u8,
+            _ => 0x80,
+        };
+        binary.push(low_bits | more);
         if more == 0 {
             return;
         }
@@ -690,9 +702,8 @@ where
     let mut num = 0u64;
     for i in 0..8 {
         let byte = reader.read_u8()?;
-        let more = (byte & 0x80) != 0;
         num |= u64::from(byte & 0x7f) << (i * 7);
-        if !more {
+        if (byte & 0x80) == 0 {
             return Ok(num);
         }
     }

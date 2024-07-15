@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -6,8 +6,8 @@ use crate::{
     timeout::Timeout,
 };
 use anyhow::Context;
-use libra_crypto::{ed25519::Ed25519Signature, hash::CryptoHash};
-use libra_types::validator_verifier::ValidatorVerifier;
+use diem_crypto::ed25519::Ed25519Signature;
+use diem_types::validator_verifier::ValidatorVerifier;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt};
 
@@ -41,9 +41,8 @@ impl TimeoutCertificate {
 
     /// Verifies the signatures for the round
     pub fn verify(&self, validator: &ValidatorVerifier) -> anyhow::Result<()> {
-        let timeout_hash = self.timeout.hash();
         validator
-            .verify_aggregated_signature(timeout_hash, &self.signatures)
+            .verify_aggregated_struct_signature(&self.timeout, &self.signatures)
             .context("Failed to verify TimeoutCertificate")?;
         Ok(())
     }

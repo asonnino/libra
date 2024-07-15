@@ -1,17 +1,22 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::account_address::AccountAddress;
+use crate::{account_address::AccountAddress, identifier::Identifier};
 use anyhow::Result as AResult;
 use serde::{
     de::Error as DeError,
-    ser::{SerializeSeq, SerializeTuple},
-    Deserialize,
+    ser::{SerializeMap, SerializeSeq, SerializeTuple},
+    Deserialize, Serialize,
 };
 use std::fmt::{self, Debug};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub struct MoveStruct(Vec<MoveValue>);
+pub enum MoveStruct {
+    /// The representation used by the MoveVM
+    Runtime(Vec<MoveValue>),
+    /// A decorated representation with human-readable field names that can be used by clients
+    WithFields(Vec<(Identifier, MoveValue)>),
+}
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum MoveValue {
@@ -25,10 +30,28 @@ pub enum MoveValue {
     Signer(AccountAddress),
 }
 
-#[derive(Debug)]
-pub struct MoveStructLayout(Vec<MoveTypeLayout>);
+/// A layout associated with a named field
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveFieldLayout {
+    name: Identifier,
+    layout: MoveTypeLayout,
+}
 
-#[derive(Debug)]
+impl MoveFieldLayout {
+    pub fn new(name: Identifier, layout: MoveTypeLayout) -> Self {
+        Self { name, layout }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MoveStructLayout {
+    /// The representation used by the MoveVM
+    Runtime(Vec<MoveTypeLayout>),
+    /// A decorated representation with human-readable field names that can be used by clients
+    WithFields(Vec<MoveFieldLayout>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MoveTypeLayout {
     Bool,
     U8,
@@ -42,48 +65,97 @@ pub enum MoveTypeLayout {
 
 impl MoveValue {
     pub fn simple_deserialize(blob: &[u8], ty: &MoveTypeLayout) -> AResult<Self> {
-        Ok(lcs::from_bytes_seed(ty, blob)?)
+        Ok(bcs::from_bytes_seed(ty, blob)?)
     }
 
     pub fn simple_serialize(&self) -> Option<Vec<u8>> {
-        lcs::to_bytes(self).ok()
+        bcs::to_bytes(self).ok()
     }
 
     pub fn vector_u8(v: Vec<u8>) -> Self {
         MoveValue::Vector(v.into_iter().map(MoveValue::U8).collect())
     }
+
+    pub fn vector_address(v: Vec<AccountAddress>) -> Self {
+        MoveValue::Vector(v.into_iter().map(MoveValue::Address).collect())
+    }
+}
+
+pub fn serialize_values<'a, I>(vals: I) -> Vec<Vec<u8>>
+where
+    I: IntoIterator<Item = &'a MoveValue>,
+{
+    vals.into_iter()
+        .map(|val| {
+            val.simple_serialize()
+                .expect("serialization should succeed")
+        })
+        .collect()
 }
 
 impl MoveStruct {
     pub fn new(value: Vec<MoveValue>) -> Self {
-        MoveStruct(value)
+        Self::Runtime(value)
+    }
+
+    pub fn with_fields(values: Vec<(Identifier, MoveValue)>) -> Self {
+        Self::WithFields(values)
     }
 
     pub fn simple_deserialize(blob: &[u8], ty: &MoveStructLayout) -> AResult<Self> {
-        Ok(lcs::from_bytes_seed(ty, blob)?)
+        Ok(bcs::from_bytes_seed(ty, blob)?)
     }
 
     pub fn fields(&self) -> &[MoveValue] {
-        &self.0
+        match self {
+            Self::Runtime(vals) => vals,
+            Self::WithFields(_) => {
+                // It's not possible to implement this without changing the return type, and some
+                // panicking is the best move
+                panic!("Getting fields for decorated representation")
+            }
+        }
     }
 
-    pub fn into_inner(self) -> Vec<MoveValue> {
-        self.0
+    pub fn into_fields(self) -> Vec<MoveValue> {
+        match self {
+            Self::Runtime(vals) => vals,
+            Self::WithFields(vals) => vals.into_iter().map(|(_, f)| f).collect(),
+        }
     }
 }
 
 impl MoveStructLayout {
     pub fn new(types: Vec<MoveTypeLayout>) -> Self {
-        MoveStructLayout(types)
+        Self::Runtime(types)
     }
+
+    pub fn with_fields(types: Vec<MoveFieldLayout>) -> Self {
+        Self::WithFields(types)
+    }
+
     pub fn fields(&self) -> &[MoveTypeLayout] {
-        &self.0
+        match self {
+            Self::Runtime(vals) => vals,
+            Self::WithFields(_) => {
+                // It's not possible to implement this without changing the return type, and some
+                // performance-critical VM serialization code uses the Runtime case of this.
+                // panicking is the best move
+                panic!("Getting fields for decorated representation")
+            }
+        }
+    }
+
+    pub fn into_fields(self) -> Vec<MoveTypeLayout> {
+        match self {
+            Self::Runtime(vals) => vals,
+            Self::WithFields(vals) => vals.into_iter().map(|f| f.layout).collect(),
+        }
     }
 }
 
 impl<'d> serde::de::DeserializeSeed<'d> for &MoveTypeLayout {
     type Value = MoveValue;
-
     fn deserialize<D: serde::de::Deserializer<'d>>(
         self,
         deserializer: D,
@@ -128,6 +200,30 @@ impl<'d, 'a> serde::de::Visitor<'d> for VectorElementVisitor<'a> {
     }
 }
 
+struct DecoratedStructFieldVisitor<'a>(&'a [MoveFieldLayout]);
+
+impl<'d, 'a> serde::de::Visitor<'d> for DecoratedStructFieldVisitor<'a> {
+    type Value = Vec<(Identifier, MoveValue)>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Struct")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'d>,
+    {
+        let mut vals = Vec::new();
+        for (i, layout) in self.0.iter().enumerate() {
+            match seq.next_element_seed(layout)? {
+                Some(elem) => vals.push(elem),
+                None => return Err(A::Error::invalid_length(i, &self)),
+            }
+        }
+        Ok(vals)
+    }
+}
+
 struct StructFieldVisitor<'a>(&'a [MoveTypeLayout]);
 
 impl<'d, 'a> serde::de::Visitor<'d> for StructFieldVisitor<'a> {
@@ -152,6 +248,17 @@ impl<'d, 'a> serde::de::Visitor<'d> for StructFieldVisitor<'a> {
     }
 }
 
+impl<'d> serde::de::DeserializeSeed<'d> for &MoveFieldLayout {
+    type Value = (Identifier, MoveValue);
+
+    fn deserialize<D: serde::de::Deserializer<'d>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        Ok((self.name.clone(), self.layout.deserialize(deserializer)?))
+    }
+}
+
 impl<'d> serde::de::DeserializeSeed<'d> for &MoveStructLayout {
     type Value = MoveStruct;
 
@@ -159,9 +266,18 @@ impl<'d> serde::de::DeserializeSeed<'d> for &MoveStructLayout {
         self,
         deserializer: D,
     ) -> Result<Self::Value, D::Error> {
-        let layout = &self.0;
-        let fields = deserializer.deserialize_tuple(layout.len(), StructFieldVisitor(layout))?;
-        Ok(MoveStruct(fields))
+        match self {
+            MoveStructLayout::Runtime(layout) => {
+                let fields =
+                    deserializer.deserialize_tuple(layout.len(), StructFieldVisitor(layout))?;
+                Ok(MoveStruct::Runtime(fields))
+            }
+            MoveStructLayout::WithFields(layout) => {
+                let fields = deserializer
+                    .deserialize_tuple(layout.len(), DecoratedStructFieldVisitor(layout))?;
+                Ok(MoveStruct::WithFields(fields))
+            }
+        }
     }
 }
 
@@ -185,13 +301,64 @@ impl serde::Serialize for MoveValue {
         }
     }
 }
-
 impl serde::Serialize for MoveStruct {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut t = serializer.serialize_tuple(self.0.len())?;
-        for v in self.0.iter() {
-            t.serialize_element(v)?;
+        match self {
+            Self::Runtime(s) => {
+                let mut t = serializer.serialize_tuple(s.len())?;
+                for v in s.iter() {
+                    t.serialize_element(v)?;
+                }
+                t.end()
+            }
+            Self::WithFields(s) => {
+                let mut t = serializer.serialize_map(Some(s.len()))?;
+                for (f, v) in s.iter() {
+                    t.serialize_entry(f, v)?;
+                }
+                t.end()
+            }
         }
-        t.end()
+    }
+}
+
+impl fmt::Display for MoveFieldLayout {
+    fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}: {}", self.name, self.layout)
+    }
+}
+
+impl fmt::Display for MoveTypeLayout {
+    fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
+        use MoveTypeLayout::*;
+        match self {
+            Bool => write!(f, "bool"),
+            U8 => write!(f, "u8"),
+            U64 => write!(f, "u64"),
+            U128 => write!(f, "u128"),
+            Address => write!(f, "address"),
+            Vector(typ) => write!(f, "vector<{}>", typ),
+            Struct(s) => write!(f, "{}", s),
+            Signer => write!(f, "signer"),
+        }
+    }
+}
+
+impl fmt::Display for MoveStructLayout {
+    fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{{ ")?;
+        match self {
+            Self::Runtime(layouts) => {
+                for (i, l) in layouts.iter().enumerate() {
+                    write!(f, "{}: {}, ", i, l)?
+                }
+            }
+            Self::WithFields(layouts) => {
+                for layout in layouts {
+                    write!(f, "{}, ", layout)?
+                }
+            }
+        }
+        write!(f, "}}")
     }
 }

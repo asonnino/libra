@@ -1,18 +1,18 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use proptest::sample::Index as PropIndex;
-use vm::file_format::{
-    CompiledModuleMut, Signature, SignatureToken, StructFieldInformation, TypeSignature,
+use move_binary_format::file_format::{
+    CompiledModule, Signature, SignatureToken, StructFieldInformation, TypeSignature,
 };
+use proptest::sample::Index as PropIndex;
 
 pub struct SignatureRefMutation<'a> {
-    module: &'a mut CompiledModuleMut,
+    module: &'a mut CompiledModule,
     mutations: Vec<(PropIndex, PropIndex)>,
 }
 
 impl<'a> SignatureRefMutation<'a> {
-    pub fn new(module: &'a mut CompiledModuleMut, mutations: Vec<(PropIndex, PropIndex)>) -> Self {
+    pub fn new(module: &'a mut CompiledModule, mutations: Vec<(PropIndex, PropIndex)>) -> Self {
         Self { module, mutations }
     }
 
@@ -39,12 +39,12 @@ impl<'a> SignatureRefMutation<'a> {
 
 /// Context for applying a list of `FieldRefMutation` instances.
 pub struct FieldRefMutation<'a> {
-    module: &'a mut CompiledModuleMut,
+    module: &'a mut CompiledModule,
     mutations: Vec<(PropIndex, PropIndex)>,
 }
 
 impl<'a> FieldRefMutation<'a> {
-    pub fn new(module: &'a mut CompiledModuleMut, mutations: Vec<(PropIndex, PropIndex)>) -> Self {
+    pub fn new(module: &'a mut CompiledModule, mutations: Vec<(PropIndex, PropIndex)>) -> Self {
         Self { module, mutations }
     }
 

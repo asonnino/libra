@@ -1,18 +1,21 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Usage: ./key-manager node.config
 
 #![forbid(unsafe_code)]
 
-use libra_config::config::KeyManagerConfig;
-use libra_key_manager::{
-    counters::COUNTERS, libra_interface::JsonRpcLibraInterface, Error, KeyManager,
+use diem_config::config::KeyManagerConfig;
+use diem_key_manager::{
+    counters,
+    diem_interface::JsonRpcDiemInterface,
+    logging::{LogEntry, LogEvent, LogSchema},
+    Error, KeyManager,
 };
-use libra_logger::info;
-use libra_secure_push_metrics::MetricsPusher;
-use libra_secure_storage::Storage;
-use libra_secure_time::RealTimeService;
+use diem_logger::info;
+use diem_secure_push_metrics::MetricsPusher;
+use diem_secure_storage::Storage;
+use diem_time_service::TimeService;
 use std::{convert::TryInto, env, process};
 
 fn main() {
@@ -31,14 +34,16 @@ fn main() {
         process::exit(1);
     });
 
-    libra_logger::Logger::new()
+    diem_logger::Logger::new()
         .channel_size(key_manager_config.logger.chan_size)
         .is_async(key_manager_config.logger.is_async)
         .level(key_manager_config.logger.level)
+        .read_env()
         .init();
-    libra_logger::init_struct_log_from_env().expect("Failed to initialize structured logging");
 
-    MetricsPusher::new(COUNTERS.clone()).start();
+    crash_handler::setup_panic_handler();
+    let _mp = MetricsPusher::start();
+    counters::initialize_all_metric_counters();
 
     create_and_execute_key_manager(key_manager_config).unwrap_or_else(|e| {
         eprintln!("Error! The Key Manager has failed during execution: {}", e);
@@ -47,27 +52,30 @@ fn main() {
 }
 
 fn create_and_execute_key_manager(key_manager_config: KeyManagerConfig) -> Result<(), Error> {
-    let libra_interface = create_libra_interface(key_manager_config.json_rpc_endpoint);
+    info!(
+        LogSchema::new(LogEntry::Initialized).event(LogEvent::Pending),
+        key_manager_config = key_manager_config
+    );
+
+    let json_rpc_endpoint = key_manager_config.json_rpc_endpoint;
+    let diem_interface = JsonRpcDiemInterface::new(json_rpc_endpoint.clone());
     let storage: Storage = (&key_manager_config.secure_backend)
         .try_into()
         .expect("Unable to initialize storage");
-    let time_service = RealTimeService::new();
 
-    KeyManager::new(
-        libra_interface,
+    let mut key_manager = KeyManager::new(
+        diem_interface,
         storage,
-        time_service,
+        TimeService::real(),
         key_manager_config.rotation_period_secs,
         key_manager_config.sleep_period_secs,
         key_manager_config.txn_expiration_secs,
-    )
-    .execute()
-}
-
-fn create_libra_interface(json_rpc_endpoint: String) -> JsonRpcLibraInterface {
-    info!(
-        "Creating a libra interface that talks to the JSON RPC endpoint at: {:?}.",
-        json_rpc_endpoint
+        key_manager_config.chain_id,
     );
-    JsonRpcLibraInterface::new(json_rpc_endpoint)
+
+    info!(LogSchema::new(LogEntry::Initialized)
+        .event(LogEvent::Success)
+        .json_rpc_endpoint(&json_rpc_endpoint));
+
+    key_manager.execute()
 }

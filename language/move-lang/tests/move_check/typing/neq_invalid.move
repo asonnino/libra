@@ -1,11 +1,11 @@
-module M {
+module 0x8675309::M {
     struct S { u: u64 }
-    resource struct R {
+    struct R {
         f: u64
     }
-    struct G0<T: copyable> {}
-    struct G1<T: resource> {}
-    struct G2<T> {}
+    struct G0<phantom T> has drop {}
+    struct G1<phantom T: key> {}
+    struct G2<phantom T> {}
 
 
 

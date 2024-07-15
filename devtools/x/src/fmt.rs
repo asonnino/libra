@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{cargo::Cargo, context::XContext, Result};
@@ -22,9 +22,9 @@ pub struct Args {
     args: Vec<OsString>,
 }
 
-pub fn run(args: Args, _xctx: XContext) -> Result<()> {
+pub fn run(args: Args, xctx: XContext) -> Result<()> {
     // Hardcode that we want imports merged
-    let mut pass_through_args = vec!["--config".into(), "merge_imports=true".into()];
+    let mut pass_through_args = vec!["--config".into(), "imports_granularity=crate".into()];
 
     if args.check {
         pass_through_args.push("--check".into());
@@ -32,7 +32,7 @@ pub fn run(args: Args, _xctx: XContext) -> Result<()> {
 
     pass_through_args.extend(args.args);
 
-    let mut cmd = Cargo::new("fmt");
+    let mut cmd = Cargo::new(xctx.config().cargo_config(), "fmt", true);
 
     if args.workspace {
         // cargo fmt doesn't have a --workspace flag, instead it uses the

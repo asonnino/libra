@@ -1,35 +1,70 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+//!
+//! This module is to contain all networking logging information.
+//!
+//! ```
+//! use diem_config::network_id::NetworkContext;
+//! use diem_logger::info;
+//! use diem_types::{PeerId, network_address::NetworkAddress};
+//! use network::logging::NetworkSchema;
+//!
+//! info!(
+//!   NetworkSchema::new(&NetworkContext::mock())
+//!     .remote_peer(&PeerId::random())
+//!     .network_address(&NetworkAddress::mock()),
+//!   field_name = "field",
+//!   "Value is {} message",
+//!   5
+//! );
+//! ```
+
 use crate::{
-    peer_manager::{ConnectionNotification, ConnectionRequest, PeerManagerRequest},
-    ConnectivityRequest,
+    connectivity_manager::DiscoverySource,
+    transport::{ConnectionId, ConnectionMetadata},
 };
-use libra_config::network_id::NetworkContext;
-use libra_logger::LoggingField;
-use libra_types::PeerId;
+use diem_config::network_id::NetworkContext;
+use diem_logger::Schema;
+use diem_types::{network_address::NetworkAddress, PeerId};
+use netcore::transport::ConnectionOrigin;
 
-/// This file contains constants used for structured logging data types so that there is
-/// consistency among structured logs.
-pub const CONNECTIVITY_MANAGER_LOOP: &str = "connectivity_manager_loop";
-pub const ONCHAIN_DISCOVERY_LOOP: &str = "onchain_discovery_loop";
-pub const PEER_MANAGER_LOOP: &str = "peer_manager_loop";
+#[derive(Schema)]
+pub struct NetworkSchema<'a> {
+    connection_id: Option<&'a ConnectionId>,
+    #[schema(display)]
+    connection_origin: Option<&'a ConnectionOrigin>,
+    #[schema(display)]
+    discovery_source: Option<&'a DiscoverySource>,
+    #[schema(display)]
+    network_address: Option<&'a NetworkAddress>,
+    network_context: &'a NetworkContext,
+    #[schema(display)]
+    remote_peer: Option<&'a PeerId>,
+}
 
-/// Common terms
-pub const TYPE: &str = "type";
-pub const START: &str = "start";
-pub const TERMINATION: &str = "termination";
-pub const EVENT: &str = "event";
+impl<'a> NetworkSchema<'a> {
+    pub fn new(network_context: &'a NetworkContext) -> Self {
+        Self {
+            connection_id: None,
+            connection_origin: None,
+            discovery_source: None,
+            network_address: None,
+            network_context,
+            remote_peer: None,
+        }
+    }
 
-/// Specific fields for logging
-pub const NETWORK_CONTEXT: LoggingField<&NetworkContext> = LoggingField::new("network_context");
-pub const EVENT_ID: LoggingField<&u32> = LoggingField::new("event_id");
-pub const REMOTE_PEER: LoggingField<&PeerId> = LoggingField::new("remote_peer");
-pub const CONNECTION_NOTIFICATION: LoggingField<&ConnectionNotification> =
-    LoggingField::new("conn_notification");
-pub const CONNECTIVITY_REQUEST: LoggingField<&ConnectivityRequest> =
-    LoggingField::new("connectivity_request");
-pub const CONNECTION_REQUEST: LoggingField<&ConnectionRequest> =
-    LoggingField::new("connection_request");
-pub const PEER_MANAGER_REQUEST: LoggingField<&PeerManagerRequest> =
-    LoggingField::new("peer_manager_request");
+    pub fn connection_metadata(self, metadata: &'a ConnectionMetadata) -> Self {
+        self.connection_id(&metadata.connection_id)
+            .connection_origin(&metadata.origin)
+            .remote_peer(&metadata.remote_peer_id)
+    }
+
+    pub fn connection_metadata_with_address(self, metadata: &'a ConnectionMetadata) -> Self {
+        self.connection_id(&metadata.connection_id)
+            .connection_origin(&metadata.origin)
+            .remote_peer(&metadata.remote_peer_id)
+            .network_address(&metadata.addr)
+    }
+}

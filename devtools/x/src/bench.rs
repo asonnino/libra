@@ -1,19 +1,21 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    cargo::{CargoArgs, CargoCommand},
+    cargo::{selected_package::SelectedPackageArgs, CargoCommand},
     context::XContext,
-    utils, Result,
+    Result,
 };
 use std::ffi::OsString;
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
 pub struct Args {
-    #[structopt(long, short, number_of_values = 1)]
-    /// Run test on the provided packages
-    package: Vec<String>,
+    #[structopt(flatten)]
+    package_args: SelectedPackageArgs,
+    /// Do not run the benchmarks, but compile them
+    #[structopt(long)]
+    no_run: bool,
     #[structopt(name = "BENCHNAME", parse(from_os_str))]
     benchname: Option<OsString>,
     #[structopt(name = "ARGS", parse(from_os_str), last = true)]
@@ -22,55 +24,19 @@ pub struct Args {
 
 pub fn run(mut args: Args, xctx: XContext) -> Result<()> {
     args.args.extend(args.benchname.clone());
-    let config = xctx.config();
 
-    let cmd = CargoCommand::Bench(&args.args);
-    let base_args = CargoArgs {
-        all_features: true,
-        ..CargoArgs::default()
+    let mut direct_args = Vec::new();
+    if args.no_run {
+        direct_args.push(OsString::from("--no-run"));
     };
 
-    if !args.package.is_empty() {
-        let run_together = args.package.iter().filter(|p| !config.is_exception(p));
-        let run_separate = args.package.iter().filter_map(|p| {
-            config.package_exceptions().get(p).map(|e| {
-                (
-                    p,
-                    CargoArgs {
-                        all_features: e.all_features,
-                        ..base_args
-                    },
-                )
-            })
-        });
-        cmd.run_on_packages_together(run_together, &base_args)?;
-        cmd.run_on_packages_separate(run_separate)?;
-    } else if utils::project_is_root()? {
-        cmd.run_with_exclusions(
-            config.package_exceptions().iter().map(|(p, _)| p),
-            &base_args,
-        )?;
-        cmd.run_on_packages_separate(config.package_exceptions().iter().map(|(name, pkg)| {
-            (
-                name,
-                CargoArgs {
-                    all_features: pkg.all_features,
-                    ..base_args
-                },
-            )
-        }))?;
-    } else {
-        let package = utils::get_local_package()?;
-        let all_features = config
-            .package_exceptions()
-            .get(&package)
-            .map(|pkg| pkg.all_features)
-            .unwrap_or(true);
+    let cmd = CargoCommand::Bench {
+        cargo_config: xctx.config().cargo_config(),
+        direct_args: direct_args.as_slice(),
+        args: &args.args,
+        env: &[],
+    };
 
-        cmd.run_on_local_package(&CargoArgs {
-            all_features,
-            ..base_args
-        })?;
-    }
-    Ok(())
+    let packages = args.package_args.to_selected_packages(&xctx)?;
+    cmd.run_on_packages(&packages)
 }

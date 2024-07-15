@@ -1,23 +1,21 @@
 [package]
 name = "bytecode-source-map"
 version = "0.1.0"
-authors = ["Libra Association <opensource@libra.org>"]
+authors = ["Diem Association <opensource@diem.com>"]
 license = "Apache-2.0"
 publish = false
 edition = "2018"
 
 [dependencies]
-anyhow = "1.0.31"
-libra-types = { path = "../../../types", version = "0.1.0" }
-libra-workspace-hack = { path = "../../../common/workspace-hack", version = "0.1.0" }
-move-core-types = { path = "../../move-core/types", version = "0.1.0" }
-move-ir-types = { path = "../../move-ir/types", version = "0.1.0" }
-vm = { path = "../../vm", version = "0.1.0" }
-lcs = { path = "../../../common/lcs", version = "0.1.0", package = "libra-canonical-serialization" }
-codespan = "0.8.0"
-codespan-reporting = "0.8.0"
-serde = { version = "1.0.114", default-features = false }
+anyhow = "1.0.38"
+diem-workspace-hack = { path = "../../../crates/diem-workspace-hack" }
+move-core-types = { path = "../../move-core/types" }
+move-ir-types = { path = "../../move-ir/types" }
+move-symbol-pool = { path = "../../move-symbol-pool" }
+move-binary-format = { path = "../../move-binary-format" }
+bcs = { git = "https://github.com/diem/bcs", rev = "30ce9f4ac51342d2fb4c04c4f5b40683d9652dc6" }
+codespan-reporting = "0.11.1"
+serde = { version = "1.0.124", default-features = false }
 
 [features]
 default = []
-fuzzing = ["libra-types/fuzzing"]

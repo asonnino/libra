@@ -1,19 +1,20 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::core_mempool::{CoreMempool, TimelineState, TxnPointer};
 use anyhow::{format_err, Result};
-use libra_config::config::NodeConfig;
-use libra_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
-use libra_types::{
+use diem_config::config::NodeConfig;
+use diem_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
+use diem_types::{
     account_address::AccountAddress,
-    account_config::LBR_NAME,
+    account_config::{AccountSequenceInfo, XUS_NAME},
+    chain_id::ChainId,
     mempool_status::MempoolStatusCode,
-    transaction::{RawTransaction, Script, SignedTransaction},
+    transaction::{GovernanceRole, RawTransaction, Script, SignedTransaction},
 };
 use once_cell::sync::Lazy;
 use rand::{rngs::StdRng, SeedableRng};
-use std::{collections::HashSet, iter::FromIterator};
+use std::collections::HashSet;
 
 pub(crate) fn setup_mempool() -> (CoreMempool, ConsensusMock) {
     (
@@ -36,7 +37,8 @@ pub struct TestTransaction {
     pub(crate) address: usize,
     pub(crate) sequence_number: u64,
     pub(crate) gas_price: u64,
-    pub(crate) is_governance_txn: bool,
+    pub(crate) governance_role: GovernanceRole,
+    pub(crate) account_seqno_type: AccountSequenceInfo,
 }
 
 impl TestTransaction {
@@ -45,35 +47,42 @@ impl TestTransaction {
             address,
             sequence_number,
             gas_price,
-            is_governance_txn: false,
+            governance_role: GovernanceRole::NonGovernanceRole,
+            account_seqno_type: AccountSequenceInfo::Sequential(0),
         }
+    }
+
+    pub(crate) fn crsn(mut self, min_nonce: u64) -> Self {
+        // Default CRSN size to 128
+        self.account_seqno_type = AccountSequenceInfo::CRSN {
+            min_nonce,
+            size: 128,
+        };
+        self
     }
 
     pub(crate) fn make_signed_transaction_with_expiration_time(
         &self,
-        exp_time: std::time::Duration,
+        exp_timestamp_secs: u64,
     ) -> SignedTransaction {
-        self.make_signed_transaction_impl(100, exp_time)
+        self.make_signed_transaction_impl(100, exp_timestamp_secs)
     }
 
     pub(crate) fn make_signed_transaction_with_max_gas_amount(
         &self,
         max_gas_amount: u64,
     ) -> SignedTransaction {
-        self.make_signed_transaction_impl(
-            max_gas_amount,
-            std::time::Duration::from_secs(u64::max_value()),
-        )
+        self.make_signed_transaction_impl(max_gas_amount, u64::max_value())
     }
 
     pub(crate) fn make_signed_transaction(&self) -> SignedTransaction {
-        self.make_signed_transaction_impl(100, std::time::Duration::from_secs(u64::max_value()))
+        self.make_signed_transaction_impl(100, u64::max_value())
     }
 
     fn make_signed_transaction_impl(
         &self,
         max_gas_amount: u64,
-        exp_time: std::time::Duration,
+        exp_timestamp_secs: u64,
     ) -> SignedTransaction {
         let raw_txn = RawTransaction::new_script(
             TestTransaction::get_address(self.address),
@@ -81,8 +90,9 @@ impl TestTransaction {
             Script::new(vec![], vec![], vec![]),
             max_gas_amount,
             self.gas_price,
-            LBR_NAME.to_owned(),
-            exp_time,
+            XUS_NAME.to_owned(),
+            exp_timestamp_secs,
+            ChainId::test(),
         );
         let mut seed: [u8; 32] = [0u8; 32];
         seed[..4].copy_from_slice(&[1, 2, 3, 4]);
@@ -99,7 +109,6 @@ impl TestTransaction {
     }
 }
 
-// adds transactions to mempool
 pub(crate) fn add_txns_to_mempool(
     pool: &mut CoreMempool,
     txns: Vec<TestTransaction>,
@@ -111,9 +120,9 @@ pub(crate) fn add_txns_to_mempool(
             txn.clone(),
             0,
             txn.gas_unit_price(),
-            0,
+            transaction.account_seqno_type,
             TimelineState::NotReady,
-            transaction.is_governance_txn,
+            transaction.governance_role,
         );
         transactions.push(txn);
     }
@@ -130,9 +139,9 @@ pub(crate) fn add_signed_txn(pool: &mut CoreMempool, transaction: SignedTransact
             transaction.clone(),
             0,
             transaction.gas_unit_price(),
-            0,
+            AccountSequenceInfo::Sequential(0),
             TimelineState::NotReady,
-            false,
+            GovernanceRole::NonGovernanceRole,
         )
         .code
     {
@@ -153,7 +162,7 @@ pub(crate) fn batch_add_signed_txn(
     Ok(())
 }
 
-// helper struct that keeps state between `.get_block` calls. Imitates work of Consensus
+// Helper struct that keeps state between `.get_block` calls. Imitates work of Consensus.
 pub struct ConsensusMock(HashSet<TxnPointer>);
 
 impl ConsensusMock {
@@ -169,9 +178,12 @@ impl ConsensusMock {
         let block = mempool.get_block(block_size, self.0.clone());
         self.0 = self
             .0
-            .union(&HashSet::from_iter(
-                block.iter().map(|t| (t.sender(), t.sequence_number())),
-            ))
+            .union(
+                &block
+                    .iter()
+                    .map(|t| (t.sender(), t.sequence_number()))
+                    .collect(),
+            )
             .cloned()
             .collect();
         block

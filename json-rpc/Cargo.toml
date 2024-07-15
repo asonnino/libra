@@ -1,46 +1,82 @@
 [package]
-name = "libra-json-rpc"
+name = "diem-json-rpc"
 version = "0.1.0"
-authors = ["Libra Association <opensource@libra.org>"]
-description = "Libra rpc endpoint"
-repository = "https://github.com/libra/libra"
-homepage = "https://libra.org"
+authors = ["Diem Association <opensource@diem.com>"]
+description = "Diem rpc endpoint"
+repository = "https://github.com/diem/diem"
+homepage = "https://diem.com"
 license = "Apache-2.0"
 publish = false
 edition = "2018"
 
 [dependencies]
-anyhow = "1.0.31"
-futures = "0.3.5"
-hex = "0.4.2"
-once_cell = "1.4.0"
-serde_json = "1.0.56"
-serde = { version = "1.0.114", default-features = false }
-tokio = { version = "0.2.21", features = ["full"] }
-warp = "0.2.3"
-reqwest = { version = "0.10.6", features = ["blocking", "json"], default_features = false, optional = true }
-proptest = { version = "0.10.0", optional = true }
+anyhow = "1.0.38"
+fail = "0.4.0"
+futures = "0.3.12"
+hex = "0.4.3"
+hyper = "0.14.20"
+once_cell = "1.7.2"
+rand = "0.8.3"
+serde_json = "1.0.64"
+serde = { version = "1.0.124", features = ["derive"], default-features = false }
+tokio = { version = "1.18.2", features = ["full"] }
+tokio-retry = "0.3.0"
+tokio-stream = "0.1.8"
+tokio-tungstenite = "0.14.0"
+warp = { version = "0.3.0", features = ["default", "tls", "tokio-rustls", "tokio-tungstenite", "websocket"] }
+reqwest = { version = "0.11.2", features = ["blocking", "json"], default_features = false, optional = true }
+proptest = { version = "1.0.0", optional = true }
+regex = { version = "1.5.5", default-features = false, features = ["std", "perf"] }
 
-debug-interface = { path = "../common/debug-interface", version = "0.1.0" }
-lcs = { path = "../common/lcs", version = "0.1.0", package = "libra-canonical-serialization" }
-libradb = { path = "../storage/libradb", version = "0.1.0", optional = true }
-libra-config = { path = "../config", version = "0.1.0" }
-libra-crypto = { path = "../crypto/crypto", version = "0.1.0" }
-libra-json-rpc-types = { path = "./types", version = "0.1.0", package = "libra-json-rpc-types" }
-libra-logger = { path = "../common/logger", version = "0.1.0" }
-libra-mempool = { path = "../mempool", version = "0.1.0" }
-libra-metrics = { path = "../common/metrics", version = "0.1.0" }
-libra-proptest-helpers = { path = "../common/proptest-helpers", optional = true }
-libra-types = { path = "../types", version = "0.1.0" }
-libra-temppath = { path = "../common/temppath", version = "0.1.0", optional = true }
-libra-workspace-hack = { path = "../common/workspace-hack", version = "0.1.0" }
-move-core-types = { path = "../language/move-core/types", version = "0.1.0" }
-network = { path = "../network", version = "0.1.0" }
-storage-interface = { path = "../storage/storage-interface", version = "0.1.0" }
+bcs = { git = "https://github.com/diem/bcs", rev = "30ce9f4ac51342d2fb4c04c4f5b40683d9652dc6" }
+diem-framework-releases= { path = "../language/diem-framework/releases" }
+diem-client = { path = "../crates/diem-client", optional = true }
+diem-config = { path = "../config" }
+diem-crypto = { path = "../crates/diem-crypto" }
+diemdb = { path = "../storage/diemdb", optional = true }
+diem-json-rpc-types = { path = "./types", package = "diem-json-rpc-types" }
+diem-infallible = { path = "../crates/diem-infallible" }
+diem-logger = { path = "../crates/diem-logger" }
+diem-mempool = { path = "../mempool" }
+diem-metrics = { path = "../crates/diem-metrics" }
+diem-proptest-helpers = { path = "../crates/diem-proptest-helpers", optional = true }
+diem-types = { path = "../types" }
+diem-temppath = { path = "../crates/diem-temppath", optional = true }
+diem-workspace-hack = { path = "../crates/diem-workspace-hack" }
+executor = { path = "../execution/executor" , optional = true}
+executor-types = { path = "../execution/executor-types" , optional = true}
+move-core-types = { path = "../language/move-core/types" }
+move-vm-types = { path = "../language/move-vm/types", optional = true }
+network = { path = "../network" }
+resource-viewer = { path = "../language/tools/resource-viewer" }
+diem-scratchpad = { path = "../storage/diem-scratchpad", optional = true }
+storage-interface = { path = "../storage/storage-interface" }
+thiserror = "1.0.37"
+vm-genesis = { path = "../language/tools/vm-genesis", optional = true }
 
 [dev-dependencies]
-libra-json-rpc-client = { path = "../client/json-rpc", version = "0.1.0" }
-vm-validator = { path = "../vm-validator", version = "0.1.0" }
+proptest = "1.0.0"
+reqwest = { version = "0.11.2", features = ["blocking", "json"], default_features = false }
+rand = { version = "0.8.3" }
+
+generate-key = { path = "../config/generate-key" }
+diemdb = { path = "../storage/diemdb", features = ["fuzzing"] }
+diem-genesis-tool = {path = "../config/management/genesis", features = ["testing"] }
+diem-client = { path = "../crates/diem-client" }
+diem-mempool = { path = "../mempool", features = ["fuzzing"] }
+diem-proptest-helpers = { path = "../crates/diem-proptest-helpers" }
+diem-temppath = { path = "../crates/diem-temppath" }
+diem-types = { path = "../types", features = ["fuzzing"] }
+vm-validator = { path = "../vm-validator" }
+diem-framework-releases= { path = "../language/diem-framework/releases" }
+vm-genesis = { path = "../language/tools/vm-genesis" }
+executor = { path = "../execution/executor" }
+executor-types = { path = "../execution/executor-types" }
+diem-scratchpad = { path = "../storage/diem-scratchpad" }
+move-vm-types = { path = "../language/move-vm/types" }
+diem-transaction-builder = { path = "../sdk/transaction-builder" }
+diem-sdk = { path = "../sdk" }
 
 [features]
-fuzzing = ["proptest", "libra-mempool/fuzzing", "libra-proptest-helpers", "libra-temppath", "libradb/fuzzing", "reqwest"]
+fuzzing = ["proptest", "diem-client", "diem-mempool/fuzzing", "diemdb/fuzzing", "diem-proptest-helpers", "diem-temppath", "executor", "executor-types", "move-vm-types", "reqwest", "diem-scratchpad", "vm-genesis"]
+failpoints = ["fail/failpoints"]

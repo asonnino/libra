@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -9,24 +9,15 @@ use crate::{
     util::mock_time_service::SimulatedTimeService,
 };
 use consensus_types::{block::Block, quorum_cert::QuorumCert};
+use diem_config::config::NodeConfig;
+use diem_crypto::{ed25519::Ed25519PrivateKey, Uniform};
+use diem_types::validator_signer::ValidatorSigner;
 use execution_correctness::{ExecutionCorrectness, ExecutionCorrectnessManager};
 use executor_test_helpers::start_storage_service;
 use executor_types::ExecutedTrees;
-use futures::channel::mpsc;
-use libra_config::{
-    config::{ExecutionCorrectnessService, NodeConfig, PersistableConfig, RemoteExecutionService},
-    utils,
-};
-use libra_crypto::{ed25519::Ed25519PrivateKey, Uniform};
-use libra_temppath::TempPath;
-use libra_types::validator_signer::ValidatorSigner;
-use state_synchronizer::StateSyncClient;
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
-};
+use std::sync::Arc;
 use storage_interface::DbReader;
-
+#[allow(clippy::needless_borrow)]
 fn get_initial_data_and_qc(db: &dyn DbReader) -> (RecoveryData, QuorumCert) {
     // find the block corresponding to storage latest ledger info
     let startup_info = db
@@ -34,14 +25,14 @@ fn get_initial_data_and_qc(db: &dyn DbReader) -> (RecoveryData, QuorumCert) {
         .expect("unable to read ledger info from storage")
         .expect("startup info is None");
 
-    let ledger_info = startup_info.latest_ledger_info.ledger_info().clone();
+    let ledger_info_with_sigs = startup_info.latest_ledger_info.clone();
 
     let qc = QuorumCert::certificate_for_genesis_from_ledger_info(
-        &ledger_info,
-        Block::make_genesis_block_from_ledger_info(&ledger_info).id(),
+        ledger_info_with_sigs.ledger_info(),
+        Block::make_genesis_block_from_ledger_info(ledger_info_with_sigs.ledger_info()).id(),
     );
 
-    let ledger_recovery_data = LedgerRecoveryData::new(ledger_info);
+    let ledger_recovery_data = LedgerRecoveryData::new(ledger_info_with_sigs);
     let frozen_root_hashes = startup_info
         .committed_tree_state
         .ledger_frozen_subtree_hashes
@@ -59,6 +50,7 @@ fn get_initial_data_and_qc(db: &dyn DbReader) -> (RecoveryData, QuorumCert) {
             ),
             vec![],
             None,
+            None,
         )
         .unwrap(),
         qc,
@@ -66,15 +58,17 @@ fn get_initial_data_and_qc(db: &dyn DbReader) -> (RecoveryData, QuorumCert) {
 }
 
 fn build_inserter(
-    config: &mut NodeConfig,
+    config: &NodeConfig,
     initial_data: RecoveryData,
     lec_client: Box<dyn ExecutionCorrectness + Send + Sync>,
 ) -> TreeInserter {
-    let (coordinator_sender, _coordinator_receiver) = mpsc::unbounded();
+    let client_commit_timeout_ms = config.state_sync.client_commit_timeout_ms;
+    let (consensus_notifier, _consensus_listener) =
+        consensus_notifications::new_consensus_notifier_listener_pair(client_commit_timeout_ms);
 
     let state_computer = Arc::new(ExecutionProxy::new(
         lec_client,
-        Arc::new(StateSyncClient::new(coordinator_sender)),
+        Box::new(consensus_notifier),
     ));
 
     TreeInserter::new_with_store(
@@ -95,32 +89,19 @@ fn build_inserter(
 #[test]
 fn test_executor_restart() {
     // Start storage service
-    let (mut config, _handle, db) = start_storage_service();
-
-    let server_port = utils::get_available_port();
-    let server_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
-
-    // Start LEC service as a process.
-    config.execution.service =
-        ExecutionCorrectnessService::SpawnedProcess(RemoteExecutionService { server_address });
-
-    // Store the config
-    let config_path = TempPath::new();
-    config_path.create_as_file().unwrap();
-    config.save_config(&config_path).unwrap();
-
-    let execution_correctness_manager = ExecutionCorrectnessManager::new(&mut config);
+    let (config, _handle, db) = start_storage_service();
+    let execution_correctness_manager = ExecutionCorrectnessManager::new(&config);
 
     let (initial_data, qc) = get_initial_data_and_qc(&*db);
 
     let mut inserter = build_inserter(
-        &mut config,
+        &config,
         initial_data,
         execution_correctness_manager.client(),
     );
 
     let block_store = inserter.block_store();
-    let genesis = block_store.root();
+    let genesis = block_store.ordered_root();
     let genesis_block_id = genesis.id();
     let genesis_block = block_store
         .get_block(genesis_block_id)
@@ -135,9 +116,8 @@ fn test_executor_restart() {
     // Crash LEC.
     drop(execution_correctness_manager);
 
-    config = NodeConfig::load(&config_path).unwrap();
     // Restart LEC and make sure we can continue to append to the current tree.
-    let _execution_correctness_manager = ExecutionCorrectnessManager::new(&mut config);
+    let _execution_correctness_manager = ExecutionCorrectnessManager::new(&config);
 
     //       ╭--> A1--> A2--> A3
     // Genesis--> B1--> B2
@@ -150,32 +130,20 @@ fn test_executor_restart() {
 #[test]
 fn test_block_store_restart() {
     // Start storage service
-    let (mut config, _handle, db) = start_storage_service();
+    let (config, _handle, db) = start_storage_service();
 
-    let server_port = utils::get_available_port();
-    let server_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
-
-    // Start LEC service as a process.
-    config.execution.service =
-        ExecutionCorrectnessService::SpawnedProcess(RemoteExecutionService { server_address });
-
-    // Store the config
-    let config_path = TempPath::new();
-    config_path.create_as_file().unwrap();
-    config.save_config(&config_path).unwrap();
-
-    let execution_correctness_manager = ExecutionCorrectnessManager::new(&mut config);
+    let execution_correctness_manager = ExecutionCorrectnessManager::new(&config);
 
     {
         let (initial_data, qc) = get_initial_data_and_qc(&*db);
         let mut inserter = build_inserter(
-            &mut config,
+            &config,
             initial_data,
             execution_correctness_manager.client(),
         );
 
         let block_store = inserter.block_store();
-        let genesis = block_store.root();
+        let genesis = block_store.ordered_root();
         let genesis_block_id = genesis.id();
         let genesis_block = block_store
             .get_block(genesis_block_id)
@@ -190,15 +158,14 @@ fn test_block_store_restart() {
 
     // Restart block_store
     {
-        config = NodeConfig::load(&config_path).unwrap();
         let (initial_data, qc) = get_initial_data_and_qc(&*db);
         let mut inserter = build_inserter(
-            &mut config,
+            &config,
             initial_data,
             execution_correctness_manager.client(),
         );
         let block_store = inserter.block_store();
-        let genesis = block_store.root();
+        let genesis = block_store.ordered_root();
         let genesis_block_id = genesis.id();
         let genesis_block = block_store
             .get_block(genesis_block_id)

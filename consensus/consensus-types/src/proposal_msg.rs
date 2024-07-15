@@ -1,10 +1,11 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{block::Block, common::Author, sync_info::SyncInfo};
-use anyhow::{ensure, format_err, Context, Result};
-use libra_types::validator_verifier::ValidatorVerifier;
+use anyhow::{anyhow, ensure, format_err, Context, Result};
+use diem_types::validator_verifier::ValidatorVerifier;
 use serde::{Deserialize, Serialize};
+use short_hex_str::AsShortHexStr;
 use std::fmt;
 
 /// ProposalMsg contains the required information for the proposer election protocol to make its
@@ -54,12 +55,15 @@ impl ProposalMsg {
             self.sync_info.highest_quorum_cert().certified_block().id(),
             self.proposal.parent_id(),
         );
-        let previous_round = self.proposal.round() - 1;
+        let previous_round = self
+            .proposal
+            .round()
+            .checked_sub(1)
+            .ok_or_else(|| anyhow!("proposal round overflowed!"))?;
+
         let highest_certified_round = std::cmp::max(
             self.proposal.quorum_cert().certified_block().round(),
-            self.sync_info
-                .highest_timeout_certificate()
-                .map_or(0, |tc| tc.round()),
+            self.sync_info.highest_timeout_round(),
         );
         ensure!(
             previous_round == highest_certified_round,
@@ -81,6 +85,9 @@ impl ProposalMsg {
             .map_err(|e| format_err!("{:?}", e))?;
         // if there is a timeout certificate, verify its signatures
         if let Some(tc) = self.sync_info.highest_timeout_certificate() {
+            tc.verify(validator).map_err(|e| format_err!("{:?}", e))?;
+        }
+        if let Some(tc) = self.sync_info.highest_2chain_timeout_cert() {
             tc.verify(validator).map_err(|e| format_err!("{:?}", e))?;
         }
         // Note that we postpone the verification of SyncInfo until it's being used.
@@ -108,10 +115,10 @@ impl ProposalMsg {
 
 impl fmt::Display for ProposalMsg {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let author = match self.proposal.author() {
-            Some(author) => author.short_str(),
-            None => String::from("NIL"),
-        };
-        write!(f, "[proposal {} from {}]", self.proposal, author,)
+        write!(f, "[proposal {} from ", self.proposal)?;
+        match self.proposal.author() {
+            Some(author) => write!(f, "{}]", author.short_str()),
+            None => write!(f, "NIL]"),
+        }
     }
 }

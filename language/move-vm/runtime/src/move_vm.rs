@@ -1,73 +1,41 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::runtime::VMRuntime;
+use crate::{native_functions::NativeFunction, runtime::VMRuntime, session::Session};
+use move_binary_format::errors::{Location, VMResult};
 use move_core_types::{
-    account_address::AccountAddress,
-    identifier::IdentStr,
-    language_storage::{ModuleId, TypeTag},
+    account_address::AccountAddress, identifier::Identifier, resolver::MoveResolver,
 };
-use move_vm_types::{data_store::DataStore, gas_schedule::CostStrategy, values::Value};
-use vm::errors::VMResult;
 
 pub struct MoveVM {
     runtime: VMRuntime,
 }
 
 impl MoveVM {
-    pub fn new() -> Self {
-        Self {
-            runtime: VMRuntime::new(),
-        }
+    pub fn new<I>(natives: I) -> VMResult<Self>
+    where
+        I: IntoIterator<Item = (AccountAddress, Identifier, Identifier, NativeFunction)>,
+    {
+        Ok(Self {
+            runtime: VMRuntime::new(natives).map_err(|err| err.finish(Location::Undefined))?,
+        })
     }
 
-    pub fn execute_function(
-        &self,
-        module: &ModuleId,
-        function_name: &IdentStr,
-        ty_args: Vec<TypeTag>,
-        args: Vec<Value>,
-        _sender: AccountAddress,
-        data_store: &mut dyn DataStore,
-        cost_strategy: &mut CostStrategy,
-    ) -> VMResult<()> {
-        self.runtime.execute_function(
-            module,
-            function_name,
-            ty_args,
-            args,
-            data_store,
-            cost_strategy,
-        )
-    }
-
-    pub fn execute_script(
-        &self,
-        script: Vec<u8>,
-        ty_args: Vec<TypeTag>,
-        args: Vec<Value>,
-        sender: AccountAddress,
-        data_store: &mut dyn DataStore,
-        cost_strategy: &mut CostStrategy,
-    ) -> VMResult<()> {
-        self.runtime
-            .execute_script(script, ty_args, args, sender, data_store, cost_strategy)
-    }
-
-    pub fn publish_module(
-        &self,
-        module: Vec<u8>,
-        sender: AccountAddress,
-        data_store: &mut dyn DataStore,
-        cost_strategy: &mut CostStrategy,
-    ) -> VMResult<()> {
-        self.runtime
-            .publish_module(module, sender, data_store, cost_strategy)
-    }
-}
-
-impl Default for MoveVM {
-    fn default() -> Self {
-        Self::new()
+    /// Create a new Session backed by the given storage.
+    ///
+    /// Right now it is the caller's responsibility to ensure cache coherence of the Move VM Loader
+    ///   - When a module gets published in a Move VM Session, and then gets used by another
+    ///     transaction, it will be loaded into the code cache and stay there even if the resulted
+    ///     effects do not get commited back to the storage when the Session ends.
+    ///   - As a result, if one wants to have multiple sessions at a time, one needs to make sure
+    ///     none of them will try to publish a module. In other words, if there is a module publishing
+    ///     Session it must be the only Session existing.
+    ///   - In general, a new Move VM needs to be created whenever the storage gets modified by an
+    ///     outer envrionment, or otherwise the states may be out of sync. There are a few exceptional
+    ///     cases where this may not be necessary, with the most notable one being the common module
+    ///     publishing flow: you can keep using the same Move VM if you publish some modules in a Session
+    ///     and apply the effects to the storage when the Session ends.
+    pub fn new_session<'r, S: MoveResolver>(&self, remote: &'r S) -> Session<'r, '_, S> {
+        self.runtime.new_session(remote)
     }
 }

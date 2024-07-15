@@ -1,109 +1,96 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::Result;
-use criterion::Criterion;
-use libra_state_view::StateView;
-use libra_types::{access_path::AccessPath, account_address::AccountAddress};
-use libra_vm::data_cache::StateViewCache;
+use criterion::{measurement::Measurement, Criterion};
+use move_binary_format::CompiledModule;
 use move_core_types::{
-    gas_schedule::{GasAlgebra, GasUnits},
+    account_address::AccountAddress,
     identifier::{IdentStr, Identifier},
-    language_storage::ModuleId,
+    language_storage::{ModuleId, CORE_CODE_ADDRESS},
 };
-use move_lang::{compiled_unit::CompiledUnit, shared::Address};
-use move_vm_runtime::{data_cache::TransactionDataCache, move_vm::MoveVM};
-use move_vm_types::gas_schedule::{zero_cost_schedule, CostStrategy};
+use move_lang::{compiled_unit::AnnotatedCompiledUnit, Compiler, Flags};
+use move_vm_runtime::move_vm::MoveVM;
+use move_vm_test_utils::BlankStorage;
+use move_vm_types::gas_schedule::GasStatus;
+use once_cell::sync::Lazy;
 use std::path::PathBuf;
-use vm::CompiledModule;
+
+static MOVE_BENCH_SRC_PATH: Lazy<PathBuf> = Lazy::new(|| {
+    vec![env!("CARGO_MANIFEST_DIR"), "src", "bench.move"]
+        .into_iter()
+        .collect()
+});
 
 /// Entry point for the bench, provide a function name to invoke in Module Bench in bench.move.
-pub fn bench(c: &mut Criterion, fun: &str) {
-    let move_vm = MoveVM::new();
-
-    let addr = [0u8; AccountAddress::LENGTH];
-    let module = compile_module(&addr);
-    let sender = AccountAddress::new(addr);
-    execute(c, &move_vm, sender, module, fun);
+pub fn bench<M: Measurement + 'static>(c: &mut Criterion<M>, fun: &str) {
+    let modules = compile_modules();
+    let move_vm = MoveVM::new(move_stdlib::natives::all_natives(
+        AccountAddress::from_hex_literal("0x1").unwrap(),
+    ))
+    .unwrap();
+    execute(c, &move_vm, modules, fun);
 }
 
-// Compile `bench.move`
-fn compile_module(addr: &[u8; AccountAddress::LENGTH]) -> CompiledModule {
-    // TODO: this has only been tried with `cargo bench` from `libra/src/language/benchmarks`
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("src/bench.move");
-    let s = path.to_str().expect("no path specified").to_owned();
-
-    let (_, mut modules) =
-        move_lang::move_compile(&[s], &[], Some(Address::new(*addr))).expect("Error compiling...");
-    match modules.remove(0) {
-        CompiledUnit::Module { module, .. } => module,
-        CompiledUnit::Script { .. } => panic!("Expected a module but received a script"),
-    }
+// Compile `bench.move` and its dependencies
+fn compile_modules() -> Vec<CompiledModule> {
+    let mut src_files = move_stdlib::move_stdlib_files();
+    src_files.push(MOVE_BENCH_SRC_PATH.to_str().unwrap().to_owned());
+    let (_files, compiled_units) = Compiler::new(&src_files, &[])
+        .set_flags(Flags::empty().set_sources_shadow_deps(false))
+        .set_named_address_values(move_stdlib::move_stdlib_named_addresses())
+        .build_and_report()
+        .expect("Error compiling...");
+    compiled_units
+        .into_iter()
+        .map(|unit| match unit {
+            AnnotatedCompiledUnit::Module(annot_unit) => annot_unit.named_module.module,
+            AnnotatedCompiledUnit::Script(_) => {
+                panic!("Expected a module but received a script")
+            }
+        })
+        .collect()
 }
 
 // execute a given function in the Bench module
-fn execute(
-    c: &mut Criterion,
+fn execute<M: Measurement + 'static>(
+    c: &mut Criterion<M>,
     move_vm: &MoveVM,
-    sender: AccountAddress,
-    module: CompiledModule,
+    modules: Vec<CompiledModule>,
     fun: &str,
 ) {
     // establish running context
-    let state = EmptyStateView;
-    let gas_schedule = zero_cost_schedule();
-    let data_cache = StateViewCache::new(&state);
-    let mut data_store = TransactionDataCache::new(&data_cache);
-    let mut cost_strategy = CostStrategy::system(&gas_schedule, GasUnits::new(100_000_000));
+    let storage = BlankStorage::new();
+    let sender = CORE_CODE_ADDRESS;
+    let mut session = move_vm.new_session(&storage);
+    let mut gas_status = GasStatus::new_unmetered();
 
-    let mut mod_blob = vec![];
-    module
-        .serialize(&mut mod_blob)
-        .expect("Module serialization error");
-    move_vm
-        .publish_module(mod_blob, sender, &mut data_store, &mut cost_strategy)
-        .expect("Module must load");
+    for module in modules {
+        let mut mod_blob = vec![];
+        module
+            .serialize(&mut mod_blob)
+            .expect("Module serialization error");
+        session
+            .publish_module(mod_blob, sender, &mut gas_status)
+            .expect("Module must load");
+    }
 
     // module and function to call
-    let module_id = ModuleId::new(AccountAddress::ZERO, Identifier::new("Bench").unwrap());
+    let module_id = ModuleId::new(sender, Identifier::new("Bench").unwrap());
     let fun_name = IdentStr::new(fun).unwrap_or_else(|_| panic!("Invalid identifier name {}", fun));
 
     // benchmark
     c.bench_function(fun, |b| {
         b.iter(|| {
-            move_vm
-                .execute_function(
-                    &module_id,
-                    &fun_name,
-                    vec![],
-                    vec![],
-                    sender,
-                    &mut data_store,
-                    &mut cost_strategy,
-                )
-                .unwrap_or_else(|err| panic!("{:?}::{} failed with {:?}", &module_id, fun, err))
+            session
+                .execute_function(&module_id, fun_name, vec![], vec![], &mut gas_status)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "{:?}::{} failed with {:?}",
+                        &module_id,
+                        fun,
+                        err.into_vm_status()
+                    )
+                })
         })
     });
-}
-
-//
-// Utilities to get the VM going...
-//
-
-// An empty `StateView`
-struct EmptyStateView;
-
-impl StateView for EmptyStateView {
-    fn get(&self, _: &AccessPath) -> Result<Option<Vec<u8>>> {
-        Ok(None)
-    }
-
-    fn multi_get(&self, _access_paths: &[AccessPath]) -> Result<Vec<Option<Vec<u8>>>> {
-        unimplemented!()
-    }
-
-    fn is_genesis(&self) -> bool {
-        true
-    }
 }

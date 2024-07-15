@@ -1,21 +1,22 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    account_config::LBR_NAME,
+    account_config::XUS_NAME,
     account_state_blob::AccountStateBlob,
     block_info::BlockInfo,
+    chain_id::ChainId,
     ledger_info::LedgerInfo,
     proof::{
         definition::MAX_ACCUMULATOR_PROOF_DEPTH, AccountStateProof, AccumulatorExtensionProof,
         EventAccumulatorInternalNode, EventAccumulatorProof, EventProof, SparseMerkleInternalNode,
-        SparseMerkleLeafNode, SparseMerkleProof, TestAccumulatorInternalNode, TestAccumulatorProof,
+        SparseMerkleLeafNode, TestAccumulatorInternalNode, TestAccumulatorProof,
         TransactionAccumulatorInternalNode, TransactionAccumulatorProof, TransactionInfoWithProof,
     },
     transaction::{RawTransaction, Script, Transaction, TransactionInfo},
-    vm_status::StatusCode,
+    vm_status::KeptVMStatus,
 };
-use libra_crypto::{
+use diem_crypto::{
     ed25519::Ed25519PrivateKey,
     hash::{
         CryptoHash, TestOnlyHash, TestOnlyHasher, ACCUMULATOR_PLACEHOLDER_HASH, GENESIS_BLOCK_ID,
@@ -23,6 +24,8 @@ use libra_crypto::{
     },
     HashValue, PrivateKey, Uniform,
 };
+
+type SparseMerkleProof = crate::proof::SparseMerkleProof<AccountStateBlob>;
 
 #[test]
 fn test_verify_empty_accumulator() {
@@ -262,7 +265,7 @@ fn test_verify_transaction() {
         state_root1_hash,
         event_root1_hash,
         /* gas_used = */ 0,
-        /* major_status = */ StatusCode::EXECUTED,
+        /* major_status = */ KeptVMStatus::Executed,
     );
     let txn_info1_hash = txn_info1.hash();
 
@@ -294,7 +297,7 @@ fn test_verify_transaction() {
         state_root1_hash,
         event_root1_hash,
         /* gas_used = */ 0,
-        /* major_status = */ StatusCode::EXECUTED,
+        /* major_status = */ KeptVMStatus::Executed,
     );
     let proof = TransactionInfoWithProof::new(ledger_info_to_transaction_info_proof, fake_txn_info);
     assert!(proof.verify(&ledger_info, 1).is_err());
@@ -354,8 +357,9 @@ fn test_verify_account_state_and_event() {
             Script::new(vec![], vec![], vec![]),
             /* max_gas_amount = */ 0,
             /* gas_unit_price = */ 0,
-            /* gas_currency_code = */ LBR_NAME.to_owned(),
-            /* expiration_time = */ std::time::Duration::new(0, 0),
+            /* gas_currency_code = */ XUS_NAME.to_owned(),
+            /* expiration_timestamp_secs = */ 0,
+            ChainId::test(),
         )
         .sign(&privkey, pubkey)
         .expect("Signing failed.")
@@ -372,7 +376,7 @@ fn test_verify_account_state_and_event() {
         state_root_hash,
         event_root_hash,
         /* gas_used = */ 0,
-        /* major_status = */ StatusCode::EXECUTED,
+        /* major_status = */ KeptVMStatus::Executed,
     );
     let txn_info2_hash = txn_info2.hash();
 

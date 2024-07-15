@@ -1,16 +1,18 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use libra_state_view::StateViewId;
-use libra_types::{
+use diem_scratchpad::SparseMerkleTree;
+use diem_state_view::StateViewId;
+use diem_types::{
     account_address::AccountAddress,
-    account_config::AccountResource,
-    on_chain_config::{LibraVersion, OnChainConfigPayload, VMConfig},
+    account_config::{AccountResource, AccountSequenceInfo},
+    account_state::AccountState,
+    on_chain_config::{DiemVersion, OnChainConfigPayload, VMConfig, VMPublishingOption},
     transaction::{SignedTransaction, VMValidatorResult},
 };
-use libra_vm::LibraVM;
-use scratchpad::SparseMerkleTree;
+use diem_vm::DiemVM;
+use fail::fail_point;
 use std::{convert::TryFrom, sync::Arc};
 use storage_interface::{state_view::VerifiedStateView, DbReader};
 
@@ -19,7 +21,7 @@ use storage_interface::{state_view::VerifiedStateView, DbReader};
 mod vm_validator_test;
 
 pub trait TransactionValidation: Send + Sync + Clone {
-    type ValidationInstance: libra_vm::VMValidator;
+    type ValidationInstance: diem_vm::VMValidator;
 
     /// Validate a txn from client
     fn validate_transaction(&self, _txn: SignedTransaction) -> Result<VMValidatorResult>;
@@ -31,12 +33,11 @@ pub trait TransactionValidation: Send + Sync + Clone {
 #[derive(Clone)]
 pub struct VMValidator {
     db_reader: Arc<dyn DbReader>,
-    vm: LibraVM,
+    vm: DiemVM,
 }
 
 impl VMValidator {
     pub fn new(db_reader: Arc<dyn DbReader>) -> Self {
-        let mut vm = LibraVM::new();
         let (version, state_root) = db_reader.get_latest_state_root().expect("Should not fail.");
         let smt = SparseMerkleTree::new(state_root);
         let state_view = VerifiedStateView::new(
@@ -47,16 +48,21 @@ impl VMValidator {
             &smt,
         );
 
-        vm.load_configs(&state_view);
+        let vm = DiemVM::new_for_validation(&state_view);
         VMValidator { db_reader, vm }
     }
 }
 
 impl TransactionValidation for VMValidator {
-    type ValidationInstance = LibraVM;
+    type ValidationInstance = DiemVM;
 
     fn validate_transaction(&self, txn: SignedTransaction) -> Result<VMValidatorResult> {
-        use libra_vm::VMValidator;
+        fail_point!("vm_validator::validate_transaction", |_| {
+            Err(anyhow::anyhow!(
+                "Injected error in vm_validator::validate_transaction"
+            ))
+        });
+        use diem_vm::VMValidator;
 
         let (version, state_root) = self.db_reader.get_latest_state_root()?;
         let db_reader = Arc::clone(&self.db_reader);
@@ -78,17 +84,36 @@ impl TransactionValidation for VMValidator {
 
     fn restart(&mut self, config: OnChainConfigPayload) -> Result<()> {
         let vm_config = config.get::<VMConfig>()?;
-        let version = config.get::<LibraVersion>()?;
+        let version = config.get::<DiemVersion>()?;
+        let publishing_option = config.get::<VMPublishingOption>()?;
 
-        self.vm = LibraVM::init_with_config(version, vm_config);
+        self.vm = DiemVM::init_with_config(version, vm_config, publishing_option);
         Ok(())
     }
 }
 
 /// returns account's sequence number from storage
-pub fn get_account_sequence_number(storage: &dyn DbReader, address: AccountAddress) -> Result<u64> {
+pub fn get_account_sequence_number(
+    storage: &dyn DbReader,
+    address: AccountAddress,
+) -> Result<AccountSequenceInfo> {
+    fail_point!("vm_validator::get_account_sequence_number", |_| {
+        Err(anyhow::anyhow!(
+            "Injected error in get_account_sequence_number"
+        ))
+    });
     match storage.get_latest_account_state(address)? {
-        Some(blob) => Ok(AccountResource::try_from(&blob)?.sequence_number()),
-        None => Ok(0),
+        Some(blob) => {
+            if let Ok(Some(crsn)) = AccountState::try_from(&blob)?.get_crsn_resource() {
+                return Ok(AccountSequenceInfo::CRSN {
+                    min_nonce: crsn.min_nonce(),
+                    size: crsn.size(),
+                });
+            }
+            Ok(AccountSequenceInfo::Sequential(
+                AccountResource::try_from(&blob)?.sequence_number(),
+            ))
+        }
+        None => Ok(AccountSequenceInfo::Sequential(0)),
     }
 }

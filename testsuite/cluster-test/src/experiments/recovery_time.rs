@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
@@ -15,7 +15,7 @@ use crate::{
     tx_emitter::EmitJobRequest,
 };
 use async_trait::async_trait;
-use libra_logger::info;
+use diem_logger::info;
 use std::time::Instant;
 
 #[derive(StructOpt, Debug)]
@@ -59,6 +59,8 @@ impl Experiment for RecoveryTime {
                 &EmitJobRequest::for_instances(
                     context.cluster.validator_instances().to_vec(),
                     context.global_emit_job_request,
+                    0,
+                    0,
                 ),
                 self.params.num_accounts_to_mint as usize,
             )
@@ -66,7 +68,8 @@ impl Experiment for RecoveryTime {
         info!("Stopping {}", self.instance);
         self.instance.stop().await?;
         info!("Deleting db and restarting node for {}", self.instance);
-        self.instance.start(true).await?;
+        self.instance.clean_data().await?;
+        self.instance.start().await?;
         info!("Waiting for instance to be up: {}", self.instance);
         self.instance
             .wait_json_rpc(Instant::now() + Duration::from_secs(120))
@@ -78,10 +81,10 @@ impl Experiment for RecoveryTime {
         );
         while self
             .instance
-            .counter("libra_consensus_last_committed_round")
+            .counter("diem_consensus_last_committed_round")
             .is_err()
         {
-            time::delay_for(Duration::from_secs(1)).await;
+            time::sleep(Duration::from_secs(1)).await;
         }
         let time_to_recover = start_instant.elapsed();
         let recovery_rate =

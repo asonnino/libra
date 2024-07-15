@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -7,41 +7,26 @@ use crate::{
     process::ProcessService,
     remote_service::RemoteService,
     serializer::{SerializerClient, SerializerService},
-    spawned_process::SpawnedProcess,
     thread::ThreadService,
 };
+use diem_config::config::{ExecutionCorrectnessService, NodeConfig};
+use diem_crypto::ed25519::Ed25519PrivateKey;
+use diem_global_constants::EXECUTION_KEY;
+use diem_secure_storage::{CryptoStorage, Storage};
+use diem_vm::DiemVM;
 use executor::Executor;
-use libra_config::{
-    config::{ExecutionCorrectnessService, NodeConfig},
-    keys::KeyPair,
-};
-use libra_crypto::ed25519::Ed25519PrivateKey;
-use libra_global_constants::EXECUTION_KEY;
-use libra_secure_storage::{CryptoStorage, Storage};
-use libra_vm::LibraVM;
-use std::{
-    convert::TryInto,
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-};
+use std::{convert::TryInto, net::SocketAddr, sync::Arc};
 use storage_client::StorageClient;
 
-pub fn extract_execution_prikey(config: &mut NodeConfig) -> Option<Ed25519PrivateKey> {
+pub fn extract_execution_prikey(config: &NodeConfig) -> Option<Ed25519PrivateKey> {
     let backend = &config.execution.backend;
     let mut storage: Storage = backend.try_into().expect("Unable to initialize storage");
     if let Some(test_config) = config.test.as_ref() {
-        // Hack because Ed25519PrivateKey does not support clone / copy
-        let bytes = lcs::to_bytes(
-            &test_config
-                .execution_keypair
-                .as_ref()
-                .expect("Missing execution keypair in test config"),
-        )
-        .expect("lcs serialization cannot fail");
-        let private_key = lcs::from_bytes::<KeyPair<Ed25519PrivateKey>>(&bytes)
-            .expect("lcs deserialization cannot fail")
-            .take_private()
-            .expect("Failed to take Execution private key, key absent or already read");
+        let private_key = test_config
+            .execution_key
+            .as_ref()
+            .expect("Missing execution key in test config")
+            .private_key();
 
         storage
             .import_private_key(EXECUTION_KEY, private_key)
@@ -59,10 +44,9 @@ pub fn extract_execution_prikey(config: &mut NodeConfig) -> Option<Ed25519Privat
 }
 
 enum ExecutionCorrectnessWrapper {
-    Local(Arc<Mutex<LocalService>>),
+    Local(Arc<LocalService>),
     Process(ProcessService),
-    Serializer(Arc<Mutex<SerializerService>>),
-    SpawnedProcess(SpawnedProcess),
+    Serializer(Arc<SerializerService>),
     Thread(ThreadService),
 }
 
@@ -71,28 +55,26 @@ pub struct ExecutionCorrectnessManager {
 }
 
 impl ExecutionCorrectnessManager {
-    pub fn new(config: &mut NodeConfig) -> Self {
-        match &config.execution.service {
-            ExecutionCorrectnessService::Process(remote_service) => {
-                return Self::new_process(remote_service.server_address)
-            }
-            ExecutionCorrectnessService::SpawnedProcess(_) => {
-                return Self::new_spawned_process(config)
-            }
-            _ => (),
-        };
+    pub fn new(config: &NodeConfig) -> Self {
+        if let ExecutionCorrectnessService::Process(remote_service) = &config.execution.service {
+            return Self::new_process(
+                remote_service.server_address,
+                config.execution.network_timeout_ms,
+            );
+        }
 
         let execution_prikey = extract_execution_prikey(config);
         let storage_address = config.storage.address;
+        let timeout_ms = config.storage.timeout_ms;
         match &config.execution.service {
             ExecutionCorrectnessService::Local => {
-                Self::new_local(storage_address, execution_prikey)
+                Self::new_local(storage_address, execution_prikey, timeout_ms)
             }
             ExecutionCorrectnessService::Serializer => {
-                Self::new_serializer(storage_address, execution_prikey)
+                Self::new_serializer(storage_address, execution_prikey, timeout_ms)
             }
             ExecutionCorrectnessService::Thread => {
-                Self::new_thread(storage_address, execution_prikey)
+                Self::new_thread(storage_address, execution_prikey, timeout_ms)
             }
             _ => unreachable!(
                 "Unimplemented ExecutionCorrectnessService: {:?}",
@@ -104,19 +86,20 @@ impl ExecutionCorrectnessManager {
     pub fn new_local(
         storage_address: SocketAddr,
         execution_prikey: Option<Ed25519PrivateKey>,
+        timeout: u64,
     ) -> Self {
-        let block_executor = Box::new(Executor::<LibraVM>::new(
-            StorageClient::new(&storage_address).into(),
+        let block_executor = Box::new(Executor::<DiemVM>::new(
+            StorageClient::new(&storage_address, timeout).into(),
         ));
         Self {
             internal_execution_correctness: ExecutionCorrectnessWrapper::Local(Arc::new(
-                Mutex::new(LocalService::new(block_executor, execution_prikey)),
+                LocalService::new(block_executor, execution_prikey),
             )),
         }
     }
 
-    pub fn new_process(server_addr: SocketAddr) -> Self {
-        let process_service = ProcessService::new(server_addr);
+    pub fn new_process(server_addr: SocketAddr, network_timeout: u64) -> Self {
+        let process_service = ProcessService::new(server_addr, network_timeout);
         Self {
             internal_execution_correctness: ExecutionCorrectnessWrapper::Process(process_service),
         }
@@ -125,30 +108,25 @@ impl ExecutionCorrectnessManager {
     pub fn new_serializer(
         storage_address: SocketAddr,
         execution_prikey: Option<Ed25519PrivateKey>,
+        timeout: u64,
     ) -> Self {
-        let block_executor = Box::new(Executor::<LibraVM>::new(
-            StorageClient::new(&storage_address).into(),
+        let block_executor = Box::new(Executor::<DiemVM>::new(
+            StorageClient::new(&storage_address, timeout).into(),
         ));
         let serializer_service = SerializerService::new(block_executor, execution_prikey);
         Self {
             internal_execution_correctness: ExecutionCorrectnessWrapper::Serializer(Arc::new(
-                Mutex::new(serializer_service),
+                serializer_service,
             )),
-        }
-    }
-
-    pub fn new_spawned_process(config: &NodeConfig) -> Self {
-        let process = SpawnedProcess::new(config);
-        Self {
-            internal_execution_correctness: ExecutionCorrectnessWrapper::SpawnedProcess(process),
         }
     }
 
     pub fn new_thread(
         storage_address: SocketAddr,
         execution_prikey: Option<Ed25519PrivateKey>,
+        network_timeout: u64,
     ) -> Self {
-        let thread = ThreadService::new(storage_address, execution_prikey);
+        let thread = ThreadService::new(storage_address, execution_prikey, network_timeout);
         Self {
             internal_execution_correctness: ExecutionCorrectnessWrapper::Thread(thread),
         }
@@ -163,7 +141,6 @@ impl ExecutionCorrectnessManager {
             ExecutionCorrectnessWrapper::Serializer(serializer_service) => {
                 Box::new(SerializerClient::new(serializer_service.clone()))
             }
-            ExecutionCorrectnessWrapper::SpawnedProcess(process) => Box::new(process.client()),
             ExecutionCorrectnessWrapper::Thread(thread) => Box::new(thread.client()),
         }
     }

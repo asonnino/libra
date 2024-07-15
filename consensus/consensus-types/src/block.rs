@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -7,11 +7,17 @@ use crate::{
     quorum_cert::QuorumCert,
 };
 use anyhow::{bail, ensure, format_err};
-use libra_crypto::{ed25519::Ed25519Signature, hash::CryptoHash, HashValue};
-use libra_types::{
-    account_address::AccountAddress, block_info::BlockInfo, block_metadata::BlockMetadata,
-    epoch_state::EpochState, ledger_info::LedgerInfo, transaction::Version,
-    validator_signer::ValidatorSigner, validator_verifier::ValidatorVerifier,
+use diem_crypto::{ed25519::Ed25519Signature, hash::CryptoHash, HashValue};
+use diem_infallible::duration_since_epoch;
+use diem_types::{
+    account_address::AccountAddress,
+    block_info::BlockInfo,
+    block_metadata::BlockMetadata,
+    epoch_state::EpochState,
+    ledger_info::LedgerInfo,
+    transaction::{Transaction, Version},
+    validator_signer::ValidatorSigner,
+    validator_verifier::ValidatorVerifier,
 };
 use mirai_annotations::debug_checked_verify_eq;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -148,6 +154,20 @@ impl Block {
         }
     }
 
+    #[cfg(any(test, feature = "fuzzing"))]
+    // This method should only used by tests and fuzzers to produce arbitrary Block types.
+    pub fn new_for_testing(
+        id: HashValue,
+        block_data: BlockData,
+        signature: Option<Ed25519Signature>,
+    ) -> Self {
+        Block {
+            id,
+            block_data,
+            signature,
+        }
+    }
+
     /// The NIL blocks are special: they're not carrying any real payload and are generated
     /// independently by different validators just to fill in the round with some QC.
     pub fn new_nil(round: Round, quorum_cert: QuorumCert) -> Self {
@@ -182,11 +202,16 @@ impl Block {
         block_data: BlockData,
         validator_signer: &ValidatorSigner,
     ) -> Self {
-        let id = block_data.hash();
-        let signature = validator_signer.sign_message(id);
+        let signature = validator_signer.sign(&block_data);
+        Self::new_proposal_from_block_data_and_signature(block_data, signature)
+    }
 
+    pub fn new_proposal_from_block_data_and_signature(
+        block_data: BlockData,
+        signature: Ed25519Signature,
+    ) -> Self {
         Block {
-            id,
+            id: block_data.hash(),
             block_data,
             signature: Some(signature),
         }
@@ -203,7 +228,7 @@ impl Block {
                     .signature
                     .as_ref()
                     .ok_or_else(|| format_err!("Missing signature in Proposal"))?;
-                validator.verify_signature(*author, self.id(), signature)?;
+                validator.verify(*author, &self.block_data, signature)?;
                 self.quorum_cert().verify(validator)
             }
         }
@@ -241,6 +266,15 @@ impl Block {
                 self.timestamp_usecs() > parent.timestamp_usecs(),
                 "Blocks must have strictly increasing timestamps"
             );
+
+            let current_ts = duration_since_epoch();
+
+            // we can say that too far is 5 minutes in the future
+            const TIMEBOUND: u64 = 300_000_000;
+            ensure!(
+                self.timestamp_usecs() <= (current_ts.as_micros() as u64).saturating_add(TIMEBOUND),
+                "Blocks must not be too far in the future"
+            );
         }
         ensure!(
             !self.quorum_cert().ends_epoch(),
@@ -252,6 +286,18 @@ impl Block {
             "Block id mismatch the hash"
         );
         Ok(())
+    }
+
+    pub fn transactions_to_execute(&self) -> Vec<Transaction> {
+        std::iter::once(Transaction::BlockMetadata(self.into()))
+            .chain(
+                self.payload()
+                    .unwrap_or(&Vec::new())
+                    .iter()
+                    .cloned()
+                    .map(Transaction::UserTransaction),
+            )
+            .collect()
     }
 }
 
@@ -265,7 +311,7 @@ impl<'de> Deserialize<'de> for Block {
         struct BlockWithoutId {
             block_data: BlockData,
             signature: Option<Ed25519Signature>,
-        };
+        }
 
         let BlockWithoutId {
             block_data,

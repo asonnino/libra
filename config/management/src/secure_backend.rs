@@ -1,26 +1,25 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::error::Error;
-use libra_config::config::{self, GitHubConfig, OnDiskStorageConfig, Token, VaultConfig};
-use libra_secure_storage::{KVStorage, Storage};
+use diem_config::config::{self, GitHubConfig, OnDiskStorageConfig, Token, VaultConfig};
 use std::{
     collections::HashMap,
     convert::{TryFrom, TryInto},
     path::PathBuf,
     str::FromStr,
 };
+use structopt::StructOpt;
 
+pub const BACKEND: &str = "backend";
 pub const DISK: &str = "disk";
 pub const GITHUB: &str = "github";
 pub const MEMORY: &str = "memory";
 pub const VAULT: &str = "vault";
 
-#[derive(Copy, Clone, Debug)]
-pub enum StorageLocation {
-    LocalStorage,
-    RemoteStorage,
-}
+// Custom timeouts for vault backend operations when using the management tooling.
+const CONNECTION_TIMEOUT_MS: u64 = 10_000;
+const RESPONSE_TIMEOUT_MS: u64 = 10_000;
 
 /// SecureBackend is a parameter that is stored as set of semi-colon separated key/value pairs. The
 /// only expected key is backend which defines which of the SecureBackends the parameters refer to.
@@ -32,28 +31,6 @@ pub enum StorageLocation {
 pub struct SecureBackend {
     pub backend: String,
     pub parameters: HashMap<String, String>,
-}
-
-impl SecureBackend {
-    const BACKEND: &'static str = "backend";
-    const NAMESPACE: &'static str = "namespace";
-
-    /// Creates and returns a new Storage instance using the SecureBackend.
-    /// This method ensures the storage instance is available before returning.
-    pub fn create_storage(self, location: StorageLocation) -> Result<Storage, Error> {
-        let storage: Storage = self.try_into()?;
-        storage.available().map_err(|e| match location {
-            StorageLocation::LocalStorage => Error::LocalStorageUnavailable(e.to_string()),
-            StorageLocation::RemoteStorage => Error::RemoteStorageUnavailable(e.to_string()),
-        })?;
-
-        Ok(storage)
-    }
-
-    pub fn set_namespace(mut self, namespace: String) -> Self {
-        self.parameters.insert(Self::NAMESPACE.into(), namespace);
-        self
-    }
 }
 
 impl FromStr for SecureBackend {
@@ -78,7 +55,7 @@ impl TryFrom<&str> for SecureBackend {
             parameters.insert(kv[0].into(), kv[1].into());
         }
         let backend = parameters
-            .remove(Self::BACKEND)
+            .remove(BACKEND)
             .ok_or(Error::BackendMissingBackendKey)?;
         Ok(Self {
             backend,
@@ -112,6 +89,7 @@ impl TryInto<config::SecureBackend> for SecureBackend {
                     .parameters
                     .remove("repository")
                     .ok_or_else(|| Error::BackendParsingError("missing repository".into()))?;
+                let branch = self.parameters.remove("branch");
                 let token = self
                     .parameters
                     .remove("token")
@@ -120,6 +98,7 @@ impl TryInto<config::SecureBackend> for SecureBackend {
                     namespace: self.parameters.remove("namespace"),
                     repository_owner,
                     repository,
+                    branch,
                     token: Token::FromDisk(PathBuf::from(token)),
                 })
             }
@@ -139,6 +118,10 @@ impl TryInto<config::SecureBackend> for SecureBackend {
                     server,
                     ca_certificate: certificate,
                     token: Token::FromDisk(PathBuf::from(token)),
+                    renew_ttl_secs: None,
+                    disable_cas: Some(true),
+                    connection_timeout_ms: Some(CONNECTION_TIMEOUT_MS),
+                    response_timeout_ms: Some(RESPONSE_TIMEOUT_MS),
                 })
             }
             _ => panic!("Invalid backend: {}", self.backend),
@@ -153,14 +136,55 @@ impl TryInto<config::SecureBackend> for SecureBackend {
     }
 }
 
-impl TryInto<Storage> for SecureBackend {
-    type Error = Error;
+#[macro_export]
+macro_rules! secure_backend {
+    ($struct_name:ident, $field_name:ident, $purpose:literal) => {
+        secure_backend!($struct_name, $field_name, $purpose, "ignore");
+    };
+    ($struct_name:ident, $field_name:ident, $purpose:literal, $required:literal) => {
+        #[derive(Clone, Debug, StructOpt)]
+        pub struct $struct_name {
+            #[structopt(long,
+                help = concat!("Backend for ", $purpose),
+                required_unless_one(&["config", $required]),
+                long_help = concat!("Backend for ", $purpose, r#"
 
-    fn try_into(self) -> Result<Storage, Error> {
-        let config: config::SecureBackend = self.try_into()?;
-        Ok((&config).into())
-    }
+Secure backends are represented as a semi-colon deliminted key value
+pair: "k0=v0;k1=v1;...".  The current supported formats are:
+    Vault: "backend=vault;server=URL;token=PATH_TO_TOKEN"
+        an optional namespace: "namespace=NAMESPACE"
+        an optional server certificate: "ca_certificate=PATH_TO_CERT"
+    GitHub: "backend=github;repository_owner=REPOSITORY_OWNER;repository=REPOSITORY;token=PATH_TO_TOKEN"
+        an optional branch: "branch=BRANCH", defaults to master
+        an optional namespace: "namespace=NAMESPACE"
+    InMemory: "backend=memory"
+    OnDisk: "backend=disk;path=LOCAL_PATH"
+                "#)
+            )]
+            pub $field_name: Option<SecureBackend>,
+        }
+
+        impl FromStr for $struct_name {
+            type Err = Error;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                let secure_backend = SecureBackend::try_from(s)?;
+                let $field_name = $struct_name {
+                    $field_name: Some(secure_backend),
+                };
+                Ok($field_name)
+            }
+        }
+    };
 }
+
+secure_backend!(
+    ValidatorBackend,
+    validator_backend,
+    "validator configuration"
+);
+
+secure_backend!(SharedBackend, shared_backend, "shared information");
 
 #[allow(dead_code)]
 #[cfg(test)]
@@ -179,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_disk() {
-        let path = libra_temppath::TempPath::new();
+        let path = diem_temppath::TempPath::new();
         path.create_as_file().unwrap();
         let disk = format!("backend=disk;path={}", path.path().to_str().unwrap());
         storage(&disk).unwrap();
@@ -190,31 +214,38 @@ mod tests {
 
     #[test]
     fn test_github() {
-        let path = libra_temppath::TempPath::new();
+        let path = diem_temppath::TempPath::new();
         path.create_as_file().unwrap();
         let mut file = File::create(path.path()).unwrap();
         file.write_all(b"disk_token").unwrap();
         let path_str = path.path().to_str().unwrap();
 
         let github = format!(
-            "backend=github;repository_owner=libra;repository=libra;token={}",
+            "backend=github;repository_owner=diem;repository=diem;token={}",
             path_str
         );
         storage(&github).unwrap();
 
         let github = format!(
-            "backend=github;repository_owner=libra;repository=libra;token={};namespace=test",
+            "backend=github;repository_owner=diem;repository=diem;token={};namespace=test",
+            path_str
+        );
+        storage(&github).unwrap();
+
+        let github = format!(
+            "backend=github;repository_owner=diem;repository=diem;branch=genesis;token={};namespace=test",
             path_str
         );
         storage(&github).unwrap();
 
         let github = "backend=github";
-        assert!(storage(github).is_err());
+
+        storage(github).unwrap_err();
     }
 
     #[test]
     fn test_vault() {
-        let path = libra_temppath::TempPath::new();
+        let path = diem_temppath::TempPath::new();
         path.create_as_file().unwrap();
         let mut file = File::create(path.path()).unwrap();
         file.write_all(b"disk_token").unwrap();
@@ -233,10 +264,10 @@ mod tests {
         storage(&vault).unwrap();
 
         let vault = "backend=vault";
-        assert!(storage(vault).is_err());
+        storage(vault).unwrap_err();
     }
 
-    fn storage(s: &str) -> Result<Storage, Error> {
+    fn storage(s: &str) -> Result<config::SecureBackend, Error> {
         let management_backend: SecureBackend = s.try_into()?;
         management_backend.try_into()
     }

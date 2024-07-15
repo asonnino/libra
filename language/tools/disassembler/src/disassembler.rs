@@ -1,29 +1,31 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{bail, format_err, Result};
+use anyhow::{bail, format_err, Error, Result};
 use bytecode_source_map::{
     mapping::SourceMapping,
     source_map::{FunctionSourceMap, SourceName},
 };
-use bytecode_verifier::control_flow_graph::{ControlFlowGraph, VMControlFlowGraph};
 use colored::*;
-use move_core_types::identifier::IdentStr;
-use move_coverage::coverage_map::{CoverageMap, FunctionCoverage};
-use vm::{
-    access::ModuleAccess,
+use move_binary_format::{
+    binary_views::BinaryIndexedView,
+    control_flow_graph::{ControlFlowGraph, VMControlFlowGraph},
     file_format::{
-        Bytecode, FieldHandleIndex, FunctionDefinition, FunctionDefinitionIndex, Kind, Signature,
-        SignatureIndex, SignatureToken, StructDefinition, StructDefinitionIndex,
-        StructFieldInformation, TableIndex, TypeSignature,
+        Ability, AbilitySet, Bytecode, FieldHandleIndex, FunctionDefinition,
+        FunctionDefinitionIndex, Signature, SignatureIndex, SignatureToken, StructDefinition,
+        StructDefinitionIndex, StructFieldInformation, StructTypeParameter, TableIndex,
+        TypeSignature, Visibility,
     },
 };
+use move_core_types::identifier::IdentStr;
+use move_coverage::coverage_map::{ExecCoverageMap, FunctionCoverage};
+use move_ir_types::location::Loc;
 
 /// Holds the various options that we support while disassembling code.
 #[derive(Debug, Default)]
 pub struct DisassemblerOptions {
-    /// Only print public functions
-    pub only_public: bool,
+    /// Only print non-private functions
+    pub only_externally_visible: bool,
 
     /// Print the bytecode for the instructions within the function.
     pub print_code: bool,
@@ -38,7 +40,7 @@ pub struct DisassemblerOptions {
 impl DisassemblerOptions {
     pub fn new() -> Self {
         Self {
-            only_public: false,
+            only_externally_visible: false,
             print_code: false,
             print_basic_blocks: false,
             print_locals: false,
@@ -46,16 +48,16 @@ impl DisassemblerOptions {
     }
 }
 
-pub struct Disassembler<Location: Clone + Eq> {
-    source_mapper: SourceMapping<Location>,
+pub struct Disassembler<'a> {
+    source_mapper: SourceMapping<'a>,
     // The various options that we can set for disassembly.
     options: DisassemblerOptions,
     // Optional coverage map for use in displaying code coverage
-    coverage_map: Option<CoverageMap>,
+    coverage_map: Option<ExecCoverageMap>,
 }
 
-impl<Location: Clone + Eq> Disassembler<Location> {
-    pub fn new(source_mapper: SourceMapping<Location>, options: DisassemblerOptions) -> Self {
+impl<'a> Disassembler<'a> {
+    pub fn new(source_mapper: SourceMapping<'a>, options: DisassemblerOptions) -> Self {
         Self {
             source_mapper,
             options,
@@ -63,7 +65,17 @@ impl<Location: Clone + Eq> Disassembler<Location> {
         }
     }
 
-    pub fn add_coverage_map(&mut self, coverage_map: CoverageMap) {
+    pub fn from_view(view: BinaryIndexedView<'a>, default_loc: Loc) -> Result<Self> {
+        let mut options = DisassemblerOptions::new();
+        options.print_code = true;
+        Ok(Self {
+            source_mapper: SourceMapping::new_from_view(view, default_loc)?,
+            options,
+            coverage_map: None,
+        })
+    }
+
+    pub fn add_coverage_map(&mut self, coverage_map: ExecCoverageMap) {
         self.coverage_map = Some(coverage_map);
     }
 
@@ -75,27 +87,46 @@ impl<Location: Clone + Eq> Disassembler<Location> {
         &self,
         function_definition_index: FunctionDefinitionIndex,
     ) -> Result<&FunctionDefinition> {
-        if function_definition_index.0 as usize >= self.source_mapper.bytecode.function_defs().len()
+        if function_definition_index.0 as usize
+            >= self
+                .source_mapper
+                .bytecode
+                .function_defs()
+                .map_or(0, |f| f.len())
         {
             bail!("Invalid function definition index supplied when marking function")
         }
-        Ok(self
+        match self
             .source_mapper
             .bytecode
-            .function_def_at(function_definition_index))
+            .function_def_at(function_definition_index)
+        {
+            Ok(definition) => Ok(definition),
+            Err(err) => Err(Error::new(err)),
+        }
     }
 
     fn get_struct_def(
         &self,
         struct_definition_index: StructDefinitionIndex,
     ) -> Result<&StructDefinition> {
-        if struct_definition_index.0 as usize >= self.source_mapper.bytecode.struct_defs().len() {
+        if struct_definition_index.0 as usize
+            >= self
+                .source_mapper
+                .bytecode
+                .struct_defs()
+                .map_or(0, |d| d.len())
+        {
             bail!("Invalid struct definition index supplied when marking struct")
         }
-        Ok(self
+        match self
             .source_mapper
             .bytecode
-            .struct_def_at(struct_definition_index))
+            .struct_def_at(struct_definition_index)
+        {
+            Ok(definition) => Ok(definition),
+            Err(err) => Err(Error::new(err)),
+        }
     }
 
     //***************************************************************************
@@ -111,7 +142,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                 self.coverage_map.as_ref().and_then(|coverage_map| {
                     coverage_map
                         .module_maps
-                        .get(&module)
+                        .get(module)
                         .and_then(|module_map| module_map.get_function_coverage(function_name))
                 })
             })
@@ -122,6 +153,9 @@ impl<Location: Clone + Eq> Disassembler<Location> {
     }
 
     fn format_function_coverage(&self, name: &IdentStr, function_body: String) -> String {
+        if self.coverage_map.is_none() {
+            return function_body;
+        }
         if self.is_function_called(name) {
             function_body.green()
         } else {
@@ -131,10 +165,14 @@ impl<Location: Clone + Eq> Disassembler<Location> {
     }
 
     fn format_with_instruction_coverage(
+        &self,
         pc: usize,
         function_coverage_map: Option<&FunctionCoverage>,
         instruction: String,
     ) -> String {
+        if self.coverage_map.is_none() {
+            return format!("\t{}: {}", pc, instruction);
+        }
         let coverage = function_coverage_map.and_then(|map| map.get(&(pc as u64)));
         match coverage {
             Some(coverage) => format!("[{}]\t{}: {}", coverage, pc, instruction).green(),
@@ -148,11 +186,11 @@ impl<Location: Clone + Eq> Disassembler<Location> {
     //***************************************************************************
 
     fn name_for_field(&self, field_idx: FieldHandleIndex) -> Result<String> {
-        let field_handle = self.source_mapper.bytecode.field_handle_at(field_idx);
+        let field_handle = self.source_mapper.bytecode.field_handle_at(field_idx)?;
         let struct_def = self
             .source_mapper
             .bytecode
-            .struct_def_at(field_handle.owner);
+            .struct_def_at(field_handle.owner)?;
         let field_def = match &struct_def.field_information {
             StructFieldInformation::Native => {
                 return Err(format_err!("Attempt to access field on a native struct"));
@@ -179,11 +217,11 @@ impl<Location: Clone + Eq> Disassembler<Location> {
     }
 
     fn type_for_field(&self, field_idx: FieldHandleIndex) -> Result<String> {
-        let field_handle = self.source_mapper.bytecode.field_handle_at(field_idx);
+        let field_handle = self.source_mapper.bytecode.field_handle_at(field_idx)?;
         let struct_def = self
             .source_mapper
             .bytecode
-            .struct_def_at(field_handle.owner);
+            .struct_def_at(field_handle.owner)?;
         let field_def = match &struct_def.field_information {
             StructFieldInformation::Native => {
                 return Err(format_err!("Attempt to access field on a native struct"));
@@ -215,7 +253,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
             .0
             .iter()
             .map(|sig_tok| {
-                Ok(self.disassemble_sig_tok(sig_tok.clone(), &struct_source_map.type_parameters)?)
+                self.disassemble_sig_tok(sig_tok.clone(), &struct_source_map.type_parameters)
             })
             .collect::<Result<Vec<String>>>()?;
 
@@ -234,7 +272,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
     fn name_for_parameter_or_local(
         &self,
         local_idx: usize,
-        function_source_map: &FunctionSourceMap<Location>,
+        function_source_map: &FunctionSourceMap,
     ) -> Result<String> {
         let name = function_source_map
                 .get_parameter_or_local_name(local_idx as u64)
@@ -252,7 +290,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
         idx: usize,
         parameters: &Signature,
         locals: &Signature,
-        function_source_map: &FunctionSourceMap<Location>,
+        function_source_map: &FunctionSourceMap,
     ) -> Result<String> {
         let sig_tok = if idx < parameters.len() {
             &parameters.0[idx]
@@ -268,13 +306,23 @@ impl<Location: Clone + Eq> Disassembler<Location> {
         &self,
         local_idx: usize,
         locals: &Signature,
-        function_source_map: &FunctionSourceMap<Location>,
+        function_source_map: &FunctionSourceMap,
     ) -> Result<String> {
         let sig_tok = locals
             .0
             .get(local_idx as usize)
             .ok_or_else(|| format_err!("Unable to get type for local at index {}", local_idx))?;
         self.disassemble_sig_tok(sig_tok.clone(), &function_source_map.type_parameters)
+    }
+
+    fn format_ability(a: Ability) -> String {
+        match a {
+            Ability::Copy => "copy",
+            Ability::Drop => "drop",
+            Ability::Store => "store",
+            Ability::Key => "key",
+        }
+        .to_string()
     }
 
     fn format_type_params(ty_params: &[String]) -> String {
@@ -316,7 +364,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
     fn disassemble_sig_tok(
         &self,
         sig_tok: SignatureToken,
-        type_param_context: &[SourceName<Location>],
+        type_param_context: &[SourceName],
     ) -> Result<String> {
         Ok(match sig_tok {
             SignatureToken::Bool => "bool".to_string(),
@@ -383,8 +431,8 @@ impl<Location: Clone + Eq> Disassembler<Location> {
         parameters: &Signature,
         instruction: &Bytecode,
         locals_sigs: &Signature,
-        function_source_map: &FunctionSourceMap<Location>,
-        default_location: &Location,
+        function_source_map: &FunctionSourceMap,
+        default_location: &Loc,
     ) -> Result<String> {
         match instruction {
             Bytecode::LdConst(idx) => {
@@ -458,7 +506,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                 let field_inst = self
                     .source_mapper
                     .bytecode
-                    .field_instantiation_at(*field_idx);
+                    .field_instantiation_at(*field_idx)?;
                 let name = self.name_for_field(field_inst.handle)?;
                 let ty = self.type_for_field(field_inst.handle)?;
                 Ok(format!(
@@ -475,7 +523,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                 let field_inst = self
                     .source_mapper
                     .bytecode
-                    .field_instantiation_at(*field_idx);
+                    .field_instantiation_at(*field_idx)?;
                 let name = self.name_for_field(field_inst.handle)?;
                 let ty = self.type_for_field(field_inst.handle)?;
                 Ok(format!(
@@ -491,7 +539,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                 let struct_inst = self
                     .source_mapper
                     .bytecode
-                    .struct_instantiation_at(*struct_idx);
+                    .struct_instantiation_at(*struct_idx)?;
                 let type_params = self
                     .source_mapper
                     .bytecode
@@ -510,7 +558,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                 let struct_inst = self
                     .source_mapper
                     .bytecode
-                    .struct_instantiation_at(*struct_idx);
+                    .struct_instantiation_at(*struct_idx)?;
                 let type_params = self
                     .source_mapper
                     .bytecode
@@ -529,7 +577,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                 let struct_inst = self
                     .source_mapper
                     .bytecode
-                    .struct_instantiation_at(*struct_idx);
+                    .struct_instantiation_at(*struct_idx)?;
                 let type_params = self
                     .source_mapper
                     .bytecode
@@ -551,7 +599,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                 let struct_inst = self
                     .source_mapper
                     .bytecode
-                    .struct_instantiation_at(*struct_idx);
+                    .struct_instantiation_at(*struct_idx)?;
                 let type_params = self
                     .source_mapper
                     .bytecode
@@ -573,7 +621,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                 let struct_inst = self
                     .source_mapper
                     .bytecode
-                    .struct_instantiation_at(*struct_idx);
+                    .struct_instantiation_at(*struct_idx)?;
                 let type_params = self
                     .source_mapper
                     .bytecode
@@ -592,7 +640,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                 let struct_inst = self
                     .source_mapper
                     .bytecode
-                    .struct_instantiation_at(*struct_idx);
+                    .struct_instantiation_at(*struct_idx)?;
                 let type_params = self
                     .source_mapper
                     .bytecode
@@ -603,25 +651,22 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                     struct_idx, name, ty_params
                 ))
             }
-            Bytecode::MoveToSender(struct_idx) => {
+            Bytecode::MoveTo(struct_idx) => {
                 let (name, ty_params) = self.struct_type_info(*struct_idx, &Signature(vec![]))?;
-                Ok(format!(
-                    "MoveToSender[{}]({}{})",
-                    struct_idx, name, ty_params
-                ))
+                Ok(format!("MoveTo[{}]({}{})", struct_idx, name, ty_params))
             }
-            Bytecode::MoveToSenderGeneric(struct_idx) => {
+            Bytecode::MoveToGeneric(struct_idx) => {
                 let struct_inst = self
                     .source_mapper
                     .bytecode
-                    .struct_instantiation_at(*struct_idx);
+                    .struct_instantiation_at(*struct_idx)?;
                 let type_params = self
                     .source_mapper
                     .bytecode
                     .signature_at(struct_inst.type_parameters);
                 let (name, ty_params) = self.struct_type_info(struct_inst.def, type_params)?;
                 Ok(format!(
-                    "MoveToSenderGeneric[{}]({}{})",
+                    "MoveToGeneric[{}]({}{})",
                     struct_idx, name, ty_params
                 ))
             }
@@ -638,7 +683,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                     .signature_at(function_handle.parameters)
                     .0
                     .iter()
-                    .map(|sig_tok| Ok(self.disassemble_sig_tok(sig_tok.clone(), &[])?))
+                    .map(|sig_tok| self.disassemble_sig_tok(sig_tok.clone(), &[]))
                     .collect::<Result<Vec<String>>>()?
                     .join(", ");
                 let type_rets = self
@@ -647,7 +692,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                     .signature_at(function_handle.return_)
                     .0
                     .iter()
-                    .map(|sig_tok| Ok(self.disassemble_sig_tok(sig_tok.clone(), &[])?))
+                    .map(|sig_tok| self.disassemble_sig_tok(sig_tok.clone(), &[]))
                     .collect::<Result<Vec<String>>>()?;
                 Ok(format!(
                     "Call[{}]({}({}){})",
@@ -683,7 +728,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                                 sig_tok.clone(),
                                 &function_source_map.type_parameters,
                             )?,
-                            default_location.clone(),
+                            *default_location,
                         ))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -693,7 +738,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                     .signature_at(function_handle.parameters)
                     .0
                     .iter()
-                    .map(|sig_tok| Ok(self.disassemble_sig_tok(sig_tok.clone(), &ty_params)?))
+                    .map(|sig_tok| self.disassemble_sig_tok(sig_tok.clone(), &ty_params))
                     .collect::<Result<Vec<String>>>()?
                     .join(", ");
                 let type_rets = self
@@ -702,7 +747,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                     .signature_at(function_handle.return_)
                     .0
                     .iter()
-                    .map(|sig_tok| Ok(self.disassemble_sig_tok(sig_tok.clone(), &ty_params)?))
+                    .map(|sig_tok| self.disassemble_sig_tok(sig_tok.clone(), &ty_params))
                     .collect::<Result<Vec<String>>>()?;
                 Ok(format!(
                     "Call[{}]({}{}({}){})",
@@ -764,7 +809,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                     instruction,
                     locals_sigs,
                     function_source_map,
-                    &decl_location,
+                    decl_location,
                 )
             })
             .collect::<Result<Vec<String>>>()?;
@@ -773,7 +818,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
             .into_iter()
             .enumerate()
             .map(|(instr_index, dis_instr)| {
-                Self::format_with_instruction_coverage(
+                self.format_with_instruction_coverage(
                     instr_index,
                     function_code_coverage_map,
                     dis_instr,
@@ -794,21 +839,58 @@ impl<Location: Clone + Eq> Disassembler<Location> {
         Ok(instrs)
     }
 
-    fn disassemble_type_formals(
-        source_map_ty_params: &[SourceName<Location>],
-        kinds: &[Kind],
+    fn disassemble_struct_type_formals(
+        source_map_ty_params: &[SourceName],
+        type_parameters: &[StructTypeParameter],
     ) -> String {
         let ty_params: Vec<String> = source_map_ty_params
             .iter()
-            .zip(kinds.iter())
-            .map(|((name, _), kind)| format!("{}: {:#?}", name.as_str(), kind))
+            .zip(type_parameters)
+            .map(|((name, _), ty_param)| {
+                let abilities_str = if ty_param.constraints == AbilitySet::EMPTY {
+                    "".to_string()
+                } else {
+                    let ability_vec: Vec<_> = ty_param
+                        .constraints
+                        .into_iter()
+                        .map(Self::format_ability)
+                        .collect();
+                    format!(": {}", ability_vec.join(" + "))
+                };
+                format!(
+                    "{}{}{}",
+                    if ty_param.is_phantom { "phantom " } else { "" },
+                    name.as_str(),
+                    abilities_str
+                )
+            })
+            .collect();
+        Self::format_type_params(&ty_params)
+    }
+
+    fn disassemble_fun_type_formals(
+        source_map_ty_params: &[SourceName],
+        ablities: &[AbilitySet],
+    ) -> String {
+        let ty_params: Vec<String> = source_map_ty_params
+            .iter()
+            .zip(ablities)
+            .map(|((name, _), abs)| {
+                let abilities_str = if *abs == AbilitySet::EMPTY {
+                    "".to_string()
+                } else {
+                    let ability_vec: Vec<_> = abs.into_iter().map(Self::format_ability).collect();
+                    format!(": {}", ability_vec.join(" + "))
+                };
+                format!("{}{}", name.as_str(), abilities_str)
+            })
             .collect();
         Self::format_type_params(&ty_params)
     }
 
     fn disassemble_locals(
         &self,
-        function_source_map: &FunctionSourceMap<Location>,
+        function_source_map: &FunctionSourceMap,
         locals_idx: SignatureIndex,
         parameter_len: usize,
     ) -> Result<Vec<String>> {
@@ -825,7 +907,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
             .map(|(local_idx, (name, _))| {
                 let ty =
                     self.type_for_local(parameter_len + local_idx, signature, function_source_map)?;
-                Ok(format!("{}: {}", name.to_string(), ty))
+                Ok(format!("{}: {}", name, ty))
             })
             .collect::<Result<Vec<String>>>()?;
         Ok(locals_names_tys)
@@ -846,19 +928,26 @@ impl<Location: Clone + Eq> Disassembler<Location> {
             .source_map
             .get_function_source_map(function_definition_index)?;
 
-        if self.options.only_public && !function_definition.is_public() {
+        if match function_definition.visibility {
+            Visibility::Script | Visibility::Friend | Visibility::Public => false,
+            Visibility::Private => self.options.only_externally_visible,
+        } {
             return Ok("".to_string());
         }
 
-        let visibility_modifier = if function_definition.is_native() {
+        let visibility_modifier = match function_definition.visibility {
+            Visibility::Private => "",
+            Visibility::Script => "public(script) ",
+            Visibility::Friend => "public(friend) ",
+            Visibility::Public => "public ",
+        };
+        let native_modifier = if function_definition.is_native() {
             "native "
-        } else if function_definition.is_public() {
-            "public "
         } else {
             ""
         };
 
-        let ty_params = Self::disassemble_type_formals(
+        let ty_params = Self::disassemble_fun_type_formals(
             &function_source_map.type_parameters,
             &function_handle.type_parameters,
         );
@@ -909,7 +998,8 @@ impl<Location: Clone + Eq> Disassembler<Location> {
         Ok(self.format_function_coverage(
             name,
             format!(
-                "{visibility_modifier}{name}{ty_params}({params}){ret_type}{body}",
+                "{native_modifier}{visibility_modifier}{name}{ty_params}({params}){ret_type}{body}",
+                native_modifier = native_modifier,
                 visibility_modifier = visibility_modifier,
                 name = name,
                 ty_params = ty_params,
@@ -953,10 +1043,15 @@ impl<Location: Clone + Eq> Disassembler<Location> {
 
         let native = if field_info.is_none() { "native " } else { "" };
 
-        let nominal_name = if struct_handle.is_nominal_resource {
-            "resource"
+        let abilities = if struct_handle.abilities == AbilitySet::EMPTY {
+            String::new()
         } else {
-            "struct"
+            let ability_vec: Vec<_> = struct_handle
+                .abilities
+                .into_iter()
+                .map(Self::format_ability)
+                .collect();
+            format!(" has {}", ability_vec.join(", "))
         };
 
         let name = self
@@ -965,7 +1060,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
             .identifier_at(struct_handle.name)
             .to_string();
 
-        let ty_params = Self::disassemble_type_formals(
+        let ty_params = Self::disassemble_struct_type_formals(
             &struct_source_map.type_parameters,
             &struct_handle.type_parameters,
         );
@@ -976,7 +1071,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                 .map(|(name, ty)| {
                     let ty_str =
                         self.disassemble_sig_tok(ty.0.clone(), &struct_source_map.type_parameters)?;
-                    Ok(format!("{}: {}", name.to_string(), ty_str))
+                    Ok(format!("{}: {}", name, ty_str))
                 })
                 .collect::<Result<Vec<String>>>()?,
         };
@@ -990,33 +1085,43 @@ impl<Location: Clone + Eq> Disassembler<Location> {
         }
 
         Ok(format!(
-            "{native}{nominal_name} {name}{ty_params} {fields}",
+            "{native}struct {name}{ty_params}{abilities} {fields}",
             native = native,
-            nominal_name = nominal_name,
             name = name,
             ty_params = ty_params,
+            abilities = abilities,
             fields = &fields.join(",\n\t"),
         ))
     }
 
     pub fn disassemble(&self) -> Result<String> {
         let name_opt = self.source_mapper.source_map.module_name_opt.as_ref();
-        let name = name_opt.map(|(addr, n)| format!("{}.{}", addr.short_str(), n.to_string()));
+        let name = name_opt.map(|(addr, n)| format!("{}.{}", addr.short_str_lossless(), n));
+        let version = format!("{}", self.source_mapper.bytecode.version());
         let header = match name {
             Some(s) => format!("module {}", s),
             None => "script".to_owned(),
         };
 
-        let struct_defs: Vec<String> = (0..self.source_mapper.bytecode.struct_defs().len())
+        let struct_defs: Vec<String> = (0..self
+            .source_mapper
+            .bytecode
+            .struct_defs()
+            .map_or(0, |d| d.len()))
             .map(|i| self.disassemble_struct_def(StructDefinitionIndex(i as TableIndex)))
             .collect::<Result<Vec<String>>>()?;
 
-        let function_defs: Vec<String> = (0..self.source_mapper.bytecode.function_defs().len())
+        let function_defs: Vec<String> = (0..self
+            .source_mapper
+            .bytecode
+            .function_defs()
+            .map_or(0, |f| f.len()))
             .map(|i| self.disassemble_function_def(FunctionDefinitionIndex(i as TableIndex)))
             .collect::<Result<Vec<String>>>()?;
 
         Ok(format!(
-            "{header} {{\n{struct_defs}\n\n{function_defs}\n}}",
+            "// Move bytecode v{version}\n{header} {{\n{struct_defs}\n\n{function_defs}\n}}",
+            version = version,
             header = header,
             struct_defs = &struct_defs.join("\n"),
             function_defs = &function_defs.join("\n")

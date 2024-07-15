@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! All proofs generated in this module are not valid proofs. They are only for the purpose of
@@ -7,9 +7,12 @@
 use crate::proof::{
     definition::MAX_ACCUMULATOR_PROOF_DEPTH, AccumulatorConsistencyProof, AccumulatorProof,
     AccumulatorRangeProof, SparseMerkleLeafNode, SparseMerkleProof, SparseMerkleRangeProof,
+    TransactionAccumulatorSummary,
 };
-use libra_crypto::{
-    hash::{CryptoHasher, ACCUMULATOR_PLACEHOLDER_HASH, SPARSE_MERKLE_PLACEHOLDER_HASH},
+use diem_crypto::{
+    hash::{
+        CryptoHash, CryptoHasher, ACCUMULATOR_PLACEHOLDER_HASH, SPARSE_MERKLE_PLACEHOLDER_HASH,
+    },
     HashValue,
 };
 use proptest::{collection::vec, prelude::*};
@@ -69,7 +72,10 @@ where
     }
 }
 
-impl Arbitrary for SparseMerkleProof {
+impl<V> Arbitrary for SparseMerkleProof<V>
+where
+    V: std::fmt::Debug + CryptoHash,
+{
     type Parameters = ();
     type Strategy = BoxedStrategy<Self>;
 
@@ -140,6 +146,26 @@ impl Arbitrary for SparseMerkleRangeProof {
     fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
         vec(arb_sparse_merkle_sibling(), 0..=256)
             .prop_map(Self::new)
+            .boxed()
+    }
+}
+
+impl Arbitrary for TransactionAccumulatorSummary {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Self>;
+
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+        let arb_version = 0u64..=256;
+        arb_version
+            .prop_map(|version| {
+                let num_leaves = version + 1;
+                let num_subtrees = num_leaves.count_ones() as u64;
+                let mock_subtrees = (0..num_subtrees)
+                    .map(HashValue::from_u64)
+                    .collect::<Vec<_>>();
+                let consistency_proof = AccumulatorConsistencyProof::new(mock_subtrees);
+                Self::try_from_genesis_proof(consistency_proof, version).unwrap()
+            })
             .boxed()
     }
 }

@@ -1,9 +1,9 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::syntax::ParseError;
-use codespan::{ByteIndex, Span};
 use move_ir_types::location::*;
+use move_symbol_pool::Symbol;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tok {
@@ -84,8 +84,9 @@ pub enum Tok {
     Native,
     Old,
     Public,
+    Script,
+    Friend,
     Requires,
-    Resource,
     /// Return in the specification language
     SpecReturn,
     /// Return statement in the Move language
@@ -95,13 +96,18 @@ pub enum Tok {
     SucceedsIf,
     Synthetic,
     True,
-    /// Transaction sender in the specification language
-    TxnSender,
     U8,
     U64,
     U128,
     Vector,
-    Copyable,
+    VecPack(u64),
+    VecLen,
+    VecImmBorrow,
+    VecMutBorrow,
+    VecPushBack,
+    VecPopBack,
+    VecUnpack(u64),
+    VecSwap,
     While,
     LBrace,
     Pipe,
@@ -125,7 +131,7 @@ impl Tok {
 
 pub struct Lexer<'input> {
     pub spec_mode: bool,
-    file: &'static str,
+    file: Symbol,
     text: &'input str,
     prev_end: usize,
     cur_start: usize,
@@ -134,7 +140,7 @@ pub struct Lexer<'input> {
 }
 
 impl<'input> Lexer<'input> {
-    pub fn new(file: &'static str, s: &'input str) -> Lexer<'input> {
+    pub fn new(file: Symbol, s: &'input str) -> Lexer<'input> {
         Lexer {
             spec_mode: false, // read tokens without trailing punctuation during specs.
             file,
@@ -150,11 +156,11 @@ impl<'input> Lexer<'input> {
         self.token
     }
 
-    pub fn content(&self) -> &str {
+    pub fn content(&self) -> &'input str {
         &self.text[self.cur_start..self.cur_end]
     }
 
-    pub fn file_name(&self) -> &'static str {
+    pub fn file_name(&self) -> Symbol {
         self.file
     }
 
@@ -166,8 +172,25 @@ impl<'input> Lexer<'input> {
         self.prev_end
     }
 
+    fn trim_whitespace_and_comments(&self) -> &'input str {
+        let mut text = &self.text[self.cur_end..];
+        loop {
+            // Trim the only whitespace characters we recognize: newline, tab, and space.
+            text = text.trim_start_matches(|c: char| matches!(c, '\n' | '\t' | ' '));
+            // Trim the only comments we recognize: '// ... \n'.
+            if text.starts_with("//") {
+                text = text.trim_start_matches(|c: char| c != '\n');
+                // Continue the loop on the following line, which may contain leading
+                // whitespace or comments of its own.
+                continue;
+            }
+            break;
+        }
+        text
+    }
+
     pub fn lookahead(&self) -> Result<Tok, ParseError<Loc, anyhow::Error>> {
-        let text = self.text[self.cur_end..].trim_start();
+        let text = self.trim_whitespace_and_comments();
         let offset = self.text.len() - text.len();
         let (tok, _) = self.find_token(text, offset)?;
         Ok(tok)
@@ -175,7 +198,7 @@ impl<'input> Lexer<'input> {
 
     pub fn advance(&mut self) -> Result<(), ParseError<Loc, anyhow::Error>> {
         self.prev_end = self.cur_end;
-        let text = self.text[self.cur_end..].trim_start();
+        let text = self.trim_whitespace_and_comments();
         self.cur_start = self.text.len() - text.len();
         let (token, len) = self.find_token(text, self.cur_start)?;
         self.cur_end = self.cur_start + len;
@@ -216,11 +239,11 @@ impl<'input> Lexer<'input> {
                         (Tok::AccountAddressValue, 2 + hex_len)
                     }
                 } else {
-                    get_decimal_number(&text)
+                    get_decimal_number(text)
                 }
             }
             'a'..='z' | 'A'..='Z' | '$' | '_' => {
-                let len = get_name_len(&text);
+                let len = get_name_len(text);
                 let name = &text[..len];
                 if !self.spec_mode {
                     match &text[len..].chars().next() {
@@ -246,13 +269,33 @@ impl<'input> Lexer<'input> {
                         }
                         Some('<') => match name {
                             "vector" => (Tok::Vector, len),
+                            "vec_len" => (Tok::VecLen, len),
+                            "vec_imm_borrow" => (Tok::VecImmBorrow, len),
+                            "vec_mut_borrow" => (Tok::VecMutBorrow, len),
+                            "vec_push_back" => (Tok::VecPushBack, len),
+                            "vec_pop_back" => (Tok::VecPopBack, len),
+                            "vec_swap" => (Tok::VecSwap, len),
                             "borrow_global" => (Tok::BorrowGlobal, len + 1),
                             "borrow_global_mut" => (Tok::BorrowGlobalMut, len + 1),
                             "exists" => (Tok::Exists, len + 1),
                             "move_from" => (Tok::MoveFrom, len + 1),
                             "move_to" => (Tok::MoveTo, len + 1),
                             "main" => (Tok::Main, len),
-                            _ => (Tok::NameBeginTyValue, len + 1),
+                            _ => {
+                                if let Some(stripped) = name.strip_prefix("vec_pack_") {
+                                    match stripped.parse::<u64>() {
+                                        Ok(num) => (Tok::VecPack(num), len),
+                                        Err(_) => (Tok::NameBeginTyValue, len + 1),
+                                    }
+                                } else if let Some(stripped) = name.strip_prefix("vec_unpack_") {
+                                    match stripped.parse::<u64>() {
+                                        Ok(num) => (Tok::VecUnpack(num), len),
+                                        Err(_) => (Tok::NameBeginTyValue, len + 1),
+                                    }
+                                } else {
+                                    (Tok::NameBeginTyValue, len + 1)
+                                }
+                            }
                         },
                         Some('(') => match name {
                             "assert" => (Tok::Assert, len + 1),
@@ -345,8 +388,8 @@ impl<'input> Lexer<'input> {
             '[' => (Tok::LSquare, 1), // for vector specs
             ']' => (Tok::RSquare, 1), // for vector specs
             _ => {
-                let idx = ByteIndex(start_offset as u32);
-                let location = Loc::new(self.file_name(), Span::new(idx, idx));
+                let idx = start_offset as u32;
+                let location = Loc::new(self.file_name(), idx, idx);
                 return Err(ParseError::InvalidToken { location });
             }
         };
@@ -363,21 +406,15 @@ fn get_name_len(text: &str) -> usize {
         return 0;
     }
     text.chars()
-        .position(|c| match c {
-            'a'..='z' | 'A'..='Z' | '$' | '_' | '0'..='9' => false,
-            _ => true,
-        })
-        .unwrap_or_else(|| text.len())
+        .position(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '$' | '_' | '0'..='9'))
+        .unwrap_or(text.len())
 }
 
 fn get_decimal_number(text: &str) -> (Tok, usize) {
     let len = text
         .chars()
-        .position(|c| match c {
-            '0'..='9' => false,
-            _ => true,
-        })
-        .unwrap_or_else(|| text.len());
+        .position(|c| !matches!(c, '0'..='9'))
+        .unwrap_or(text.len());
     let rest = &text[len..];
     if rest.starts_with("u8") {
         (Tok::U8Value, len + 2)
@@ -393,11 +430,8 @@ fn get_decimal_number(text: &str) -> (Tok, usize) {
 // Return the length of the substring containing characters in [0-9a-fA-F].
 fn get_hex_digits_len(text: &str) -> usize {
     text.chars()
-        .position(|c| match c {
-            'a'..='f' | 'A'..='F' | '0'..='9' => false,
-            _ => true,
-        })
-        .unwrap_or_else(|| text.len())
+        .position(|c| !matches!(c, 'a'..='f' | 'A'..='F' | '0'..='9'))
+        .unwrap_or(text.len())
 }
 
 // Check for an optional sequence of hex digits following by a double quote, and return
@@ -422,10 +456,12 @@ fn get_name_token(name: &str) -> Tok {
         "bool" => Tok::Bool,
         "break" => Tok::Break,
         "continue" => Tok::Continue,
+        "copy" => Tok::Copy,
         "else" => Tok::Else,
         "ensures" => Tok::Ensures,
         "false" => Tok::False,
         "freeze" => Tok::Freeze,
+        "friend" => Tok::Friend,
         "global" => Tok::Global,              // spec language
         "global_exists" => Tok::GlobalExists, // spec language
         "to_u8" => Tok::ToU8,
@@ -442,19 +478,17 @@ fn get_name_token(name: &str) -> Tok {
         "old" => Tok::Old,
         "public" => Tok::Public,
         "requires" => Tok::Requires,
-        "resource" => Tok::Resource,
         "RET" => Tok::SpecReturn,
         "return" => Tok::Return,
+        "script" => Tok::Script,
         "signer" => Tok::Signer,
         "struct" => Tok::Struct,
         "succeeds_if" => Tok::SucceedsIf,
         "synthetic" => Tok::Synthetic,
         "true" => Tok::True,
-        "txn_sender" => Tok::TxnSender,
         "u8" => Tok::U8,
         "u64" => Tok::U64,
         "u128" => Tok::U128,
-        "copyable" => Tok::Copyable,
         "while" => Tok::While,
         _ => Tok::NameValue,
     }

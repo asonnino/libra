@@ -1,10 +1,9 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    block_storage::{
-        block_store::sync_manager::NeedFetchResult, BlockReader, PendingVotes, VoteReceptionResult,
-    },
+    block_storage::{block_store::sync_manager::NeedFetchResult, BlockReader},
+    pending_votes::{PendingVotes, VoteReceptionResult},
     test_utils::{build_empty_tree, build_simple_tree, TreeInserter},
 };
 use consensus_types::{
@@ -19,8 +18,8 @@ use consensus_types::{
     vote::Vote,
     vote_data::VoteData,
 };
-use libra_crypto::{HashValue, PrivateKey};
-use libra_types::{
+use diem_crypto::{HashValue, PrivateKey};
+use diem_types::{
     validator_signer::ValidatorSigner, validator_verifier::random_validator_verifier,
 };
 use proptest::prelude::*;
@@ -39,7 +38,7 @@ fn test_highest_block_and_quorum_cert() {
         &certificate_for_genesis()
     );
 
-    let genesis = block_store.root();
+    let genesis = block_store.ordered_root();
 
     // Genesis block and quorum certificate is still the highest
     let block_round_1 = inserter.insert_block_with_qc(certificate_for_genesis(), &genesis, 1);
@@ -80,7 +79,7 @@ fn test_highest_block_and_quorum_cert() {
 fn test_qc_ancestry() {
     let mut inserter = TreeInserter::default();
     let block_store = inserter.block_store();
-    let genesis = block_store.root();
+    let genesis = block_store.ordered_root();
     let block_a_1 = inserter.insert_block_with_qc(certificate_for_genesis(), &genesis, 1);
     let block_a_2 = inserter.insert_block(&block_a_1, 2, None);
 
@@ -110,7 +109,7 @@ proptest! {
             // recursion depth
             50)
     ){
-        let authors: HashSet<Author> = private_keys.iter().map(|private_key| libra_types::account_address::from_public_key(&private_key.public_key())).collect();
+        let authors: HashSet<Author> = private_keys.iter().map(|private_key| diem_types::account_address::from_public_key(&private_key.public_key())).collect();
         let block_store = build_empty_tree();
         for block in blocks {
             if block.round() > 0 && authors.contains(&block.author().unwrap()) {
@@ -206,7 +205,7 @@ fn test_block_tree_gc() {
     // build a tree with 100 nodes, max_pruned_nodes_in_mem = 10
     let mut inserter = TreeInserter::default();
     let block_store = inserter.block_store();
-    let genesis = block_store.root();
+    let genesis = block_store.ordered_root();
     let mut cur_node = block_store.get_block(genesis.id()).unwrap();
     let mut added_blocks = vec![];
 
@@ -230,32 +229,40 @@ fn test_block_tree_gc() {
 fn test_path_from_root() {
     let mut inserter = TreeInserter::default();
     let block_store = inserter.block_store();
-    let genesis = block_store.get_block(block_store.root().id()).unwrap();
+    let genesis = block_store
+        .get_block(block_store.ordered_root().id())
+        .unwrap();
     let b1 = inserter.insert_block_with_qc(certificate_for_genesis(), &genesis, 1);
     let b2 = inserter.insert_block(&b1, 2, None);
     let b3 = inserter.insert_block(&b2, 3, None);
 
     assert_eq!(
-        block_store.path_from_root(b3.id()),
+        block_store.path_from_ordered_root(b3.id()),
         Some(vec![b1, b2.clone(), b3.clone()])
     );
-    assert_eq!(block_store.path_from_root(genesis.id()), Some(vec![]));
+    assert_eq!(
+        block_store.path_from_ordered_root(genesis.id()),
+        Some(vec![])
+    );
 
     block_store.prune_tree(b2.id());
 
-    assert_eq!(block_store.path_from_root(b3.id()), Some(vec![b3.clone()]));
-    assert_eq!(block_store.path_from_root(genesis.id()), None);
+    assert_eq!(
+        block_store.path_from_ordered_root(b3.id()),
+        Some(vec![b3.clone()])
+    );
+    assert_eq!(block_store.path_from_ordered_root(genesis.id()), None);
 }
 
 #[test]
 fn test_insert_vote() {
-    ::libra_logger::Logger::new().environment_only(true).init();
+    ::diem_logger::Logger::init_for_testing();
     // Set up enough different authors to support different votes for the same block.
     let (signers, validator_verifier) = random_validator_verifier(11, Some(10), false);
     let my_signer = signers[10].clone();
     let mut inserter = TreeInserter::new(my_signer);
     let block_store = inserter.block_store();
-    let genesis = block_store.root();
+    let genesis = block_store.ordered_root();
     let block = inserter.insert_block_with_qc(certificate_for_genesis(), &genesis, 1);
     let mut pending_votes = PendingVotes::new();
 
@@ -322,7 +329,7 @@ fn test_insert_vote() {
 fn test_illegal_timestamp() {
     let signer = ValidatorSigner::random(None);
     let block_store = build_empty_tree();
-    let genesis = block_store.root();
+    let genesis = block_store.ordered_root();
     let block_with_illegal_timestamp = Block::new_proposal(
         vec![],
         0,
@@ -342,7 +349,7 @@ fn test_highest_qc() {
 
     // build a tree of the following form
     // genesis <- a1 <- a2 <- a3
-    let genesis = block_store.root();
+    let genesis = block_store.ordered_root();
     let a1 = inserter.insert_block_with_qc(certificate_for_genesis(), &genesis, 1);
     assert_eq!(block_store.highest_certified_block(), genesis);
     let a2 = inserter.insert_block(&a1, 2, None);
@@ -358,7 +365,7 @@ fn test_need_fetch_for_qc() {
 
     // build a tree of the following form
     // genesis <- a1 <- a2 <- a3
-    let genesis = block_store.root();
+    let genesis = block_store.ordered_root();
     let a1 = inserter.insert_block_with_qc(certificate_for_genesis(), &genesis, 1);
     let a2 = inserter.insert_block(&a1, 2, None);
     let a3 = inserter.insert_block(&a2, 3, None);

@@ -1,19 +1,21 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
-use bytecode_source_map::{
-    mapping::SourceMapping,
-    source_map::SourceMap,
-    utils::{remap_owned_loc_to_loc, source_map_from_file, OwnedLoc},
-};
+use bytecode_source_map::{mapping::SourceMapping, utils::source_map_from_file};
 use disassembler::disassembler::{Disassembler, DisassemblerOptions};
+use move_binary_format::{
+    binary_views::BinaryIndexedView,
+    file_format::{CompiledModule, CompiledScript},
+};
+use move_command_line_common::files::{
+    MOVE_COMPILED_EXTENSION, MOVE_EXTENSION, SOURCE_MAP_EXTENSION,
+};
 use move_coverage::coverage_map::CoverageMap;
 use move_ir_types::location::Spanned;
 use std::{fs, path::Path};
 use structopt::StructOpt;
-use vm::file_format::{CompiledModule, CompiledScript};
 
 #[derive(Debug, StructOpt)]
 #[structopt(
@@ -56,9 +58,9 @@ struct Args {
 fn main() {
     let args = Args::from_args();
 
-    let move_extension = "move";
-    let mv_bytecode_extension = "mv";
-    let source_map_extension = "mvsm";
+    let move_extension = MOVE_EXTENSION;
+    let mv_bytecode_extension = MOVE_COMPILED_EXTENSION;
+    let source_map_extension = SOURCE_MAP_EXTENSION;
 
     let source_path = Path::new(&args.bytecode_file_path);
     let extension = source_path
@@ -76,33 +78,37 @@ fn main() {
 
     let source_path = Path::new(&args.bytecode_file_path).with_extension(move_extension);
     let source = fs::read_to_string(&source_path).ok();
-    let source_map = source_map_from_file::<OwnedLoc>(
+    let source_map = source_map_from_file(
         &Path::new(&args.bytecode_file_path).with_extension(source_map_extension),
-    )
-    .map(remap_owned_loc_to_loc);
+    );
 
     let mut disassembler_options = DisassemblerOptions::new();
     disassembler_options.print_code = !args.skip_code;
-    disassembler_options.only_public = args.skip_private;
+    disassembler_options.only_externally_visible = args.skip_private;
     disassembler_options.print_basic_blocks = !args.skip_basic_blocks;
     disassembler_options.print_locals = !args.skip_locals;
 
-    // TODO: make source mapping work with the move source language
+    // TODO: make source mapping work with the Move source language
     let no_loc = Spanned::unsafe_no_loc(()).loc;
-    let mut source_mapping = if args.is_script {
-        let compiled_script = CompiledScript::deserialize(&bytecode_bytes)
+    let module: CompiledModule;
+    let script: CompiledScript;
+    let bytecode = if args.is_script {
+        script = CompiledScript::deserialize(&bytecode_bytes)
             .expect("Script blob can't be deserialized");
-        source_map
-            .or_else(|_| SourceMap::dummy_from_script(&compiled_script, no_loc))
-            .and_then(|source_map| Ok(SourceMapping::new_from_script(source_map, compiled_script)))
-            .expect("Unable to build source mapping for compiled script")
+        BinaryIndexedView::Script(&script)
     } else {
-        let compiled_module = CompiledModule::deserialize(&bytecode_bytes)
+        module = CompiledModule::deserialize(&bytecode_bytes)
             .expect("Module blob can't be deserialized");
-        source_map
-            .or_else(|_| SourceMap::dummy_from_module(&compiled_module, no_loc))
-            .and_then(|source_map| Ok(SourceMapping::new(source_map, compiled_module)))
-            .expect("Unable to build source mapping for compiled module")
+        BinaryIndexedView::Module(&module)
+    };
+
+    let mut source_mapping = {
+        if let Ok(s) = source_map {
+            SourceMapping::new(s, bytecode)
+        } else {
+            SourceMapping::new_from_view(bytecode, no_loc)
+                .expect("Unable to build dummy source mapping")
+        }
     };
 
     if let Some(source_code) = source {
@@ -112,7 +118,8 @@ fn main() {
     let mut disassembler = Disassembler::new(source_mapping, disassembler_options);
 
     if let Some(file_path) = &args.code_coverage_path {
-        disassembler.add_coverage_map(CoverageMap::from_binary_file(file_path));
+        disassembler
+            .add_coverage_map(CoverageMap::from_binary_file(file_path).to_unified_exec_map());
     }
 
     let dissassemble_string = disassembler.disassemble().expect("Unable to dissassemble");

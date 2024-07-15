@@ -1,16 +1,16 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use super::cfg::BlockCFG;
-use crate::parser::ast::Var;
+use crate::{hlir::ast::FunctionSignature, parser::ast::Var};
 use std::collections::BTreeSet;
 
 /// returns true if anything changed
-pub fn optimize(cfg: &mut BlockCFG) -> bool {
+pub fn optimize(signature: &FunctionSignature, cfg: &mut BlockCFG) -> bool {
     let mut changed = super::remove_no_ops::optimize(cfg);
     loop {
         let ssa_temps = {
-            let s = count(cfg);
+            let s = count(signature, cfg);
             if s.is_empty() {
                 break changed;
             }
@@ -28,8 +28,8 @@ pub fn optimize(cfg: &mut BlockCFG) -> bool {
 // Count assignment and usage
 //**************************************************************************************************
 
-fn count(cfg: &BlockCFG) -> BTreeSet<Var> {
-    let mut context = count::Context::new();
+fn count(signature: &FunctionSignature, cfg: &BlockCFG) -> BTreeSet<Var> {
+    let mut context = count::Context::new(signature);
     for block in cfg.blocks().values() {
         for cmd in block {
             count::command(&mut context, cmd)
@@ -40,7 +40,7 @@ fn count(cfg: &BlockCFG) -> BTreeSet<Var> {
 
 mod count {
     use crate::{
-        hlir::ast::*,
+        hlir::ast::{FunctionSignature, *},
         parser::ast::{BinOp, UnaryOp, Var},
     };
     use std::collections::{BTreeMap, BTreeSet};
@@ -51,31 +51,35 @@ mod count {
     }
 
     impl Context {
-        pub fn new() -> Self {
-            Context {
+        pub fn new(signature: &FunctionSignature) -> Self {
+            let mut ctx = Context {
                 assigned: BTreeMap::new(),
                 used: BTreeMap::new(),
+            };
+            for (v, _) in &signature.parameters {
+                ctx.assign(v, false);
             }
+            ctx
         }
 
         fn assign(&mut self, var: &Var, substitutable: bool) {
             if !substitutable {
-                self.assigned.insert(var.clone(), None);
+                self.assigned.insert(*var, None);
                 return;
             }
 
-            if let Some(count) = self.assigned.entry(var.clone()).or_insert_with(|| Some(0)) {
+            if let Some(count) = self.assigned.entry(*var).or_insert_with(|| Some(0)) {
                 *count += 1
             }
         }
 
         fn used(&mut self, var: &Var, substitutable: bool) {
             if !substitutable {
-                self.used.insert(var.clone(), None);
+                self.used.insert(*var, None);
                 return;
             }
 
-            if let Some(count) = self.used.entry(var.clone()).or_insert_with(|| Some(0)) {
+            if let Some(count) = self.used.entry(*var).or_insert_with(|| Some(0)) {
                 *count += 1
             }
         }
@@ -108,12 +112,12 @@ mod count {
                 exp(context, er);
                 exp(context, el)
             }
-            C::Return(e)
+            C::Return { exp: e, .. }
             | C::Abort(e)
             | C::IgnoreAndPop { exp: e, .. }
             | C::JumpIf { cond: e, .. } => exp(context, e),
 
-            C::Jump(_) => (),
+            C::Jump { .. } => (),
             C::Break | C::Continue => panic!("ICE break/continue not translated to jumps"),
         }
     }
@@ -216,7 +220,7 @@ mod count {
             E::BinopExp(e1, op, e2) => {
                 can_subst_exp_binary(op) && can_subst_exp_single(e1) && can_subst_exp_single(e2)
             }
-            E::ExpList(es) => es.iter().all(|i| can_subst_exp_item(i)),
+            E::ExpList(es) => es.iter().all(can_subst_exp_item),
             E::Pack(_, _, fields) => fields.iter().all(|(_, _, e)| can_subst_exp_single(e)),
 
             E::Unreachable => panic!("ICE should not analyze dead code"),
@@ -296,12 +300,12 @@ mod eliminate {
                 exp(context, er);
                 exp(context, el)
             }
-            C::Return(e)
+            C::Return { exp: e, .. }
             | C::Abort(e)
             | C::IgnoreAndPop { exp: e, .. }
             | C::JumpIf { cond: e, .. } => exp(context, e),
 
-            C::Jump(_) => (),
+            C::Jump { .. } => (),
             C::Break | C::Continue => panic!("ICE break/continue not translated to jumps"),
         }
     }
@@ -312,7 +316,7 @@ mod eliminate {
     }
 
     fn lvalues(context: &mut Context, ls: &mut Vec<LValue>) -> Vec<Option<Var>> {
-        let old = std::mem::replace(ls, vec![]);
+        let old = std::mem::take(ls);
         old.into_iter()
             .map(|l| match lvalue(context, l) {
                 LRes::Same(lvalue) => {
@@ -400,8 +404,8 @@ mod eliminate {
                     UnannotatedExp_::ExpList(es) => es,
                     _ => panic!("ICE local elimination type mismatch"),
                 };
-                let old_tys = std::mem::replace(tys, vec![]);
-                let old_es = std::mem::replace(es, vec![]);
+                let old_tys = std::mem::take(tys);
+                let old_es = std::mem::take(es);
                 for ((mut item, ty), elim_opt) in old_es.into_iter().zip(old_tys).zip(eliminated) {
                     let e = match &mut item {
                         ExpListItem::Single(e, _) => e,
@@ -444,7 +448,12 @@ mod eliminate {
     fn unit(loc: Loc) -> Exp {
         H::exp(
             sp(loc, Type_::Unit),
-            sp(loc, UnannotatedExp_::Unit { trailing: false }),
+            sp(
+                loc,
+                UnannotatedExp_::Unit {
+                    case: UnitCase::Implicit,
+                },
+            ),
         )
     }
 }

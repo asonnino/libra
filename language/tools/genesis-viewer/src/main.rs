@@ -1,18 +1,22 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use compiled_stdlib::StdLibOptions;
-use libra_types::{
+use diem_resource_viewer::DiemValueAnnotator;
+use diem_types::{
     access_path::AccessPath,
     account_address::AccountAddress,
     contract_event::ContractEvent,
     transaction::ChangeSet,
     write_set::{WriteOp, WriteSet},
 };
-use resource_viewer::{MoveValueAnnotator, NullStateView};
-use std::collections::{BTreeMap, BTreeSet};
+use move_binary_format::CompiledModule;
+use move_core_types::resolver::MoveResolver;
+use move_vm_test_utils::InMemoryStorage;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Debug,
+};
 use structopt::StructOpt;
-use vm::CompiledModule;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "Genesis Viewer")]
@@ -73,9 +77,16 @@ pub fn main() {
     // we default to `all`
     let arg_count = std::env::args().len();
     let args = Args::from_args();
-    let ws = vm_genesis::generate_genesis_change_set_for_testing(StdLibOptions::Compiled);
+    let ws =
+        vm_genesis::generate_genesis_change_set_for_testing(vm_genesis::GenesisOptions::Compiled);
+
+    let mut storage = InMemoryStorage::new();
+    for (blob, module) in diem_framework_releases::current_modules_with_blobs() {
+        storage.publish_or_overwrite_module(module.self_id(), blob.clone())
+    }
+
     if args.all || arg_count == 3 {
-        print_all(&ws);
+        print_all(&storage, &ws);
     } else {
         if args.event_raw {
             print_events_raw(ws.events());
@@ -84,19 +95,19 @@ pub fn main() {
             print_events_key(ws.events());
         }
         if args.type_events {
-            print_events(ws.events());
+            print_events(&storage, ws.events());
         }
         if args.type_modules {
             print_modules(ws.write_set());
         }
         if args.type_resources {
-            print_resources(ws.write_set());
+            print_resources(&storage, ws.write_set());
         }
         if args.write_set {
             print_write_set_raw(ws.write_set());
         }
         if args.ws_by_type {
-            print_write_set_by_type(ws.write_set());
+            print_write_set_by_type(&storage, ws.write_set());
         }
         if args.ws_keys {
             print_keys(ws.write_set());
@@ -105,15 +116,15 @@ pub fn main() {
             print_keys_sorted(ws.write_set());
         }
         if args.print_account_states {
-            print_account_states(ws.write_set());
+            print_account_states(&storage, ws.write_set());
         }
     }
 }
 
-fn print_all(cs: &ChangeSet) {
-    print_write_set_by_type(cs.write_set());
+fn print_all(storage: &impl MoveResolver, cs: &ChangeSet) {
+    print_write_set_by_type(storage, cs.write_set());
     println!("* Events:");
-    print_events(cs.events());
+    print_events(storage, cs.events());
 }
 
 fn print_events_raw(events: &[ContractEvent]) {
@@ -146,16 +157,15 @@ fn print_events_key(events: &[ContractEvent]) {
     }
 }
 
-fn print_write_set_by_type(ws: &WriteSet) {
+fn print_write_set_by_type(storage: &impl MoveResolver, ws: &WriteSet) {
     println!("* Modules:");
     print_modules(ws);
     println!("* Resources:");
-    print_resources(ws);
+    print_resources(storage, ws);
 }
 
-fn print_events(events: &[ContractEvent]) {
-    let view = NullStateView::default();
-    let annotator = MoveValueAnnotator::new(&view);
+fn print_events(storage: &impl MoveResolver, events: &[ContractEvent]) {
+    let annotator = DiemValueAnnotator::new(storage);
 
     for event in events {
         println!("+ {:?}", event.key());
@@ -174,7 +184,7 @@ fn print_modules(ws: &WriteSet) {
         match v {
             WriteOp::Deletion => panic!("found WriteOp::Deletion in WriteSet"),
             WriteOp::Value(blob) => {
-                let tag = k.path.get(0).expect("empty blob in WriteSet");
+                let tag = k.path.first().expect("empty blob in WriteSet");
                 if *tag == 0 {
                     modules.insert(
                         k.clone(),
@@ -190,21 +200,20 @@ fn print_modules(ws: &WriteSet) {
     }
 }
 
-fn print_resources(ws: &WriteSet) {
+fn print_resources(storage: &impl MoveResolver, ws: &WriteSet) {
     let mut resources: BTreeMap<AccessPath, Vec<u8>> = BTreeMap::new();
     for (k, v) in ws {
         match v {
             WriteOp::Deletion => panic!("found WriteOp::Deletion in WriteSet"),
             WriteOp::Value(blob) => {
-                let tag = k.path.get(0).expect("empty blob in WriteSet");
+                let tag = k.path.first().expect("empty blob in WriteSet");
                 if *tag == 1 {
                     resources.insert(k.clone(), blob.clone());
                 }
             }
         }
     }
-    let view = NullStateView::default();
-    let annotator = MoveValueAnnotator::new(&view);
+    let annotator = DiemValueAnnotator::new(storage);
     for (k, v) in &resources {
         println!("AccessPath: {:?}", k);
         match annotator.view_access_path(k.clone(), v.as_ref()) {
@@ -215,13 +224,13 @@ fn print_resources(ws: &WriteSet) {
     }
 }
 
-fn print_account_states(ws: &WriteSet) {
+fn print_account_states(storage: &impl MoveResolver, ws: &WriteSet) {
     let mut accounts: BTreeMap<AccountAddress, Vec<(AccessPath, Vec<u8>)>> = BTreeMap::new();
     for (k, v) in ws {
         match v {
             WriteOp::Deletion => panic!("found WriteOp::Deletion in WriteSet"),
             WriteOp::Value(blob) => {
-                let tag = k.path.get(0).expect("empty blob in WriteSet");
+                let tag = k.path.first().expect("empty blob in WriteSet");
                 if *tag == 1 {
                     accounts
                         .entry(k.address)
@@ -231,8 +240,7 @@ fn print_account_states(ws: &WriteSet) {
             }
         }
     }
-    let view = NullStateView::default();
-    let annotator = MoveValueAnnotator::new(&view);
+    let annotator = DiemValueAnnotator::new(storage);
     for (k, v) in &accounts {
         println!("Address: {}", k);
         for (ap, resource) in v {

@@ -1,10 +1,9 @@
 ---
 id: ir-to-bytecode
 title: Move IR Compiler
-custom_edit_url: https://github.com/libra/libra/edit/master/language/compiler/README.md
+custom_edit_url: https://github.com/diem/diem/edit/main/language/compiler/README.md
 ---
 
-# Move IR Compiler
 
 ## Summary
 
@@ -15,7 +14,7 @@ The Move IR compiler compiles the Move IR down to its bytecode representation.
 The Move IR compiler compiles modules and scripts written in Move down to
 their respective bytecode representations. The two data types used to
 represent these outputs are `CompiledModule` and `CompiledScript`. These
-data types are defined in [file_format.rs](https://github.com/libra/libra/blob/master/language/vm/src/file_format.rs).
+data types are defined in [file_format.rs](https://github.com/diem/diem/blob/main/language/move-binary-format/src/file_format.rs).
 
 Beyond translating Move IR to Move bytecode, the compiler's purpose is as a
 testing tool for the bytecode verifier. Because of this, its job is to
@@ -25,30 +24,28 @@ performed during the compilation process. In fact, the compiler goes out of
 its way to push these semantic checks into the bytecode, and compile
 semantically invalid code in the Move IR to equivalent---semantically
 invalid---bytecode programs. The semantics of the compiled bytecode is
-then verified by the [bytecode verifier](https://github.com/libra/libra/blob/master/language/bytecode-verifier/README.md). The compiler command line
+then verified by the [bytecode verifier](https://github.com/diem/diem/blob/main/language/bytecode-verifier/README.md). The compiler command line
 automatically calls the bytecode verifier at the end of compilation.
 
 ## Command-line options
 
 ```text
 USAGE:
-    compiler [FLAGS] [OPTIONS] <source_path>
+    compiler [FLAGS] [OPTIONS] <source-path>
 
 FLAGS:
     -h, --help                 Prints help information
-    -l, --list_dependencies    Instead of compiling the source, emit a dependency list of the compiled source
+    -l, --list-dependencies    Instead of compiling the source, emit a dependency list of the compiled source
     -m, --module               Treat input file as a module (default is to treat file as a script)
-        --no-stdlib            Do not automatically compile stdlib dependencies
         --no-verify            Do not automatically run the bytecode verifier
+        --src-map
     -V, --version              Prints version information
 
 OPTIONS:
-    -a, --address <address>       Account address used for publishing
-        --deps <deps_path>        Path to the list of modules that we want to link with
-    -o, --output <output_path>    Serialize and write the compiled output to this file
+    -d, --deps <deps-path>    Path to the list of modules that we want to link with
 
 ARGS:
-    <source_path>    Path to the Move IR source to compile
+    <source-path>    Path to the Move IR source to compile
 ```
 
 ### Example Usage
@@ -56,14 +53,14 @@ ARGS:
 > cargo build --bin compiler
 
 * This will build the compiler + verifier binary.
-* The binary can be found at `libra/target/debug/compiler`.
+* The binary can be found at `diem/target/debug/compiler`.
 * Alternatively, the binary can be run directly with `cargo run -p compiler`.
 
 To compile and verify `foo.mvir`, which contains a Move IR module:
-> `compiler -m foo.mvir`
+> `compiler --address 0x42 --no-stdlib -m foo.mvir`
 
 To compile and verify `bar.mvir`, which contains a transaction script:
-> `compiler bar.mvir`
+> `compiler --address 0xca --no-stdlib bar.mvir`
 
 ## Folder Structure
 

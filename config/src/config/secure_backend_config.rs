@@ -1,14 +1,18 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::Error;
-use libra_secure_storage::{
-    GitHubStorage, InMemoryStorage, NamespacedStorage, OnDiskStorage, Storage, VaultStorage,
+use diem_secure_storage::{
+    GitHubStorage, InMemoryStorage, Namespaced, OnDiskStorage, Storage, VaultStorage,
 };
 use serde::{Deserialize, Serialize};
-use std::{fs::File, io::Read, path::PathBuf};
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum SecureBackend {
     GitHub(GitHubConfig),
@@ -17,13 +21,39 @@ pub enum SecureBackend {
     OnDiskStorage(OnDiskStorageConfig),
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+impl SecureBackend {
+    pub fn namespace(&self) -> Option<&str> {
+        match self {
+            SecureBackend::GitHub(GitHubConfig { namespace, .. })
+            | SecureBackend::Vault(VaultConfig { namespace, .. })
+            | SecureBackend::OnDiskStorage(OnDiskStorageConfig { namespace, .. }) => {
+                namespace.as_deref()
+            }
+            SecureBackend::InMemoryStorage => None,
+        }
+    }
+
+    pub fn clear_namespace(&mut self) {
+        match self {
+            SecureBackend::GitHub(GitHubConfig { namespace, .. })
+            | SecureBackend::Vault(VaultConfig { namespace, .. })
+            | SecureBackend::OnDiskStorage(OnDiskStorageConfig { namespace, .. }) => {
+                *namespace = None;
+            }
+            SecureBackend::InMemoryStorage => {}
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GitHubConfig {
     /// The owner or account that hosts a repository
     pub repository_owner: String,
     /// The repository where storage will mount
     pub repository: String,
+    /// The branch containing storage, defaults to master
+    pub branch: Option<String>,
     /// The authorization token for accessing the repository
     pub token: Token,
     /// A namespace is an optional portion of the path to a key stored within GitHubConfig. For
@@ -32,7 +62,7 @@ pub struct GitHubConfig {
     pub namespace: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultConfig {
     /// Optional SSL Certificate for the vault host, this is expected to be a full path.
@@ -41,10 +71,20 @@ pub struct VaultConfig {
     /// a secret, S, without a namespace would be available in secret/data/S, with a namespace, N, it
     /// would be in secret/data/N/S.
     pub namespace: Option<String>,
+    /// Vault leverages leases on many tokens, specify this to automatically have your lease
+    /// renewed up to that many seconds more. If this is not specified, the lease will not
+    /// automatically be renewed.
+    pub renew_ttl_secs: Option<u32>,
     /// Vault's URL, note: only HTTP is currently supported.
     pub server: String,
     /// The authorization token for accessing secrets
     pub token: Token,
+    /// Disable check-and-set when writing secrets to Vault
+    pub disable_cas: Option<bool>,
+    /// Timeout for new vault socket connections, in milliseconds.
+    pub connection_timeout_ms: Option<u64>,
+    /// Timeout for generic vault operations (e.g., reads and writes), in milliseconds.
+    pub response_timeout_ms: Option<u64>,
 }
 
 impl VaultConfig {
@@ -52,12 +92,12 @@ impl VaultConfig {
         let path = self
             .ca_certificate
             .as_ref()
-            .ok_or_else(|| Error::Missing("ca_certificate"))?;
+            .ok_or(Error::Missing("ca_certificate"))?;
         read_file(path)
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OnDiskStorageConfig {
     // Required path for on disk storage
@@ -71,7 +111,7 @@ pub struct OnDiskStorageConfig {
 }
 
 /// Tokens can either be directly within this config or stored somewhere on disk.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Token {
     FromConfig(String),
@@ -88,13 +128,13 @@ impl Token {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TokenFromConfig {
     token: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TokenFromDisk {
     path: PathBuf,
@@ -105,7 +145,7 @@ impl Default for OnDiskStorageConfig {
         Self {
             namespace: None,
             path: PathBuf::from("secure_storage.json"),
-            data_dir: PathBuf::from("/opt/libra/data/common"),
+            data_dir: PathBuf::from("/opt/diem/data"),
         }
     }
 }
@@ -124,7 +164,7 @@ impl OnDiskStorageConfig {
     }
 }
 
-fn read_file(path: &PathBuf) -> Result<String, Error> {
+fn read_file(path: &Path) -> Result<String, Error> {
     let mut file =
         File::open(path).map_err(|e| Error::IO(path.to_str().unwrap().to_string(), e))?;
     let mut contents = String::new();
@@ -137,35 +177,50 @@ impl From<&SecureBackend> for Storage {
     fn from(backend: &SecureBackend) -> Self {
         match backend {
             SecureBackend::GitHub(config) => {
-                let storage = GitHubStorage::new(
+                let storage = Storage::from(GitHubStorage::new(
                     config.repository_owner.clone(),
                     config.repository.clone(),
+                    config
+                        .branch
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or_else(|| "master".to_string()),
                     config.token.read_token().expect("Unable to read token"),
-                );
+                ));
                 if let Some(namespace) = &config.namespace {
-                    Storage::from(NamespacedStorage::new(Box::new(storage), namespace.clone()))
+                    Storage::from(Namespaced::new(namespace, Box::new(storage)))
                 } else {
-                    Storage::from(storage)
+                    storage
                 }
             }
             SecureBackend::InMemoryStorage => Storage::from(InMemoryStorage::new()),
             SecureBackend::OnDiskStorage(config) => {
-                let storage = OnDiskStorage::new(config.path());
+                let storage = Storage::from(OnDiskStorage::new(config.path()));
                 if let Some(namespace) = &config.namespace {
-                    Storage::from(NamespacedStorage::new(Box::new(storage), namespace.clone()))
+                    Storage::from(Namespaced::new(namespace, Box::new(storage)))
                 } else {
-                    Storage::from(storage)
+                    storage
                 }
             }
-            SecureBackend::Vault(config) => Storage::from(VaultStorage::new(
-                config.server.clone(),
-                config.token.read_token().expect("Unable to read token"),
-                config.namespace.clone(),
-                config
-                    .ca_certificate
-                    .as_ref()
-                    .map(|_| config.ca_certificate().unwrap()),
-            )),
+            SecureBackend::Vault(config) => {
+                let storage = Storage::from(VaultStorage::new(
+                    config.server.clone(),
+                    config.token.read_token().expect("Unable to read token"),
+                    config
+                        .ca_certificate
+                        .as_ref()
+                        .map(|_| config.ca_certificate().unwrap()),
+                    config.renew_ttl_secs,
+                    config.disable_cas.map_or_else(|| true, |disable| !disable),
+                    config.connection_timeout_ms,
+                    config.response_timeout_ms,
+                ));
+                if let Some(namespace) = &config.namespace {
+                    Storage::from(Namespaced::new(namespace, Box::new(storage)))
+                } else {
+                    storage
+                }
+            }
         }
     }
 }
@@ -187,6 +242,10 @@ mod tests {
                 server: "127.0.0.1:8200".to_string(),
                 ca_certificate: None,
                 token: Token::FromConfig("test".to_string()),
+                renew_ttl_secs: None,
+                disable_cas: None,
+                connection_timeout_ms: None,
+                response_timeout_ms: None,
             },
         };
 
@@ -204,6 +263,36 @@ vault:
     }
 
     #[test]
+    fn test_vault_timeout_parsing() {
+        let from_config = Config {
+            vault: VaultConfig {
+                namespace: None,
+                server: "127.0.0.1:8200".to_string(),
+                ca_certificate: None,
+                token: Token::FromConfig("test".to_string()),
+                renew_ttl_secs: None,
+                disable_cas: None,
+                connection_timeout_ms: Some(3000),
+                response_timeout_ms: Some(5000),
+            },
+        };
+
+        let text_from_config = r#"
+vault:
+    server: "127.0.0.1:8200"
+    token:
+        from_config: "test"
+    connection_timeout_ms: 3000
+    response_timeout_ms: 5000
+        "#;
+
+        let de_from_config: Config = serde_yaml::from_str(text_from_config).unwrap();
+        assert_eq!(de_from_config, from_config);
+        // Just assert that it can be serialized, no need to do string comparison
+        serde_yaml::to_string(&from_config).unwrap();
+    }
+
+    #[test]
     fn test_token_disk_parsing() {
         let from_disk = Config {
             vault: VaultConfig {
@@ -211,6 +300,10 @@ vault:
                 server: "127.0.0.1:8200".to_string(),
                 ca_certificate: None,
                 token: Token::FromDisk(PathBuf::from("/token")),
+                renew_ttl_secs: None,
+                disable_cas: None,
+                connection_timeout_ms: None,
+                response_timeout_ms: None,
             },
         };
 
@@ -229,7 +322,7 @@ vault:
 
     #[test]
     fn test_token_reading() {
-        let temppath = libra_temppath::TempPath::new();
+        let temppath = diem_temppath::TempPath::new();
         temppath.create_as_file().unwrap();
         let mut file = File::create(temppath.path()).unwrap();
         file.write_all(b"disk_token").unwrap();

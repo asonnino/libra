@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -6,9 +6,9 @@ use crate::{
     quorum_cert::QuorumCert,
     vote_data::VoteData,
 };
-use libra_crypto::hash::HashValue;
-use libra_crypto_derive::{CryptoHasher, LCSCryptoHash};
-use libra_types::{
+use diem_crypto::hash::HashValue;
+use diem_crypto_derive::{BCSCryptoHash, CryptoHasher};
+use diem_types::{
     block_info::BlockInfo,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
 };
@@ -34,7 +34,7 @@ pub enum BlockType {
     Genesis,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq, CryptoHasher, LCSCryptoHash)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq, CryptoHasher, BCSCryptoHash)]
 /// Block has the core data of a consensus block that should be persistent when necessary.
 /// Each block must know the id of its parent and keep the QuorurmCertificate to that parent.
 pub struct BlockData {
@@ -49,17 +49,16 @@ pub struct BlockData {
     /// * Clients determining if they are relatively up-to-date with respect to the block chain.
     ///
     /// It makes the following guarantees:
-    /// 1. Time Monotonicity: Time is monotonically increasing in the block
-    ///    chain. (i.e. If H1 < H2, H1.Time < H2.Time).
-    /// 2. If a block of transactions B is agreed on with timestamp T, then at least f+1
-    ///    honest replicas think that T is in the past.  An honest replica will only vote
-    ///    on a block when its own clock >= timestamp T.
-    /// 3. If a block of transactions B is agreed on with timestamp T, then at least f+1 honest
-    ///    replicas saw the contents of B no later than T + delta for some delta.
-    ///    If T = 3:00 PM and delta is 10 minutes, then an honest replica would not have
-    ///    voted for B unless its clock was between 3:00 PM to 3:10 PM at the time the
-    ///    proposal was received.  After 3:10 PM, an honest replica would no longer vote
-    ///    on B, noting it was too far in the past.
+    ///   1. Time Monotonicity: Time is monotonically increasing in the block chain.
+    ///      (i.e. If H1 < H2, H1.Time < H2.Time).
+    ///   2. If a block of transactions B is agreed on with timestamp T, then at least
+    ///      f+1 honest validators think that T is in the past. An honest validator will
+    ///      only vote on a block when its own clock >= timestamp T.
+    ///   3. If a block of transactions B has a QC with timestamp T, an honest validator
+    ///      will not serve such a block to other validators until its own clock >= timestamp T.
+    ///   4. Current: an honest validator is not issuing blocks with a timestamp in the
+    ///       future. Currently we consider a block is malicious if it was issued more
+    ///       that 5 minutes in the future.
     timestamp_usecs: u64,
     /// Contains the quorum certified ancestor and whether the quorum certified ancestor was
     /// voted on successfully
@@ -98,11 +97,6 @@ impl BlockData {
     }
 
     pub fn round(&self) -> Round {
-        // Round numbers:
-        // - are reset to 0 periodically.
-        // - do not exceed std::u64::MAX - 2 per the 3 chain safety rule
-        // (ConsensusState::commit_rule_for_certified_block)
-        assumed_postcondition!(self.round < std::u64::MAX - 1);
         self.round
     }
 
@@ -147,6 +141,24 @@ impl BlockData {
         BlockData::new_genesis(ledger_info.timestamp_usecs(), genesis_quorum_cert)
     }
 
+    #[cfg(any(test, feature = "fuzzing"))]
+    // This method should only used by tests and fuzzers to produce arbitrary BlockData types.
+    pub fn new_for_testing(
+        epoch: u64,
+        round: Round,
+        timestamp_usecs: u64,
+        quorum_cert: QuorumCert,
+        block_type: BlockType,
+    ) -> Self {
+        Self {
+            epoch,
+            round,
+            timestamp_usecs,
+            quorum_cert,
+            block_type,
+        }
+    }
+
     pub fn new_genesis(timestamp_usecs: u64, quorum_cert: QuorumCert) -> Self {
         assume!(quorum_cert.certified_block().epoch() < u64::max_value()); // unlikely to be false in this universe
         Self {
@@ -188,4 +200,39 @@ impl BlockData {
             block_type: BlockType::Proposal { payload, author },
         }
     }
+
+    /// It's a reconfiguration suffix block if the parent block's executed state indicates next epoch.
+    pub fn is_reconfiguration_suffix(&self) -> bool {
+        self.quorum_cert.certified_block().has_reconfiguration()
+    }
+}
+
+#[test]
+fn test_reconfiguration_suffix() {
+    use diem_types::{
+        account_address::AccountAddress, epoch_state::EpochState, on_chain_config::ValidatorSet,
+    };
+
+    let reconfig_block_info = BlockInfo::new(
+        1,
+        1,
+        HashValue::random(),
+        HashValue::random(),
+        100,
+        1,
+        Some(EpochState::empty()),
+    );
+    let quorum_cert = QuorumCert::new(
+        VoteData::new(reconfig_block_info, BlockInfo::random(0)),
+        LedgerInfoWithSignatures::new(
+            LedgerInfo::new(
+                BlockInfo::genesis(HashValue::random(), ValidatorSet::empty()),
+                HashValue::zero(),
+            ),
+            BTreeMap::new(),
+        ),
+    );
+    let reconfig_suffix_block =
+        BlockData::new_proposal(vec![], AccountAddress::random(), 2, 2, quorum_cert);
+    assert!(reconfig_suffix_block.is_reconfiguration_suffix());
 }

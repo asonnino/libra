@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 // Definitions
 //**************************************************************************************************
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BorrowGraph<Loc: Copy, Lbl: Clone + Ord>(BTreeMap<RefID, Ref<Loc, Lbl>>);
 
 //**************************************************************************************************
@@ -34,7 +34,11 @@ impl<Loc: Copy, Lbl: Clone + Ord> BorrowGraph<Loc, Lbl> {
     /// Adds a new reference to the borrow graph
     /// Fails if the id is already in use
     pub fn new_ref(&mut self, id: RefID, mutable: bool) {
-        assert!(self.0.insert(id, Ref::new(mutable)).is_none(), "{}", id.0)
+        assert!(
+            self.0.insert(id, Ref::new(mutable)).is_none(),
+            "ref {} exists",
+            id.0
+        )
     }
 
     /// Return the references borrowing the `id` reference
@@ -244,7 +248,7 @@ impl<Loc: Copy, Lbl: Clone + Ord> BorrowGraph<Loc, Lbl> {
             }
         }
         for child_ref_id in borrowed_by.0.keys() {
-            let child = self.0.get_mut(&child_ref_id).unwrap();
+            let child = self.0.get_mut(child_ref_id).unwrap();
             child.borrows_from.remove(&id);
         }
         debug_checked_postcondition!(self.check_invariant());

@@ -1,18 +1,18 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::unit_tests::testutils::compile_module_string;
 
 #[test]
-fn compile_script_with_functions() {
+fn compile_module_with_functions() {
     let code = String::from(
         "
-        module Foobar {
-            resource FooCoin { value: u64 }
+        module 0x27.Foobar {
+            struct FooCoin { value: u64 }
 
             public value(this: &Self.FooCoin): u64 {
                 let value_ref: &u64;
-                value_ref = &move(this).value;
+                value_ref = &move(this).FooCoin::value;
                 return *move(value_ref);
             }
 
@@ -23,7 +23,7 @@ fn compile_script_with_functions() {
                 let check_value: u64;
                 let new_value: u64;
                 let i: u64;
-                value_ref = &mut move(this).value;
+                value_ref = &mut move(this).FooCoin::value;
                 value = *copy(value_ref);
                 check_ref = &check;
                 check_value = Self.value(move(check_ref));
@@ -41,11 +41,12 @@ fn compile_script_with_functions() {
 
 fn generate_function(name: &str, num_formals: usize, num_locals: usize) -> String {
     let mut code = format!("public {}(", name);
+    use std::fmt::Write as _;
 
     code.reserve(30 * (num_formals + num_locals));
 
     for i in 0..num_formals {
-        code.push_str(&format!("formal_{}: u64", i));
+        let _ = write!(code, "formal_{}: u64", i);
         if i < num_formals - 1 {
             code.push_str(", ");
         }
@@ -54,33 +55,53 @@ fn generate_function(name: &str, num_formals: usize, num_locals: usize) -> Strin
     code.push_str(") {\n");
 
     for i in 0..num_locals {
-        code.push_str(&format!("let x_{}: u64;\n", i));
+        let _ = writeln!(code, "let x_{}: u64;", i);
     }
     for i in 0..num_locals {
-        code.push_str(&format!("x_{} = {};\n", i, i));
+        let _ = writeln!(code, "x_{} = {};", i, i);
     }
 
     code.push_str("return;");
 
-    code.push_str("}");
+    code.push('}');
 
     code
 }
 
 #[test]
-fn compile_script_with_large_frame() {
+fn compile_module_with_large_frame() {
     let mut code = String::from(
         "
-        module Foobar {
-            resource FooCoin { value: u64 }
+        module 0x16.Foobar {
+            struct FooCoin { value: u64 }
         ",
     );
 
     // Max number of locals (formals + local variables) is u8::max_value().
     code.push_str(&generate_function("foo_func", 128, 127));
 
-    code.push_str("}");
+    code.push('}');
 
+    let compiled_module_res = compile_module_string(&code);
+    assert!(compiled_module_res.is_ok());
+}
+
+#[test]
+fn compile_module_with_script_visibility_functions() {
+    let code = String::from(
+        "
+        module 0xa1.Foobar {
+            public(script) foo() {
+                return;
+            }
+
+            public(script) bar() {
+                Self.foo();
+                return;
+            }
+        }
+        ",
+    );
     let compiled_module_res = compile_module_string(&code);
     assert!(compiled_module_res.is_ok());
 }

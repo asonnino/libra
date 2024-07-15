@@ -1,0 +1,35 @@
+[package]
+name = "diem"
+version = "0.1.0"
+authors = ["Diem Association <opensource@diem.com>"]
+description = "CLI for interacting with the Diem blockchain"
+repository = "https://github.com/diem/diem"
+homepage = "https://diem.com"
+license = "Apache-2.0"
+publish = false
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1.53"
+clap = { version = "4.0.26", features = ["derive", "env"] }
+serde = { version = "1.0.137", features = ["derive", "rc"] }
+serde_json = { version = "1.0.81", features = ["preserve_order"] }
+thiserror = "1.0.31"
+tokio = { version = "1.18.2", features = ["full"] }
+diem-client = { path = "../../crates/diem-client" }
+diem-types = { path = "../../types" }
+reqwest = { version = "0.11.2", features = ["blocking", "json"] }
+anyhow = "1.0.38"
+diem-crypto = { path = "../diem-crypto" }
+generate-key = { path = "../../config/generate-key" }
+diem-logger =  { path = "../../crates/diem-logger" }
+hex = "0.4.3"
+serde_yaml = "0.8.17"
+structopt = "0.3.21"
+swiss-knife = { path = "../../crates/swiss-knife" }
+rand = "0.8.3"
+home = "0.5.4"
+diem-workspace-hack = { path = "../diem-workspace-hack" }
+diem-transaction-builder = { path = "../../sdk/transaction-builder" }
+bcs = { git = "https://github.com/diem/bcs", rev = "30ce9f4ac51342d2fb4c04c4f5b40683d9652dc6" }
+rust_decimal = "1.10.3"

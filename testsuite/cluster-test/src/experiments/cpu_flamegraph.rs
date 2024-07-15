@@ -1,16 +1,16 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
     collections::HashSet,
+    env,
     fmt::{Display, Error, Formatter},
     time::Duration,
 };
 
-use anyhow::{format_err, Result};
+use anyhow::{anyhow, format_err, Result};
 
 use futures::{future::FutureExt, join};
-use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use structopt::StructOpt;
 
 use async_trait::async_trait;
@@ -61,28 +61,27 @@ impl Experiment for CpuFlamegraph {
         let emit_job_request = EmitJobRequest::for_instances(
             context.cluster.validator_instances().to_vec(),
             context.global_emit_job_request,
+            0,
+            0,
         );
         let emit_future = context
             .tx_emitter
             .emit_txn_for(tx_emitter_duration, emit_job_request)
             .boxed();
-        let filename = format!(
-            "{}-libra-node-perf.svg",
-            thread_rng()
-                .sample_iter(&Alphanumeric)
-                .take(30)
-                .collect::<String>()
-        );
-        let command = generate_perf_flamegraph_command(&filename, self.duration_secs);
+        let run_id = env::var("RUN_ID")
+            .map_err(|e| anyhow!("RUN_ID could not be read from the environment, Error:{}", e))?;
+        let filename = "diem-node-perf.svg";
+        let command = generate_perf_flamegraph_command(filename, &run_id, self.duration_secs);
         let flame_graph = self.perf_instance.util_cmd(command, "generate-flamegraph");
-        let flame_graph_future = tokio::time::delay_for(buffer)
+        let flame_graph_future = tokio::time::sleep(buffer)
             .then(|_| async move { flame_graph.await })
             .boxed();
         let (emit_result, flame_graph_result) = join!(emit_future, flame_graph_future);
         emit_result.map_err(|e| format_err!("Emiting tx failed: {:?}", e))?;
         flame_graph_result.map_err(|e| format_err!("Failed to generate flamegraph: {:?}", e))?;
         context.report.report_text(format!(
-            "perf flamegraph : https://toro-cluster-test-flamegraphs.s3-us-west-2.amazonaws.com/{}",
+            "perf flamegraph : https://toro-cluster-test-flamegraphs.s3-us-west-2.amazonaws.com/flamegraphs/{}/{}",
+            run_id,
             filename
         ));
         Ok(())
@@ -99,18 +98,19 @@ impl Display for CpuFlamegraph {
     }
 }
 
-fn generate_perf_flamegraph_command(filename: &str, duration_secs: usize) -> String {
+fn generate_perf_flamegraph_command(filename: &str, run_id: &str, duration_secs: usize) -> String {
     format!(
         r#"
         set -xe;
         rm -rf /tmp/perf-data;
         mkdir /tmp/perf-data;
         cd /tmp/perf-data;
-        perf record -F 99 -p $(ps aux | grep libra-node | grep -v grep | awk '{{print $2}}') --output=perf.data --call-graph dwarf -- sleep {duration_secs};
+        perf record -F 99 -p $(ps aux | grep diem-node | grep -v grep | awk '{{print $2}}') --output=perf.data --call-graph dwarf -- sleep {duration_secs};
         perf script --input=perf.data | /usr/local/etc/FlameGraph/stackcollapse-perf.pl > out.perf-folded;
         /usr/local/etc/FlameGraph/flamegraph.pl out.perf-folded > {filename};
-        aws s3 cp {filename} s3://toro-cluster-test-flamegraphs/{filename};"#,
+        aws s3 cp {filename} s3://toro-cluster-test-flamegraphs/flamegraphs/{run_id}/{filename};"#,
         duration_secs = duration_secs,
         filename = filename,
+        run_id = run_id,
     )
 }

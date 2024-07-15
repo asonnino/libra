@@ -1,15 +1,17 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use super::core::{self, Subst, TParamSubst};
 use crate::{
-    errors::*,
-    naming::ast::{self as N, TParam, Type, Type_},
-    parser::ast::{FunctionName, ModuleIdent},
-    shared::unique_map::UniqueMap,
+    diagnostics::{codes::TypeSafety, Diagnostic},
+    expansion::ast::ModuleIdent,
+    naming::ast::{self as N, TParam, TParamID, Type, Type_},
+    parser::ast::FunctionName,
+    shared::{unique_map::UniqueMap, CompilationEnv},
     typing::ast as T,
 };
 use move_ir_types::location::*;
+use move_symbol_pool::Symbol;
 use petgraph::{
     algo::{astar as petgraph_astar, tarjan_scc as petgraph_scc},
     graphmap::DiGraphMap,
@@ -57,7 +59,7 @@ impl<'a> Context<'a> {
             .zip(targs)
             .for_each(|(tparam, targ)| {
                 let info = EdgeInfo {
-                    name: fname.clone(),
+                    name: *fname,
                     type_argument: targ.clone(),
                     loc,
                     edge: Edge::Identity,
@@ -126,21 +128,24 @@ impl<'a> Context<'a> {
 // Modules
 //**************************************************************************************************
 
-pub fn modules(errors: &mut Errors, modules: &UniqueMap<ModuleIdent, T::ModuleDefinition>) {
+pub fn modules(
+    compilation_env: &mut CompilationEnv,
+    modules: &UniqueMap<ModuleIdent, T::ModuleDefinition>,
+) {
     let tparams = modules
-        .iter()
+        .key_cloned_iter()
         .map(|(mname, mdef)| {
             let tparams = mdef
                 .functions
-                .iter()
+                .key_cloned_iter()
                 .map(|(fname, fdef)| (fname, &fdef.signature.type_parameters))
                 .collect();
             (mname, tparams)
         })
         .collect();
     modules
-        .iter()
-        .for_each(|(mname, m)| module(errors, &tparams, mname, m))
+        .key_cloned_iter()
+        .for_each(|(mname, m)| module(compilation_env, &tparams, mname, m))
 }
 
 macro_rules! scc_edges {
@@ -155,7 +160,7 @@ macro_rules! scc_edges {
 }
 
 fn module<'a>(
-    errors: &mut Errors,
+    compilation_env: &mut CompilationEnv,
     tparams: &'a BTreeMap<ModuleIdent, BTreeMap<FunctionName, &'a Vec<TParam>>>,
     mname: ModuleIdent,
     module: &T::ModuleDefinition,
@@ -163,7 +168,7 @@ fn module<'a>(
     let context = &mut Context::new(tparams, mname);
     module
         .functions
-        .iter()
+        .key_cloned_iter()
         .for_each(|(_fname, fdef)| function_body(context, &fdef.body));
     let graph = context.instantiation_graph();
     // - get the strongly connected components
@@ -172,7 +177,7 @@ fn module<'a>(
     petgraph_scc(&graph)
         .into_iter()
         .filter(|scc| scc_edges!(&graph, scc).any(|(_, e, _)| e == Edge::Nested))
-        .for_each(|scc| errors.push(cycle_error(context, &graph, scc)))
+        .for_each(|scc| compilation_env.add_diag(cycle_error(context, &graph, scc)))
 }
 
 //**************************************************************************************************
@@ -205,7 +210,7 @@ fn sequence_item(context: &mut Context, item: &T::SequenceItem) {
 fn exp(context: &mut Context, e: &T::Exp) {
     use T::UnannotatedExp_ as E;
     match &e.exp.value {
-        E::InferredNum(_) | E::Use(_) => panic!("ICE should have been expanded"),
+        E::Use(_) => panic!("ICE should have been expanded"),
 
         E::Unit { .. }
         | E::Value(_)
@@ -249,7 +254,7 @@ fn exp(context: &mut Context, e: &T::Exp) {
         }
 
         E::Pack(_, _, _, fields) => {
-            for (_, (_, (_, fe))) in fields.iter() {
+            for (_, _, (_, (_, fe))) in fields.iter() {
                 exp(context, fe)
             }
         }
@@ -276,7 +281,11 @@ fn exp_list_item(context: &mut Context, item: &T::ExpListItem) {
 // Errors
 //**************************************************************************************************
 
-fn cycle_error(context: &Context, graph: &DiGraphMap<&TParam, Edge>, scc: Vec<&TParam>) -> Error {
+fn cycle_error(
+    context: &Context,
+    graph: &DiGraphMap<&TParam, Edge>,
+    scc: Vec<&TParam>,
+) -> Diagnostic {
     let critical_edge = scc_edges!(graph, &scc).find(|(_, e, _)| e == &Edge::Nested);
     // tail -> head
     let (critical_tail, _, critical_head) = critical_edge.unwrap();
@@ -290,7 +299,7 @@ fn cycle_error(context: &Context, graph: &DiGraphMap<&TParam, Edge>, scc: Vec<&T
     .unwrap();
     assert!(!cycle_nodes.is_empty());
     let next = |i| (i + 1) % cycle_nodes.len();
-    let prev = |i: usize| i.checked_sub(1).unwrap_or_else(|| cycle_nodes.len() - 1);
+    let prev = |i: usize| i.checked_sub(1).unwrap_or(cycle_nodes.len() - 1);
 
     assert!(&cycle_nodes[0] == critical_head);
     let param_info = &context.tparam_type_arguments[cycle_nodes[0]][cycle_nodes[next(0)]];
@@ -320,22 +329,28 @@ fn cycle_error(context: &Context, graph: &DiGraphMap<&TParam, Edge>, scc: Vec<&T
         case = case,
     );
 
-    let mut error = vec![(call_loc, call_msg), (ty_loc, tparam_msg)];
+    let mut secondary_labels = vec![(ty_loc, tparam_msg)];
 
     if cycle_nodes.len() > 1 {
         let (mut subst, init_call) = {
             let ftparam = cycle_nodes[0];
             let prev_tparam = cycle_nodes[prev(0)];
             let init_state = &context.tparam_type_arguments[prev_tparam][ftparam];
-            let qualified_ = format!("{}::{}", &init_state.name, &ftparam.user_specified_name);
-            let qualified = sp(ftparam.user_specified_name.loc, qualified_);
-            let qualified_tp = TParam {
-                user_specified_name: qualified,
-                ..ftparam.clone()
+            let ftparam_ty = {
+                let qualified_ = Symbol::from(format!(
+                    "{}::{}",
+                    &init_state.name, &ftparam.user_specified_name
+                ));
+                let qualified = sp(ftparam.user_specified_name.loc, qualified_);
+                let qualified_tp = TParam {
+                    user_specified_name: qualified,
+                    ..ftparam.clone()
+                };
+                sp(init_state.loc, Type_::Param(qualified_tp))
             };
-            let ftparam_ty = sp(init_state.loc, Type_::Param(qualified_tp));
-            let init_call = make_call_string(context, init_state, ftparam, &ftparam_ty);
-            let subst = make_subst(context, init_state, ftparam, ftparam_ty);
+            let init_call = make_call_string(context, init_state, ftparam.id, &ftparam_ty);
+            let loc = ftparam.user_specified_name.loc;
+            let subst = make_subst(context, loc, init_state, ftparam.id, ftparam_ty);
             (subst, init_call)
         };
 
@@ -346,8 +361,9 @@ fn cycle_error(context: &Context, graph: &DiGraphMap<&TParam, Edge>, scc: Vec<&T
                 let tparam = cycle_nodes[next(i)];
                 let cur = &context.tparam_type_arguments[targ_tparam][tparam];
                 let targ = core::subst_tparams(&subst, cur.type_argument.clone());
-                let res = make_call_string(context, cur, tparam, &targ);
-                subst = make_subst(context, cur, tparam, targ);
+                let res = make_call_string(context, cur, tparam.id, &targ);
+                let loc = tparam.user_specified_name.loc;
+                subst = make_subst(context, loc, cur, tparam.id, targ);
                 res
             })
             .collect::<Vec<_>>();
@@ -361,26 +377,32 @@ fn cycle_error(context: &Context, graph: &DiGraphMap<&TParam, Edge>, scc: Vec<&T
                     &cycle_calls[prev(i)]
                 };
                 let msg = format!("'{}' calls '{}'", prev_call, next_call);
-                error.push((*loc, msg))
+                secondary_labels.push((*loc, msg))
             });
     }
 
-    error
+    Diagnostic::new(
+        TypeSafety::CyclicInstantiation,
+        (call_loc, call_msg),
+        secondary_labels,
+    )
 }
 
 fn make_subst(
     context: &Context,
+    loc: Loc,
     state: &EdgeInfo,
-    tparam: &TParam,
+    tparam: TParamID,
     tparam_ty: Type,
 ) -> TParamSubst {
+    let mut tparam_ty = Some(tparam_ty);
     context.tparams[&context.current_module][&state.name]
         .iter()
         .map(|tp| {
-            let ty = if tp == tparam {
-                tparam_ty.clone()
+            let ty = if tp.id == tparam {
+                tparam_ty.take().unwrap()
             } else {
-                sp(tparam_ty.loc, Type_::Anything)
+                sp(loc, Type_::Anything)
             };
             (tp.id, ty)
         })
@@ -390,14 +412,14 @@ fn make_subst(
 fn make_call_string(
     context: &Context,
     cur: &EdgeInfo,
-    tparam: &TParam,
+    tparam: TParamID,
     targ: &Type,
 ) -> (Loc, String) {
     let targs = context.tparams[&context.current_module][&cur.name]
         .iter()
         .map(|tp| {
-            if tp == tparam {
-                core::error_format_nested(&targ, &Subst::empty())
+            if tp.id == tparam {
+                core::error_format_nested(targ, &Subst::empty())
             } else {
                 "_".to_owned()
             }

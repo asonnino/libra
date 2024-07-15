@@ -1,9 +1,9 @@
-module M {
-    struct CupC<T: copyable> {}
-    resource struct R {}
+module 0x8675309::M {
+    struct CupC<T: copy> { f: T }
+    struct R {}
 
     fun foo() {
-        let x: CupC<R>;
+        let _x: CupC<R>;
     }
 
 }

@@ -1,14 +1,14 @@
-module M {
-    struct CupC<T: copyable> {}
+module 0x8675309::M {
+    struct CupC<T: copy> { f: T }
     struct C {}
-    resource struct R {}
+    struct R {}
 
     fun foo() {
         ignore((abort 0: CupC<R>));
     }
 
-    fun ignore<T>(x: T) {
-
+    fun ignore<T>(_x: T) {
+        abort 0
     }
 
 }

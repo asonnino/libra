@@ -1,11 +1,11 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::unit_tests::testutils::{
     compile_module_string, compile_script_string, compile_script_string_and_assert_error,
     count_locals,
 };
-use vm::{
+use move_binary_format::{
     access::{ModuleAccess, ScriptAccess},
     file_format::Bytecode::*,
 };
@@ -160,8 +160,8 @@ fn compile_assert() {
 fn single_resource() {
     let code = String::from(
         "
-module Test {
-    resource T { i: u64 }
+module 0xf1.Test {
+    struct T { i: u64 }
 
     public new_t(): Self.T {
         return T { i: 0 };
@@ -198,26 +198,26 @@ fn compile_immutable_borrow_local() {
 fn compile_borrow_field() {
     let code = String::from(
         "
-        module Foobar {
-            resource FooCoin { value: u64 }
+        module 0x3d.Foobar {
+            struct FooCoin { value: u64 }
 
             public borrow_immut_field(arg: &Self.FooCoin) {
                 let field_ref: &u64;
-                field_ref = &move(arg).value;
+                field_ref = &move(arg).FooCoin::value;
                 _ = move(field_ref);
                 return;
             }
 
             public borrow_immut_field_from_mut_ref(arg: &mut Self.FooCoin) {
                 let field_ref: &u64;
-                field_ref = &move(arg).value;
+                field_ref = &move(arg).FooCoin::value;
                 _ = move(field_ref);
                 return;
             }
 
             public borrow_mut_field(arg: &mut Self.FooCoin) {
                 let field_ref: &mut u64;
-                field_ref = &mut move(arg).value;
+                field_ref = &mut move(arg).FooCoin::value;
                 _ = move(field_ref);
                 return;
             }
@@ -232,26 +232,26 @@ fn compile_borrow_field() {
 fn compile_borrow_field_generic() {
     let code = String::from(
         "
-        module Foobar {
-            resource FooCoin<T> { value: u64 }
+        module 0x4d.Foobar {
+            struct FooCoin<T> { value: u64 }
 
             public borrow_immut_field(arg: &Self.FooCoin<u64>) {
                 let field_ref: &u64;
-                field_ref = &move(arg).value;
+                field_ref = &move(arg).FooCoin<u64>::value;
                 _ = move(field_ref);
                 return;
             }
 
             public borrow_immut_field_from_mut_ref(arg: &mut Self.FooCoin<u128>) {
                 let field_ref: &u64;
-                field_ref = &move(arg).value;
+                field_ref = &move(arg).FooCoin<u128>::value;
                 _ = move(field_ref);
                 return;
             }
 
             public borrow_mut_field(arg: &mut Self.FooCoin<address>) {
                 let field_ref: &mut u64;
-                field_ref = &mut move(arg).value;
+                field_ref = &mut move(arg).FooCoin<address>::value;
                 _ = move(field_ref);
                 return;
             }
@@ -260,4 +260,45 @@ fn compile_borrow_field_generic() {
     );
     let compiled_module_res = compile_module_string(&code);
     let _compiled_module = compiled_module_res.unwrap();
+}
+
+#[test]
+fn compile_builtin_vector_ops() {
+    let code = String::from(
+        "
+        module 0xfab.Foobar {
+            public vector_ops() {
+                let v: vector<u64>;
+                let v_imm: &vector<u64>;
+                let v_mut: &mut vector<u64>;
+                let v_len: u64;
+                let e_imm: &u64;
+                let e_mut: &mut u64;
+
+                v = vec_pack_0<u64>();
+                v_imm = &v;
+                v_len = vec_len<u64>(copy(v_imm));
+                _ = move(v_imm);
+
+                v_mut = &mut v;
+                vec_push_back<u64>(copy(v_mut), 0);
+                vec_push_back<u64>(copy(v_mut), 1);
+
+                e_imm = vec_imm_borrow<u64>(copy(v_mut), 0);
+                _ = move(e_imm);
+                e_mut = vec_mut_borrow<u64>(copy(v_mut), 1);
+                _ = move(e_mut);
+
+                vec_swap<u64>(copy(v_mut), 0, 1);
+                _ = vec_pop_back<u64>(copy(v_mut));
+                _ = vec_pop_back<u64>(copy(v_mut));
+                _ = move(v_mut);
+
+                vec_unpack_0<u64>(move(v));
+                return;
+            }
+        }
+        ",
+    );
+    assert!(compile_module_string(&code).is_ok());
 }

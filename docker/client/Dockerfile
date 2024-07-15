@@ -1,31 +1,42 @@
-FROM debian:buster AS toolchain
+FROM debian:buster-20210721@sha256:cc58a29c333ee594f7624d968123429b26916face46169304f07580644dde6b2 AS toolchain
 
 # To use http/https proxy while building, use:
 # docker build --build-arg https_proxy=http://fwdproxy:8080 --build-arg http_proxy=http://fwdproxy:8080
 
-RUN apt-get update && apt-get install -y cmake curl clang git
+RUN apt-get update && apt-get install -y cmake curl clang git pkg-config libssl-dev
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
 ENV PATH "$PATH:/root/.cargo/bin"
 
-WORKDIR /libra
-COPY rust-toolchain /libra/rust-toolchain
+WORKDIR /diem
+COPY rust-toolchain /diem/rust-toolchain
 RUN rustup install $(cat rust-toolchain)
 
 FROM toolchain AS builder
 
-COPY . /libra
+ARG ENABLE_FAILPOINTS
+COPY . /diem
 
-RUN ./docker/build-common.sh
+RUN IMAGE_TARGETS="test" ./docker/build-common.sh
+
+### Pre-Production Image ###
+FROM debian:buster-20210721@sha256:cc58a29c333ee594f7624d968123429b26916face46169304f07580644dde6b2 AS pre-prod
+
+RUN apt-get update && apt-get install -y libssl1.1 ca-certificates && apt-get clean && rm -r /var/lib/apt/lists/*
+
+RUN mkdir -p /opt/diem/bin /opt/diem/etc
+COPY --from=builder /diem/target/release/cli /opt/diem/bin/diem_client
+
+### Test pre-production Image ###
+FROM pre-prod as testing
+
+RUN /opt/diem/bin/diem_client -h
 
 ### Production Image ###
-FROM debian:buster-slim AS prod
+FROM pre-prod AS prod
 
-RUN mkdir -p /opt/libra/bin /opt/libra/etc
-COPY --from=builder /libra/target/release/cli /opt/libra/bin/libra_client
-
-ENTRYPOINT ["/opt/libra/bin/libra_client"]
-CMD ["--url", "https://client.testnet.libra.org", "--waypoint_url",  "https://developers.libra.org/testnet_waypoint.txt"]
+ENTRYPOINT ["/opt/diem/bin/diem_client"]
+CMD ["--url", "https://testnet.diem.com/v1", "--waypoint_url",  "https://testnet.diem.com/waypoint.txt", "--chain-id", "TESTNET"]
 
 ARG BUILD_DATE
 ARG GIT_REV
@@ -34,4 +45,3 @@ ARG GIT_UPSTREAM
 LABEL org.label-schema.schema-version="1.0"
 LABEL org.label-schema.build-date=$BUILD_DATE
 LABEL org.label-schema.vcs-ref=$GIT_REV
-LABEL vcs-upstream=$GIT_UPSTREAM

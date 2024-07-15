@@ -1,9 +1,9 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     account_address::AccountAddress,
-    identifier::Identifier,
+    identifier::{self, Identifier},
     language_storage::{StructTag, TypeTag},
     transaction_argument::TransactionArgument,
 };
@@ -18,6 +18,7 @@ enum Token {
     BoolType,
     AddressType,
     VectorType,
+    SignerType,
     Whitespace(String),
     Name(String),
     Address(String),
@@ -36,10 +37,7 @@ enum Token {
 
 impl Token {
     fn is_whitespace(&self) -> bool {
-        match self {
-            Self::Whitespace(_) => true,
-            _ => false,
-        }
+        matches!(self, Self::Whitespace(_))
     }
 }
 
@@ -53,6 +51,7 @@ fn name_token(s: String) -> Token {
         "vector" => Token::VectorType,
         "true" => Token::True,
         "false" => Token::False,
+        "signer" => Token::SignerType,
         _ => Token::Name(s),
     }
 }
@@ -131,6 +130,19 @@ fn next_token(s: &str) -> Result<Option<(Token, usize)>> {
                 loop {
                     match it.next() {
                         Some('"') => break,
+                        Some(c) if c.is_ascii() => r.push(c),
+                        _ => bail!("unrecognized token"),
+                    }
+                }
+                let len = r.len() + 3;
+                (Token::Bytes(hex::encode(r)), len)
+            }
+            'x' if it.peek() == Some(&'"') => {
+                it.next().unwrap();
+                let mut r = String::new();
+                loop {
+                    match it.next() {
+                        Some('"') => break,
                         Some(c) if c.is_ascii_hexdigit() => r.push(c),
                         _ => bail!("unrecognized token"),
                     }
@@ -155,7 +167,7 @@ fn next_token(s: &str) -> Result<Option<(Token, usize)>> {
                 let mut r = String::new();
                 r.push(c);
                 for c in it {
-                    if c.is_ascii_alphanumeric() {
+                    if identifier::is_valid_identifier_char(c) {
                         r.push(c);
                     } else {
                         break;
@@ -234,6 +246,13 @@ impl<I: Iterator<Item = Token>> Parser<I> {
         Ok(v)
     }
 
+    fn parse_string(&mut self) -> Result<String> {
+        Ok(match self.next()? {
+            Token::Name(s) => s,
+            tok => bail!("unexpected token {:?}, expected string", tok),
+        })
+    }
+
     fn parse_type_tag(&mut self) -> Result<TypeTag> {
         Ok(match self.next()? {
             Token::U8Type => TypeTag::U8,
@@ -241,6 +260,7 @@ impl<I: Iterator<Item = Token>> Parser<I> {
             Token::U128Type => TypeTag::U128,
             Token::BoolType => TypeTag::Bool,
             Token::AddressType => TypeTag::Address,
+            Token::SignerType => TypeTag::Signer,
             Token::VectorType => {
                 self.consume(Token::Lt)?;
                 let ty = self.parse_type_tag()?;
@@ -314,10 +334,20 @@ where
     Ok(res)
 }
 
+pub fn parse_string_list(s: &str) -> Result<Vec<String>> {
+    parse(s, |parser| {
+        parser.parse_comma_list(|parser| parser.parse_string(), Token::EOF, true)
+    })
+}
+
 pub fn parse_type_tags(s: &str) -> Result<Vec<TypeTag>> {
     parse(s, |parser| {
         parser.parse_comma_list(|parser| parser.parse_type_tag(), Token::EOF, true)
     })
+}
+
+pub fn parse_type_tag(s: &str) -> Result<TypeTag> {
+    parse(s, |parser| parser.parse_type_tag())
 }
 
 pub fn parse_transaction_arguments(s: &str) -> Result<Vec<TransactionArgument>> {
@@ -367,10 +397,10 @@ fn tests_parse_transaction_argument_positive() {
             "0X54afa3526",
             T::Address(AccountAddress::from_hex_literal("0x54afa3526").unwrap()),
         ),
-        ("b\"7fff\"", T::U8Vector(vec![0x7f, 0xff])),
-        ("b\"\"", T::U8Vector(vec![])),
-        ("b\"00\"", T::U8Vector(vec![0x00])),
-        ("b\"deadbeef\"", T::U8Vector(vec![0xde, 0xad, 0xbe, 0xef])),
+        ("x\"7fff\"", T::U8Vector(vec![0x7f, 0xff])),
+        ("x\"\"", T::U8Vector(vec![])),
+        ("x\"00\"", T::U8Vector(vec![0x00])),
+        ("x\"deadbeef\"", T::U8Vector(vec![0xde, 0xad, 0xbe, 0xef])),
     ] {
         assert_eq!(&parse_transaction_argument(s).unwrap(), expected)
     }
@@ -394,11 +424,11 @@ fn tests_parse_transaction_argument_negative() {
         "0x",
         "0x_",
         "",
-        "b\"ffff",
-        "b\"a \"",
-        "b\" \"",
-        "b\"0g\"",
-        "b\"0\"",
+        "x\"ffff",
+        "x\"a \"",
+        "x\" \"",
+        "x\"0g\"",
+        "x\"0\"",
         "garbage",
         "true3",
         "3false",
@@ -406,5 +436,29 @@ fn tests_parse_transaction_argument_negative() {
         "",
     ] {
         assert!(parse_transaction_argument(s).is_err())
+    }
+}
+
+#[test]
+fn test_type_tag() {
+    for s in &[
+        "u64",
+        "bool",
+        "vector<u8>",
+        "vector<vector<u64>>",
+        "signer",
+        "0x1::M::S",
+        "0x2::M::S_",
+        "0x3::M_::S",
+        "0x4::M_::S_",
+        "0x00000000004::M::S",
+        "0x1::M::S<u64>",
+        "0x1::M::S<0x2::P::Q>",
+        "vector<0x1::M::S>",
+        "vector<0x1::M_::S_>",
+        "vector<vector<0x1::M_::S_>>",
+        "0x1::M::S<vector<u8>>",
+    ] {
+        assert!(parse_type_tag(s).is_ok(), "Failed to parse tag {}", s);
     }
 }

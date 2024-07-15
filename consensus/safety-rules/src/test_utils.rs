@@ -1,24 +1,28 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::persistent_safety_storage::PersistentSafetyStorage;
+use crate::{
+    persistent_safety_storage::PersistentSafetyStorage, serializer::SerializerService, SafetyRules,
+    TSafetyRules,
+};
 use consensus_types::{
     block::Block,
     common::{Payload, Round},
     quorum_cert::QuorumCert,
     timeout::Timeout,
+    timeout_2chain::{TwoChainTimeout, TwoChainTimeoutCertificate},
     vote::Vote,
     vote_data::VoteData,
     vote_proposal::{MaybeSignedVoteProposal, VoteProposal},
 };
-use libra_crypto::{
+use diem_crypto::{
     ed25519::Ed25519PrivateKey,
     hash::{CryptoHash, TransactionAccumulatorHasher},
     traits::SigningKey,
     Uniform,
 };
-use libra_secure_storage::{InMemoryStorage, Storage};
-use libra_types::{
+use diem_secure_storage::{InMemoryStorage, Storage};
+use diem_types::{
     block_info::BlockInfo,
     epoch_change::EpochChangeProof,
     epoch_state::EpochState,
@@ -29,10 +33,7 @@ use libra_types::{
     validator_signer::ValidatorSigner,
     waypoint::Waypoint,
 };
-use std::{
-    collections::BTreeMap,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::collections::BTreeMap;
 
 pub type Proof = AccumulatorExtensionProof<TransactionAccumulatorHasher>;
 
@@ -65,16 +66,13 @@ pub fn make_proposal_with_qc_and_proof(
         Block::new_proposal(
             payload,
             round,
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            qc.certified_block().timestamp_usecs() + 1,
             qc,
             validator_signer,
         ),
         None,
     );
-    let signature = exec_key.map(|key| key.sign_message(&vote_proposal.hash()));
+    let signature = exec_key.map(|key| key.sign(&vote_proposal));
     MaybeSignedVoteProposal {
         vote_proposal,
         signature,
@@ -128,7 +126,7 @@ pub fn make_proposal_with_parent_and_overrides(
         parent.block().id(),
         parent_output.root_hash(),
         parent_output.version(),
-        parent.block().timestamp_usecs(),
+        parent.block().timestamp_usecs() + 1,
         None,
     );
 
@@ -200,6 +198,18 @@ pub fn make_proposal_with_parent(
     )
 }
 
+pub fn make_timeout_cert(
+    round: Round,
+    hqc: &QuorumCert,
+    signer: &ValidatorSigner,
+) -> TwoChainTimeoutCertificate {
+    let timeout = TwoChainTimeout::new(1, round, hqc.clone());
+    let mut tc = TwoChainTimeoutCertificate::new(timeout.clone());
+    let signature = timeout.sign(signer);
+    tc.add(signer.author(), timeout, signature);
+    tc
+}
+
 pub fn validator_signers_to_ledger_info(signers: &[&ValidatorSigner]) -> LedgerInfo {
     let infos = signers
         .iter()
@@ -222,5 +232,30 @@ pub fn test_storage(signer: &ValidatorSigner) -> PersistentSafetyStorage {
         signer.private_key().clone(),
         Ed25519PrivateKey::generate_for_testing(),
         waypoint,
+        true,
     )
+}
+
+/// Returns a safety rules instance for testing purposes.
+pub fn test_safety_rules() -> SafetyRules {
+    let signer = ValidatorSigner::from_int(0);
+    let storage = test_storage(&signer);
+    let (epoch_change_proof, _) = make_genesis(&signer);
+
+    let mut safety_rules = SafetyRules::new(storage, true, false, false);
+    safety_rules.initialize(&epoch_change_proof).unwrap();
+    safety_rules
+}
+
+/// Returns a safety rules instance that has not been initialized for testing purposes.
+pub fn test_safety_rules_uninitialized() -> SafetyRules {
+    let signer = ValidatorSigner::from_int(0);
+    let storage = test_storage(&signer);
+    SafetyRules::new(storage, true, false, false)
+}
+
+/// Returns a simple serializer for testing purposes.
+pub fn test_serializer() -> SerializerService {
+    let safety_rules = test_safety_rules();
+    SerializerService::new(safety_rules)
 }

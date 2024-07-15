@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 /// Simple trait used for pretty printing the various AST
@@ -76,21 +76,21 @@ impl AstWriter {
         self.lines.push(String::new());
     }
 
-    pub fn write(&mut self, s: &str) {
+    pub fn write(&mut self, s: impl AsRef<str>) {
         let margin = self.margin;
         let cur = self.cur();
         if cur.is_empty() {
             (0..margin).for_each(|_| cur.push(' '));
         }
-        cur.push_str(s);
+        cur.push_str(s.as_ref());
     }
 
-    pub fn writeln(&mut self, s: &str) {
+    pub fn writeln(&mut self, s: impl AsRef<str>) {
         self.write(s);
         self.new_line();
     }
 
-    pub fn indent<F: FnOnce(&mut AstWriter) -> ()>(&mut self, inc: usize, f: F) {
+    pub fn indent<F: FnOnce(&mut AstWriter)>(&mut self, inc: usize, f: F) {
         self.new_line();
         self.margin += inc;
         f(self);
@@ -98,16 +98,25 @@ impl AstWriter {
         self.new_line();
     }
 
-    pub fn block<F: FnOnce(&mut AstWriter) -> ()>(&mut self, f: F) {
+    pub fn block<F: FnOnce(&mut AstWriter)>(&mut self, f: F) {
         self.write(" {");
         self.indent(4, f);
         self.write("}");
     }
 
-    pub fn annotate<F: FnOnce(&mut AstWriter) -> (), Annot: AstDebug>(
+    pub fn annotate<F: FnOnce(&mut AstWriter), Annot: AstDebug>(&mut self, f: F, annot: &Annot) {
+        self.annotate_gen(f, annot, |w, annot| annot.ast_debug(w))
+    }
+
+    pub fn annotate_gen<
+        F: FnOnce(&mut AstWriter),
+        Annot,
+        FAnnot: FnOnce(&mut AstWriter, &Annot),
+    >(
         &mut self,
         f: F,
         annot: &Annot,
+        annot_writer: FAnnot,
     ) {
         if self.verbose {
             self.write("(");
@@ -115,7 +124,7 @@ impl AstWriter {
         f(self);
         if self.verbose {
             self.write(": ");
-            annot.ast_debug(self);
+            annot_writer(self, annot);
             self.write(")");
         }
     }
@@ -145,7 +154,7 @@ impl AstWriter {
         }
     }
 
-    pub fn comma<T, F: FnMut(&mut AstWriter, T) -> ()>(
+    pub fn comma<T, F: FnMut(&mut AstWriter, T)>(
         &mut self,
         items: impl std::iter::IntoIterator<Item = T>,
         mut f: F,
@@ -156,7 +165,7 @@ impl AstWriter {
         })
     }
 
-    pub fn semicolon<T, F: FnMut(&mut AstWriter, T) -> ()>(
+    pub fn semicolon<T, F: FnMut(&mut AstWriter, T)>(
         &mut self,
         items: impl std::iter::IntoIterator<Item = T>,
         mut f: F,

@@ -1,17 +1,19 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{marking::MarkedSourceMapping, source_map::SourceMap};
-use vm::file_format::{CompiledModule, CompiledScript};
+use anyhow::Result;
+use move_binary_format::binary_views::BinaryIndexedView;
+use move_ir_types::location::Loc;
 
 /// An object that associates source code with compiled bytecode and source map.
 #[derive(Debug)]
-pub struct SourceMapping<Location: Clone + Eq> {
+pub struct SourceMapping<'view> {
     // The resulting bytecode from compiling the source map
-    pub bytecode: CompiledModule,
+    pub bytecode: BinaryIndexedView<'view>,
 
     // The source map for the bytecode made w.r.t. to the `source_code`
-    pub source_map: SourceMap<Location>,
+    pub source_map: SourceMap,
 
     // The source code for the bytecode. This is not required for disassembly, but it is required
     // for being able to print out corresponding source code for marked functions and structs.
@@ -23,8 +25,8 @@ pub struct SourceMapping<Location: Clone + Eq> {
     pub marks: Option<MarkedSourceMapping>,
 }
 
-impl<Location: Clone + Eq> SourceMapping<Location> {
-    pub fn new(source_map: SourceMap<Location>, bytecode: CompiledModule) -> Self {
+impl<'view> SourceMapping<'view> {
+    pub fn new(source_map: SourceMap, bytecode: BinaryIndexedView<'view>) -> Self {
         Self {
             source_map,
             bytecode,
@@ -33,8 +35,11 @@ impl<Location: Clone + Eq> SourceMapping<Location> {
         }
     }
 
-    pub fn new_from_script(source_map: SourceMap<Location>, bytecode: CompiledScript) -> Self {
-        Self::new(source_map, bytecode.into_module().1)
+    pub fn new_from_view(bytecode: BinaryIndexedView<'view>, default_loc: Loc) -> Result<Self> {
+        Ok(Self::new(
+            SourceMap::dummy_from_view(&bytecode, default_loc)?,
+            bytecode,
+        ))
     }
 
     pub fn with_marks(&mut self, marks: MarkedSourceMapping) {

@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module provides traits that define the behavior of a schema and its associated key and
@@ -108,7 +108,7 @@ where
 {
     /// Delegates to [`KeyCodec::encode_key`].
     fn encode_seek_key(&self) -> Result<Vec<u8>> {
-        <K as KeyCodec<S>>::encode_key(&self)
+        <K as KeyCodec<S>>::encode_key(self)
     }
 }
 

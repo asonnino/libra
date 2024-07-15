@@ -1,42 +1,64 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
 use crate::Executor;
 use anyhow::{ensure, format_err, Result};
-use executor_types::BlockExecutor;
-use libra_crypto::{hash::PRE_GENESIS_BLOCK_ID, HashValue};
-use libra_logger::prelude::*;
-use libra_state_view::{StateView, StateViewId};
-use libra_types::{
+use diem_crypto::{hash::PRE_GENESIS_BLOCK_ID, HashValue};
+use diem_logger::prelude::*;
+use diem_state_view::{StateView, StateViewId};
+use diem_types::{
     access_path::AccessPath,
-    account_config::association_address,
+    account_config::diem_root_address,
     block_info::{BlockInfo, GENESIS_EPOCH, GENESIS_ROUND, GENESIS_TIMESTAMP_USECS},
+    diem_timestamp::DiemTimestampResource,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
-    libra_timestamp::LibraTimestampResource,
     on_chain_config::{config_address, ConfigurationResource},
     transaction::Transaction,
     waypoint::Waypoint,
 };
-use libra_vm::VMExecutor;
+use diem_vm::VMExecutor;
+use executor_types::BlockExecutor;
 use move_core_types::move_resource::MoveResource;
 use std::collections::btree_map::BTreeMap;
 use storage_interface::{state_view::VerifiedStateView, DbReaderWriter, TreeState};
 
-pub fn bootstrap_db_if_empty<V: VMExecutor>(
+pub fn generate_waypoint<V: VMExecutor>(
     db: &DbReaderWriter,
     genesis_txn: &Transaction,
-) -> Result<Option<Waypoint>> {
+) -> Result<Waypoint> {
     let tree_state = db.reader.get_latest_tree_state()?;
-    if !tree_state.is_empty() {
-        return Ok(None);
+
+    let committer = calculate_genesis::<V>(db, tree_state, genesis_txn)?;
+    Ok(committer.waypoint)
+}
+
+/// If current version + 1 != waypoint.version(), return Ok(false) indicating skipping the txn.
+/// otherwise apply the txn and commit it if the result matches the waypoint.
+/// Returns Ok(true) if committed otherwise Err.
+pub fn maybe_bootstrap<V: VMExecutor>(
+    db: &DbReaderWriter,
+    genesis_txn: &Transaction,
+    waypoint: Waypoint,
+) -> Result<bool> {
+    let tree_state = db.reader.get_latest_tree_state()?;
+    // if the waypoint is not targeted with the genesis txn, it may be either already bootstrapped, or
+    // aiming for state sync to catch up.
+    if tree_state.num_transactions != waypoint.version() {
+        info!(waypoint = %waypoint, "Skip genesis txn.");
+        return Ok(false);
     }
 
     let committer = calculate_genesis::<V>(db, tree_state, genesis_txn)?;
-    let waypoint = committer.waypoint;
+    ensure!(
+        waypoint == committer.waypoint(),
+        "Waypoint verification failed. Expected {:?}, got {:?}.",
+        waypoint,
+        committer.waypoint(),
+    );
     committer.commit()?;
-    Ok(Some(waypoint))
+    Ok(true)
 }
 
 pub struct GenesisCommitter<V: VMExecutor> {
@@ -63,7 +85,7 @@ impl<V: VMExecutor> GenesisCommitter<V> {
         self.waypoint
     }
 
-    pub fn commit(mut self) -> Result<()> {
+    pub fn commit(self) -> Result<()> {
         self.executor
             .commit_blocks(vec![genesis_block_id()], self.ledger_info_with_sigs)?;
         info!("Genesis commited.");
@@ -79,10 +101,10 @@ pub fn calculate_genesis<V: VMExecutor>(
     genesis_txn: &Transaction,
 ) -> Result<GenesisCommitter<V>> {
     // DB bootstrapper works on either an empty transaction accumulator or an existing block chain.
-    // In the very exetreme and sad situation of losing quorum among validators, we refer to the
+    // In the very extreme and sad situation of losing quorum among validators, we refer to the
     // second use case said above.
     let genesis_version = tree_state.num_transactions;
-    let mut executor = Executor::<V>::new_on_unbootstrapped_db(db.clone(), tree_state);
+    let executor = Executor::<V>::new_on_unbootstrapped_db(db.clone(), tree_state);
 
     let block_id = HashValue::zero();
     let epoch = if genesis_version == 0 {
@@ -109,8 +131,12 @@ pub fn calculate_genesis<V: VMExecutor>(
         // TODO(aldenhu): fix existing tests before using real timestamp and check on-chain epoch.
         GENESIS_TIMESTAMP_USECS
     } else {
+        let next_epoch = epoch
+            .checked_add(1)
+            .ok_or_else(|| format_err!("integer overflow occurred"))?;
+
         ensure!(
-            epoch + 1 == get_state_epoch(&state_view)?,
+            next_epoch == get_state_epoch(&state_view)?,
             "Genesis txn didn't bump epoch."
         );
         get_state_timestamp(&state_view)?
@@ -143,12 +169,12 @@ pub fn calculate_genesis<V: VMExecutor>(
 fn get_state_timestamp(state_view: &VerifiedStateView) -> Result<u64> {
     let rsrc_bytes = &state_view
         .get(&AccessPath::new(
-            association_address(),
-            LibraTimestampResource::resource_path(),
+            diem_root_address(),
+            DiemTimestampResource::resource_path(),
         ))?
-        .ok_or_else(|| format_err!("LibraTimestampResource missing."))?;
-    let rsrc = lcs::from_bytes::<LibraTimestampResource>(&rsrc_bytes)?;
-    Ok(rsrc.libra_timestamp.microseconds)
+        .ok_or_else(|| format_err!("DiemTimestampResource missing."))?;
+    let rsrc = bcs::from_bytes::<DiemTimestampResource>(rsrc_bytes)?;
+    Ok(rsrc.diem_timestamp.microseconds)
 }
 
 fn get_state_epoch(state_view: &VerifiedStateView) -> Result<u64> {
@@ -158,7 +184,7 @@ fn get_state_epoch(state_view: &VerifiedStateView) -> Result<u64> {
             ConfigurationResource::resource_path(),
         ))?
         .ok_or_else(|| format_err!("ConfigurationResource missing."))?;
-    let rsrc = lcs::from_bytes::<ConfigurationResource>(&rsrc_bytes)?;
+    let rsrc = bcs::from_bytes::<ConfigurationResource>(rsrc_bytes)?;
     Ok(rsrc.epoch())
 }
 

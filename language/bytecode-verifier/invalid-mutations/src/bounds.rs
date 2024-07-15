@@ -1,28 +1,26 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use libra_proptest_helpers::pick_slice_idxs;
-use libra_types::vm_status::{StatusCode, VMStatus};
-use proptest::{
-    prelude::*,
-    sample::{self, Index as PropIndex},
-};
-use std::collections::BTreeMap;
-use vm::{
-    errors::{append_err_info, bounds_error},
+use move_binary_format::{
+    errors::{bounds_error, PartialVMError},
     file_format::{
-        AddressIdentifierIndex, CompiledModule, CompiledModuleMut, FunctionHandleIndex,
-        IdentifierIndex, ModuleHandleIndex, SignatureIndex, StructDefinitionIndex,
-        StructHandleIndex, TableIndex,
+        AddressIdentifierIndex, CompiledModule, FunctionHandleIndex, IdentifierIndex,
+        ModuleHandleIndex, SignatureIndex, StructDefinitionIndex, StructHandleIndex, TableIndex,
     },
     internals::ModuleIndex,
     views::{ModuleView, SignatureTokenView},
     IndexKind,
 };
+use move_core_types::vm_status::StatusCode;
+use proptest::{
+    prelude::*,
+    sample::{self, Index as PropIndex},
+};
+use std::collections::BTreeMap;
 
 mod code_unit;
 pub use code_unit::{ApplyCodeUnitBoundsContext, CodeUnitBoundsMutation};
-use vm::file_format::SignatureToken;
+use move_binary_format::file_format::SignatureToken;
 
 /// Represents the number of pointers that exist out from a node of a particular kind.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -59,6 +57,7 @@ impl PointerKind {
             ],
             StructDefinition => &[One(StructHandle), Star(StructHandle)],
             FunctionDefinition => &[One(FunctionHandle), One(Signature)],
+            FriendDeclaration => &[One(AddressIdentifier), One(Identifier)],
             Signature => &[Star(StructHandle)],
             FieldHandle => &[One(StructDefinition)],
             _ => &[],
@@ -80,6 +79,7 @@ pub static VALID_POINTER_SRCS: &[IndexKind] = &[
     IndexKind::FieldHandle,
     IndexKind::StructDefinition,
     IndexKind::FunctionDefinition,
+    IndexKind::FriendDeclaration,
     IndexKind::Signature,
 ];
 
@@ -125,7 +125,7 @@ impl OutOfBoundsMutation {
             Self::src_kind_strategy(),
             any::<PropIndex>(),
             any::<PropIndex>(),
-            0..16 as usize,
+            0..16_usize,
         )
             .prop_map(|(src_kind, src_idx, dst_kind_idx, offset)| {
                 let dst_kind = Self::dst_kind(src_kind, dst_kind_idx);
@@ -159,7 +159,7 @@ impl AsRef<PropIndex> for OutOfBoundsMutation {
 }
 
 pub struct ApplyOutOfBoundsContext {
-    module: CompiledModuleMut,
+    module: CompiledModule,
     // This is an Option because it gets moved out in apply before apply_one is called. Rust
     // doesn't let you call another con-consuming method after a partial move out.
     mutations: Option<Vec<OutOfBoundsMutation>>,
@@ -173,13 +173,13 @@ impl ApplyOutOfBoundsContext {
         let sig_structs: Vec<_> = Self::sig_structs(&module).collect();
 
         Self {
-            module: module.into_inner(),
+            module,
             mutations: Some(mutations),
             sig_structs,
         }
     }
 
-    pub fn apply(mut self) -> (CompiledModuleMut, Vec<VMStatus>) {
+    pub fn apply(mut self) -> (CompiledModule, Vec<PartialVMError>) {
         // This is a map from (source kind, dest kind) to the actual mutations -- this is done to
         // figure out how many mutations to do for a particular pair, which is required for
         // pick_slice_idxs below.
@@ -210,7 +210,7 @@ impl ApplyOutOfBoundsContext {
         src_kind: IndexKind,
         dst_kind: IndexKind,
         mutations: Vec<OutOfBoundsMutation>,
-    ) -> Vec<VMStatus> {
+    ) -> Vec<PartialVMError> {
         let src_count = match src_kind {
             IndexKind::Signature => self.sig_structs.len(),
             // For the other sorts it's always possible to change an index.
@@ -218,12 +218,12 @@ impl ApplyOutOfBoundsContext {
         };
         // Any signature can be a destination, not just the ones that have structs in them.
         let dst_count = self.module.kind_count(dst_kind);
-        let to_mutate = pick_slice_idxs(src_count, &mutations);
+        let to_mutate = crate::helpers::pick_slice_idxs(src_count, &mutations);
 
         mutations
             .iter()
             .zip(to_mutate)
-            .filter_map(move |(mutation, src_idx)| {
+            .map(move |(mutation, src_idx)| {
                 self.set_index(
                     src_kind,
                     src_idx,
@@ -248,16 +248,16 @@ impl ApplyOutOfBoundsContext {
         dst_kind: IndexKind,
         dst_count: usize,
         new_idx: TableIndex,
-    ) -> Option<VMStatus> {
+    ) -> PartialVMError {
         use IndexKind::*;
 
         // These are default values, but some of the match arms below mutate them.
         let mut src_idx = src_idx;
         let err = bounds_error(
-            dst_kind,
-            new_idx as usize,
-            dst_count,
             StatusCode::INDEX_OUT_OF_BOUNDS,
+            dst_kind,
+            new_idx,
+            dst_count,
         );
 
         // A dynamic type system would be able to express this next block of code far more
@@ -309,16 +309,20 @@ impl ApplyOutOfBoundsContext {
             (FieldHandle, StructDefinition) => {
                 self.module.field_handles[src_idx].owner = StructDefinitionIndex(new_idx)
             }
+            (FriendDeclaration, AddressIdentifier) => {
+                self.module.friend_decls[src_idx].address = AddressIdentifierIndex(new_idx)
+            }
+            (FriendDeclaration, Identifier) => {
+                self.module.friend_decls[src_idx].name = IdentifierIndex(new_idx)
+            }
             _ => panic!("Invalid pointer kind: {:?} -> {:?}", src_kind, dst_kind),
         }
 
-        Some(append_err_info(err, src_kind, src_idx))
+        err.at_index(src_kind, src_idx as TableIndex)
     }
 
     /// Returns the indexes of locals signatures that contain struct handles inside them.
-    fn sig_structs<'b>(
-        module: &'b CompiledModule,
-    ) -> impl Iterator<Item = (SignatureIndex, usize)> + 'b {
+    fn sig_structs(module: &CompiledModule) -> impl Iterator<Item = (SignatureIndex, usize)> + '_ {
         let module_view = ModuleView::new(module);
         module_view
             .signatures()

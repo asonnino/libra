@@ -1,24 +1,20 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 mod handlers;
 
 use crate::handlers::get_routes;
-use libradb::LibraDB;
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
-};
+use diem_logger::prelude::*;
+use diemdb::DiemDB;
+use std::{net::SocketAddr, sync::Arc};
 use tokio::runtime::{Builder, Runtime};
 
-pub fn start_backup_service(port: u16, db: Arc<LibraDB>) -> Runtime {
-    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+pub fn start_backup_service(address: SocketAddr, db: Arc<DiemDB>) -> Runtime {
     let backup_handler = db.get_backup_handler();
     let routes = get_routes(backup_handler);
 
-    let runtime = Builder::new()
-        .thread_name("backup-")
-        .threaded_scheduler()
+    let runtime = Builder::new_multi_thread()
+        .thread_name("backup")
         .enable_all()
         .build()
         .expect("[backup] failed to create runtime");
@@ -30,18 +26,21 @@ pub fn start_backup_service(port: u16, db: Arc<LibraDB>) -> Runtime {
     //
     // Note: we need to enter the runtime context first to actually bind, since
     //       tokio TcpListener can only be bound inside a tokio context.
-    let server = runtime.enter(move || warp::serve(routes).bind(address));
+    let _guard = runtime.enter();
+    let server = warp::serve(routes).bind(address);
     runtime.handle().spawn(server);
+    info!("Backup service spawned.");
     runtime
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libra_config::utils::get_available_port;
-    use libra_crypto::hash::HashValue;
-    use libra_temppath::TempPath;
+    use diem_config::utils::get_available_port;
+    use diem_crypto::hash::HashValue;
+    use diem_temppath::TempPath;
     use reqwest::blocking::get;
+    use std::net::{IpAddr, Ipv4Addr};
 
     /// 404 - endpoint not found
     /// 400 - params not provided or failed parsing
@@ -51,9 +50,9 @@ mod tests {
     #[test]
     fn routing_and_error_codes() {
         let tmpdir = TempPath::new();
-        let db = Arc::new(LibraDB::new_for_test(&tmpdir));
+        let db = Arc::new(DiemDB::new_for_test(&tmpdir));
         let port = get_available_port();
-        let _rt = start_backup_service(port, db);
+        let _rt = start_backup_service(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port), db);
 
         // Endpoint doesn't exist.
         let resp = get(&format!("http://127.0.0.1:{}/", port)).unwrap();
@@ -85,7 +84,14 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(resp.status(), 500);
-        let resp = get(&format!("http://127.0.0.1:{}/state_snapshot/1", port,)).unwrap();
+        let resp = get(&format!("http://127.0.0.1:{}/state_root_proof/0", port,)).unwrap();
         assert_eq!(resp.status(), 500);
+
+        // an endpoint handled by `reply_with_async_channel_writer' always returns 200,
+        // connection terminates prematurely when the channel writer errors.
+        let resp = get(&format!("http://127.0.0.1:{}/state_snapshot/1", port,)).unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.content_length(), None);
+        assert!(resp.bytes().is_err());
     }
 }

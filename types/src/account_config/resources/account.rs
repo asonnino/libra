@@ -1,13 +1,17 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     account_config::{
-        constants::ACCOUNT_MODULE_NAME, KeyRotationCapabilityResource, WithdrawCapabilityResource,
+        constants::ACCOUNT_MODULE_IDENTIFIER, KeyRotationCapabilityResource,
+        WithdrawCapabilityResource,
     },
     event::EventHandle,
 };
-use move_core_types::move_resource::MoveResource;
+use move_core_types::{
+    identifier::IdentStr,
+    move_resource::{MoveResource, MoveStructType},
+};
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
@@ -23,7 +27,6 @@ pub struct AccountResource {
     received_events: EventHandle,
     sent_events: EventHandle,
     sequence_number: u64,
-    is_frozen: bool,
 }
 
 impl AccountResource {
@@ -35,16 +38,14 @@ impl AccountResource {
         key_rotation_capability: Option<KeyRotationCapabilityResource>,
         sent_events: EventHandle,
         received_events: EventHandle,
-        is_frozen: bool,
     ) -> Self {
         AccountResource {
-            sequence_number,
+            authentication_key,
             withdrawal_capability,
             key_rotation_capability,
-            authentication_key,
-            sent_events,
             received_events,
-            is_frozen,
+            sent_events,
+            sequence_number,
         }
     }
 
@@ -77,14 +78,11 @@ impl AccountResource {
     pub fn received_events(&self) -> &EventHandle {
         &self.received_events
     }
-
-    /// Return the the is_frozen flag for the given AccountResource
-    pub fn is_frozen(&self) -> bool {
-        self.is_frozen
-    }
 }
 
-impl MoveResource for AccountResource {
-    const MODULE_NAME: &'static str = ACCOUNT_MODULE_NAME;
-    const STRUCT_NAME: &'static str = ACCOUNT_MODULE_NAME;
+impl MoveStructType for AccountResource {
+    const MODULE_NAME: &'static IdentStr = ACCOUNT_MODULE_IDENTIFIER;
+    const STRUCT_NAME: &'static IdentStr = ACCOUNT_MODULE_IDENTIFIER;
 }
+
+impl MoveResource for AccountResource {}

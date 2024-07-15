@@ -1,18 +1,20 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{state_replication::StateComputer, test_utils::mock_storage::MockStorage};
+use crate::{
+    error::StateSyncError,
+    state_replication::{StateComputer, StateComputerCommitCallBackType},
+    test_utils::mock_storage::MockStorage,
+};
 use anyhow::{format_err, Result};
-use consensus_types::{block::Block, common::Payload};
+use consensus_types::{block::Block, common::Payload, executed_block::ExecutedBlock};
+use diem_crypto::HashValue;
+use diem_infallible::Mutex;
+use diem_logger::prelude::*;
+use diem_types::ledger_info::LedgerInfoWithSignatures;
 use executor_types::{Error, StateComputeResult};
 use futures::channel::mpsc;
-use libra_crypto::{hash::ACCUMULATOR_PLACEHOLDER_HASH, HashValue};
-use libra_logger::prelude::*;
-use libra_types::ledger_info::LedgerInfoWithSignatures;
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, sync::Arc};
 use termion::color::*;
 
 pub struct MockStateComputer {
@@ -46,51 +48,41 @@ impl StateComputer for MockStateComputer {
     ) -> Result<StateComputeResult, Error> {
         self.block_cache
             .lock()
-            .unwrap()
             .insert(block.id(), block.payload().unwrap_or(&vec![]).clone());
-        let result = StateComputeResult::new(
-            *ACCUMULATOR_PLACEHOLDER_HASH,
-            vec![],
-            0,
-            vec![],
-            0,
-            None,
-            vec![],
-            vec![],
-        );
+        let result = StateComputeResult::new_dummy();
         Ok(result)
     }
 
     async fn commit(
         &self,
-        block_ids: Vec<HashValue>,
+        blocks: &[Arc<ExecutedBlock>],
         commit: LedgerInfoWithSignatures,
-    ) -> Result<()> {
+        call_back: StateComputerCommitCallBackType,
+    ) -> Result<(), Error> {
         self.consensus_db
             .commit_to_storage(commit.ledger_info().clone());
 
         // mock sending commit notif to state sync
         let mut txns = vec![];
-        for block_id in block_ids {
+        for block in blocks {
             let mut payload = self
                 .block_cache
                 .lock()
-                .unwrap()
-                .remove(&block_id)
+                .remove(&block.id())
                 .ok_or_else(|| format_err!("Cannot find block"))?;
             txns.append(&mut payload);
         }
-        self.state_sync_client
-            .unbounded_send(txns)
-            .expect("Fail to notify state sync about commit");
+        // they may fail during shutdown
+        let _ = self.state_sync_client.unbounded_send(txns);
 
-        self.commit_callback
-            .unbounded_send(commit)
-            .expect("Fail to notify about commit.");
+        let _ = self.commit_callback.unbounded_send(commit.clone());
+
+        call_back(blocks, commit);
+
         Ok(())
     }
 
-    async fn sync_to(&self, commit: LedgerInfoWithSignatures) -> Result<()> {
+    async fn sync_to(&self, commit: LedgerInfoWithSignatures) -> Result<(), StateSyncError> {
         debug!(
             "{}Fake sync{} to block id {}",
             Fg(Blue),
@@ -115,27 +107,61 @@ impl StateComputer for EmptyStateComputer {
         _block: &Block,
         _parent_block_id: HashValue,
     ) -> Result<StateComputeResult, Error> {
-        Ok(StateComputeResult::new(
-            *ACCUMULATOR_PLACEHOLDER_HASH,
-            vec![],
-            0,
-            vec![],
-            0,
-            None,
-            vec![],
-            vec![],
+        Ok(StateComputeResult::new_dummy())
+    }
+
+    async fn commit(
+        &self,
+        _blocks: &[Arc<ExecutedBlock>],
+        _commit: LedgerInfoWithSignatures,
+        _call_back: StateComputerCommitCallBackType,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn sync_to(&self, _commit: LedgerInfoWithSignatures) -> Result<(), StateSyncError> {
+        Ok(())
+    }
+}
+
+pub struct RandomComputeResultStateComputer {
+    random_compute_result_root_hash: HashValue,
+}
+
+impl RandomComputeResultStateComputer {
+    pub fn new() -> Self {
+        Self {
+            random_compute_result_root_hash: HashValue::random(),
+        }
+    }
+
+    pub fn get_root_hash(&self) -> HashValue {
+        self.random_compute_result_root_hash
+    }
+}
+
+#[async_trait::async_trait]
+impl StateComputer for RandomComputeResultStateComputer {
+    fn compute(
+        &self,
+        _block: &Block,
+        _parent_block_id: HashValue,
+    ) -> Result<StateComputeResult, Error> {
+        Ok(StateComputeResult::new_dummy_with_root_hash(
+            self.random_compute_result_root_hash,
         ))
     }
 
     async fn commit(
         &self,
-        _block_ids: Vec<HashValue>,
+        _blocks: &[Arc<ExecutedBlock>],
         _commit: LedgerInfoWithSignatures,
-    ) -> Result<()> {
+        _call_back: StateComputerCommitCallBackType,
+    ) -> Result<(), Error> {
         Ok(())
     }
 
-    async fn sync_to(&self, _commit: LedgerInfoWithSignatures) -> Result<()> {
+    async fn sync_to(&self, _commit: LedgerInfoWithSignatures) -> Result<(), StateSyncError> {
         Ok(())
     }
 }

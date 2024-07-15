@@ -1,0 +1,56 @@
+[package]
+name = "diem-node"
+version = "0.1.0"
+authors = ["Diem Association <opensource@diem.com>"]
+description = "Diem node"
+repository = "https://github.com/diem/diem"
+homepage = "https://diem.com"
+license = "Apache-2.0"
+publish = false
+edition = "2018"
+
+[dependencies]
+bcs = { git = "https://github.com/diem/bcs", rev = "30ce9f4ac51342d2fb4c04c4f5b40683d9652dc6" }
+fail = "0.4.0"
+futures = "0.3.12"
+hex = "0.4.3"
+jemallocator = { version = "0.3.2", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+rand = "0.8.3"
+structopt = "0.3.21"
+tokio = { version = "1.18.2", features = ["full"] }
+tokio-stream = "0.1.8"
+
+backup-service = { path = "../storage/backup/backup-service" }
+consensus = { path = "../consensus" }
+consensus-notifications = { path = "../state-sync/inter-component/consensus-notifications" }
+crash-handler = { path = "../crates/crash-handler" }
+debug-interface = { path = "../crates/debug-interface" }
+executor = { path = "../execution/executor" }
+executor-types = { path = "../execution/executor-types" }
+diem-config = { path = "../config" }
+diem-crypto = { path = "../crates/diem-crypto" }
+diem-framework-releases = { path = "../language/diem-framework/releases" }
+diem-genesis-tool = {path = "../config/management/genesis", features = ["testing"] }
+diem-json-rpc = { path = "../json-rpc" }
+diem-logger = { path = "../crates/diem-logger" }
+diem-mempool = { path = "../mempool" }
+diem-metrics = { path = "../crates/diem-metrics" }
+diem-secure-storage = { path = "../secure/storage" }
+diem-temppath = { path = "../crates/diem-temppath" }
+diem-time-service = { path = "../crates/diem-time-service" }
+diem-types = { path = "../types" }
+diem-vm = { path = "../language/diem-vm" }
+diem-workspace-hack = { path = "../crates/diem-workspace-hack" }
+diemdb = { path = "../storage/diemdb" }
+mempool-notifications = { path = "../state-sync/inter-component/mempool-notifications" }
+network-builder = { path = "../network/builder" }
+state-sync-v1 = { path = "../state-sync/state-sync-v1" }
+storage-client = { path = "../storage/storage-client" }
+storage-interface= { path = "../storage/storage-interface" }
+storage-service = { path = "../storage/storage-service" }
+subscription-service = { path = "../crates/subscription-service" }
+
+[features]
+default = []
+assert-private-keys-not-cloneable = ["diem-crypto/assert-private-keys-not-cloneable"]
+failpoints = ["fail/failpoints", "consensus/failpoints", "executor/failpoints", "diem-json-rpc/failpoints", "diem-mempool/failpoints", "state-sync-v1/failpoints"]

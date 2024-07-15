@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module implements an in-memory Merkle Accumulator that is similar to what we use in
@@ -13,16 +13,21 @@
 #[cfg(test)]
 mod accumulator_test;
 
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod mock;
+
 use super::MerkleTreeInternalNode;
 use crate::proof::definition::{LeafCount, MAX_ACCUMULATOR_LEAVES};
 use anyhow::{ensure, format_err, Result};
-use libra_crypto::{
+use diem_crypto::{
     hash::{CryptoHash, CryptoHasher, ACCUMULATOR_PLACEHOLDER_HASH},
     HashValue,
 };
+use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 
 /// The Accumulator implementation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InMemoryAccumulator<H> {
     /// Represents the roots of all the full subtrees from left to right in this accumulator. For
     /// example, if we have the following accumulator, this vector will have two hashes that
@@ -225,7 +230,7 @@ where
         current_num_leaves += remaining_new_leaves;
         current_subtree_roots.extend(subtree_iter);
 
-        Ok(Self::new(current_subtree_roots, current_num_leaves)?)
+        Self::new(current_subtree_roots, current_num_leaves)
     }
 
     /// Returns the root hash of the accumulator.
@@ -283,16 +288,20 @@ where
     pub fn num_leaves(&self) -> LeafCount {
         self.num_leaves
     }
+
+    /// Returns true if this accumulator is empty and has no leaves.
+    pub fn is_empty(&self) -> bool {
+        self.num_leaves == 0
+    }
 }
 
-// We manually implement Debug because H (CryptoHasher) does not implement Debug.
-impl<H> std::fmt::Debug for InMemoryAccumulator<H> {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "Accumulator {{ frozen_subtree_roots: {:?}, num_leaves: {:?} }}",
-            self.frozen_subtree_roots, self.num_leaves
-        )
+// #[derive(..)] doesn't seem to work b/c of the PhantomData :(
+impl<H> std::cmp::Eq for InMemoryAccumulator<H> {}
+impl<H> std::cmp::PartialEq for InMemoryAccumulator<H> {
+    fn eq(&self, other: &Self) -> bool {
+        self.num_leaves == other.num_leaves
+            && self.root_hash == other.root_hash
+            && self.frozen_subtree_roots == other.frozen_subtree_roots
     }
 }
 

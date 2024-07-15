@@ -1,21 +1,21 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
-use bytecode_verifier::constants::ConstantsChecker;
-use libra_types::vm_status::StatusCode;
+use bytecode_verifier::constants;
+use move_binary_format::file_format::{empty_module, CompiledModule, Constant, SignatureToken};
+use move_core_types::vm_status::StatusCode;
 use proptest::prelude::*;
-use vm::file_format::{empty_module, CompiledModule, Constant, SignatureToken};
 
 proptest! {
     #[test]
     fn valid_generated(module in CompiledModule::valid_strategy(20)) {
-        prop_assert!(ConstantsChecker::verify(&module).is_ok());
+        prop_assert!(constants::verify_module(&module).is_ok());
     }
 }
 
 #[test]
 fn valid_primitives() {
-    let mut module_mut = empty_module();
-    module_mut.constant_pool = vec![
+    let mut module = empty_module();
+    module.constant_pool = vec![
         Constant {
             type_: SignatureToken::Bool,
             data: vec![0],
@@ -37,8 +37,7 @@ fn valid_primitives() {
             data: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         },
     ];
-    let module = module_mut.freeze().unwrap();
-    assert!(ConstantsChecker::verify(&module).is_ok());
+    assert!(constants::verify_module(&module).is_ok());
 }
 
 #[test]
@@ -66,8 +65,8 @@ fn valid_vectors() {
         (0..0xFFFF).for_each(|_| items.extend(item.clone()));
         items
     };
-    let mut module_mut = empty_module();
-    module_mut.constant_pool = vec![
+    let mut module = empty_module();
+    module.constant_pool = vec![
         // empty
         Constant {
             type_: tvec(SignatureToken::Bool),
@@ -141,8 +140,7 @@ fn valid_vectors() {
             ])),
         },
     ];
-    let module = module_mut.freeze().unwrap();
-    assert!(ConstantsChecker::verify(&module).is_ok());
+    assert!(constants::verify_module(&module).is_ok());
 }
 
 #[test]
@@ -204,12 +202,12 @@ fn invalid_type(type_: SignatureToken, data: Vec<u8>) {
 }
 
 fn error(type_: SignatureToken, data: Vec<u8>, code: StatusCode) {
-    let mut module_mut = empty_module();
-    module_mut.constant_pool = vec![Constant { type_, data }];
+    let mut module = empty_module();
+    module.constant_pool = vec![Constant { type_, data }];
     assert!(
-        ConstantsChecker::verify(&module_mut.freeze().unwrap())
+        constants::verify_module(&module)
             .unwrap_err()
-            .major_status
+            .major_status()
             == code
     )
 }

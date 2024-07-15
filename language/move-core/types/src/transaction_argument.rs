@@ -1,7 +1,7 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::account_address::AccountAddress;
+use crate::{account_address::AccountAddress, value::MoveValue};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -27,5 +27,45 @@ impl fmt::Debug for TransactionArgument {
                 write!(f, "{{U8Vector: 0x{}}}", hex::encode(vector))
             }
         }
+    }
+}
+
+/// Convert the transaction arguments into Move values.
+pub fn convert_txn_args(args: &[TransactionArgument]) -> Vec<Vec<u8>> {
+    args.iter()
+        .map(|arg| {
+            let mv = match arg {
+                TransactionArgument::U8(i) => MoveValue::U8(*i),
+                TransactionArgument::U64(i) => MoveValue::U64(*i),
+                TransactionArgument::U128(i) => MoveValue::U128(*i),
+                TransactionArgument::Address(a) => MoveValue::Address(*a),
+                TransactionArgument::Bool(b) => MoveValue::Bool(*b),
+                TransactionArgument::U8Vector(v) => MoveValue::vector_u8(v.clone()),
+            };
+            mv.simple_serialize()
+                .expect("transaction arguments must serialize")
+        })
+        .collect()
+}
+
+/// Struct for encoding vector<vector<u8>> arguments for script functions
+#[derive(Clone, Hash, Eq, PartialEq, Deserialize)]
+pub struct VecBytes(Vec<serde_bytes::ByteBuf>);
+
+impl VecBytes {
+    pub fn from(vec_bytes: Vec<Vec<u8>>) -> Self {
+        VecBytes(
+            vec_bytes
+                .into_iter()
+                .map(serde_bytes::ByteBuf::from)
+                .collect(),
+        )
+    }
+
+    pub fn into_vec(self) -> Vec<Vec<u8>> {
+        self.0
+            .into_iter()
+            .map(|byte_buf| byte_buf.into_vec())
+            .collect()
     }
 }
